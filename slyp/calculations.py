@@ -21,6 +21,7 @@ student loan plans 1, 2, 4, 5 and PG. Anything else raises UnsupportedPayslip.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 
 from .types import (
@@ -95,7 +96,68 @@ def parse_tax_code(code: str) -> TaxCode:
 
     Raise UnsupportedPayslip for "NT" and for anything unparseable.
     """
-    raise NotImplementedError
+    raw = code.strip().upper()
+    compact = "".join(raw.split())
+
+    # Normal tax codes are cumulative unless they use W1, M1 or X
+    cumulative = True
+
+    for suffix in ("W1", "M1", "X"):
+        if compact.endswith(suffix):
+            cumulative = False
+            compact = compact[:-len(suffix)]
+            break
+
+    # Default region is England / Northern Ireland
+    region = "UK"
+
+    # Record Scottish or Welsh prefix
+    if compact.startswith(("S", "C")):
+        region = compact[0]
+        compact = compact[1:]
+
+    # NT is outside the MVP
+    if compact == "NT":
+        raise UnsupportedPayslip("NT tax codes are outside the MVP scope")
+
+    # BR, D0, D1 and 0T give no personal allowance
+    if compact in {"BR", "D0", "D1", "0T"}:
+        return TaxCode(
+            raw=raw,
+            kind=compact,
+            free_pay_annual=Decimal("0"),
+            cumulative=cumulative,
+            region=region,
+        )
+
+    # K code: e.g. K475 means a negative £4,750 allowance
+    k_match = re.fullmatch(r"K(\d+)", compact)
+
+    if k_match:
+        return TaxCode(
+            raw=raw,
+            kind="K",
+            free_pay_annual=-(Decimal(k_match.group(1)) * Decimal("10")),
+            cumulative=cumulative,
+            region=region,
+        )
+
+    # Standard code: e.g. 1257L means £12,570 allowance
+    standard_match = re.fullmatch(r"(\d+)L", compact)
+
+    if standard_match:
+        return TaxCode(
+            raw=raw,
+            kind="standard",
+            free_pay_annual=Decimal(standard_match.group(1)) * Decimal("10"),
+            cumulative=cumulative,
+            region=region,
+        )
+
+    # Anything we don't understand is outside the MVP
+    raise UnsupportedPayslip(
+        f"Unsupported or unparseable tax code: {raw}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -154,7 +216,32 @@ def national_insurance_due(
 
     Raise UnsupportedPayslip for any category other than "A".
     """
-    raise NotImplementedError
+    if category != "A":
+        raise UnsupportedPayslip(
+            f"NI category {category} is outside the MVP scope"
+        )
+
+    gross = to_money(gross_this_period)
+
+    thresholds = RATES["ni"][frequency]
+    primary_threshold = thresholds["primary_threshold"]
+    upper_earnings_limit = thresholds["upper_earnings_limit"]
+
+    if gross <= primary_threshold:
+        return Decimal("0")
+
+    main_band = min(gross, upper_earnings_limit) - primary_threshold
+    upper_band = max(
+        gross - upper_earnings_limit,
+        Decimal("0"),
+    )
+
+    due = (
+        main_band * RATES["ni"]["main_rate"]
+        + upper_band * RATES["ni"]["upper_rate"]
+    )
+
+    return due.quantize(Decimal("0.01"))
 
 
 # --------------------------------------------------------------------------
