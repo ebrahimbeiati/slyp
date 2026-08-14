@@ -80,6 +80,15 @@
     --sidebar-accent-foreground: oklch(0.205 0 0);
     --sidebar-border: oklch(0.922 0 0);
     --sidebar-ring: oklch(0.708 0 0);
+    /* Prototype dark theme colors */
+    --bg-deep: #0E1613;
+    --surface: #17221D;
+    --surface-2: #1D2A24;
+    --ink: #F3F6F2;
+    --sage: #8CA097;
+    --amber: #FFB648;
+    --mint: #6EE7A8;
+    --warn: #FF9466;
 }
 
 .dark {
