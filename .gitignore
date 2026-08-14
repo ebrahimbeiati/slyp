@@ -1,3 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Local samples (real payslips)
+samples/private/
+*.payslip.pdf
+
 # Logs
 logs
 *.log
@@ -142,6 +164,4 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
-samples/private/
-*.payslip.pdf
 
