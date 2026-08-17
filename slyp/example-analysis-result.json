@@ -1,0 +1,133 @@
+{
+  "status": "ok",
+  "failure_reason": null,
+  "is_example_data": true,
+
+  "extract": {
+    "source": {
+      "filename": "payslip-august.pdf",
+      "pages": 1,
+      "scanned_at": "2026-08-13T20:14:00Z"
+    },
+    "employer_name": "The Fox & Hound",
+    "period": {
+      "pay_date": "2026-08-28",
+      "period_number": 5,
+      "frequency": "monthly",
+      "tax_year": "2026/27"
+    },
+    "tax_code": { "value": "BR" },
+    "pay": {
+      "hourly_rate": "11.20",
+      "hours": "42.5",
+      "gross_this_period": "476.00",
+      "gross_ytd": "2380.00"
+    },
+    "deductions": {
+      "income_tax": "95.20",
+      "income_tax_ytd": "476.00",
+      "national_insurance": "0.00",
+      "national_insurance_ytd": "0.00",
+      "ni_category": "A",
+      "pension_employee": "0.00",
+      "pension_employer": "0.00",
+      "pension_percent": null,
+      "student_loan": "0.00",
+      "student_loan_plan": null,
+      "other": []
+    },
+    "net_pay": "380.80",
+    "confidence": {
+      "tax_code.value": 0.98,
+      "pay.gross_this_period": 0.99,
+      "pay.gross_ytd": 0.97,
+      "deductions.income_tax": 0.99,
+      "deductions.pension_percent": 0.31
+    },
+    "unreadable_fields": ["deductions.pension_percent"],
+    "warnings": ["No pension contributions shown on this payslip"],
+    "reconciles": true
+  },
+
+  "verdict": {
+    "headline": "2 things worth checking on this payslip",
+    "severity": "action"
+  },
+
+  "findings": [
+    {
+      "id": "tax_code_br_allowance_elsewhere",
+      "severity": "action",
+      "title": "This job is on a BR tax code",
+      "explanation": "BR means basic rate. Every pound you earn here is taxed at 20%, with none of your tax-free allowance applied to this job. That is correct if your £12,570 allowance is being used at another job. If this is your only income, or you have left the other job, you are probably paying tax you do not owe.",
+      "estimate": {
+        "label": "Possible overpayment so far this tax year",
+        "amount_gbp": "476.00",
+        "is_estimate": true
+      },
+      "next_step": "Check your tax codes in your HMRC personal tax account, or ask your payroll team which job your allowance is applied to.",
+      "projection_key": "br_code_full_year",
+      "source_fields": ["tax_code.value", "pay.gross_ytd", "deductions.income_tax_ytd"]
+    },
+    {
+      "id": "no_pension_contribution",
+      "severity": "advisory",
+      "title": "No pension contributions on this payslip",
+      "explanation": "Nothing is going into a pension from this job. Auto-enrolment applies once you are 22 or over and earning above £10,000 a year from one employer, so this may simply mean you are not eligible yet. If you are eligible and opted out, you are also turning down whatever your employer would have added.",
+      "estimate": null,
+      "next_step": "Ask your employer whether you are eligible for auto-enrolment and what they contribute.",
+      "projection_key": "pension_minimum_vs_plus_two",
+      "source_fields": ["deductions.pension_employee", "pay.gross_ytd"]
+    },
+    {
+      "id": "ni_looks_right",
+      "severity": "clear",
+      "title": "National Insurance looks right",
+      "explanation": "You earn under the threshold where National Insurance starts, so nothing has been deducted. That is what we would expect.",
+      "estimate": null,
+      "next_step": null,
+      "projection_key": null,
+      "source_fields": ["pay.gross_this_period", "deductions.national_insurance"]
+    }
+  ],
+
+  "projections": [
+    {
+      "key": "br_code_full_year",
+      "title": "What the BR code costs you over the tax year",
+      "path_a_label": "If the code stays as it is",
+      "path_b_label": "If your allowance is applied here",
+      "unit": "gbp",
+      "points": [
+        { "label": "Now (month 5)", "path_a": "476.00", "path_b": "0.00" },
+        { "label": "Month 8", "path_a": "761.60", "path_b": "0.00" },
+        { "label": "End of tax year", "path_a": "1142.40", "path_b": "0.00" }
+      ],
+      "caveat": "Assumes you keep earning about £476 a month here, and that your allowance is not being used at another job. Figures are estimates."
+    },
+    {
+      "key": "pension_minimum_vs_plus_two",
+      "title": "What two percent more into a pension does by 60",
+      "path_a_label": "Minimum contribution",
+      "path_b_label": "Two percent more",
+      "unit": "gbp",
+      "points": [
+        { "label": "Age 30", "path_a": "8400.00", "path_b": "13100.00" },
+        { "label": "Age 45", "path_a": "42600.00", "path_b": "66400.00" },
+        { "label": "Age 60", "path_a": "118000.00", "path_b": "184000.00" }
+      ],
+      "caveat": "Illustration only, based on this payslip's pay continuing and 5% average annual growth. Real returns vary and are not guaranteed."
+    }
+  ],
+
+  "score": {
+    "value": 62,
+    "checks_passed": 5,
+    "checks_run": 8,
+    "movers": [
+      "Sorting out the BR tax code",
+      "Checking whether you are eligible for a pension",
+      "Scanning next month's payslip"
+    ]
+  }
+}
