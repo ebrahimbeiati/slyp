@@ -95,19 +95,19 @@ def test_no_ni_below_primary_threshold():
 def test_ni_at_main_rate():
     # £2,000/month. TODO: work out by hand from the gov.uk thresholds.
     result = national_insurance_due(Decimal("2000"), "monthly")
-    assert result == Decimal("TODO")
+    assert result == Decimal("76.16")
 
 
 def test_ni_weekly_uses_weekly_thresholds():
     # £400/week. TODO: expected figure.
     result = national_insurance_due(Decimal("400"), "weekly")
-    assert result == Decimal("TODO")
+    assert result == Decimal("12.64")
 
 
 def test_ni_above_upper_earnings_limit():
     # £6,000/month: main rate up to the UEL, then 2% above. TODO.
     result = national_insurance_due(Decimal("6000"), "monthly")
-    assert result == Decimal("TODO")
+    assert result == Decimal("287.50")
 
 
 def test_other_ni_categories_unsupported():
