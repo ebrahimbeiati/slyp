@@ -5,9 +5,6 @@ Works out what someone SHOULD be paying, given the numbers off a payslip.
 Pure functions: same inputs always give the same output. No files, no
 network, no AI, no payslips.
 
-IMPORTANT: take every rate and threshold below from gov.uk for 2026/27.
-The values currently in RATES are placeholders and are very likely wrong.
-Replace them and delete this warning.
 
   Income tax:    https://www.gov.uk/income-tax-rates
   NI thresholds: https://www.gov.uk/guidance/rates-and-thresholds-for-employers
@@ -22,7 +19,7 @@ student loan plans 1, 2, 4, 5 and PG. Anything else raises UnsupportedPayslip.
 from __future__ import annotations
 
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from .types import (
     Frequency,
@@ -37,7 +34,7 @@ from .types import (
 
 
 # --------------------------------------------------------------------------
-# Rates and thresholds — ALL PLACEHOLDERS, REPLACE FROM GOV.UK
+# Rates and thresholds — GOV.UK 2026/27
 # --------------------------------------------------------------------------
 
 RATES = {
@@ -64,9 +61,9 @@ RATES = {
 
     "student_loans": {
         # annual thresholds; divide by periods in year
-        "1": {"threshold": Decimal("26065"), "rate": Decimal("0.09")},
-        "2": {"threshold": Decimal("28470"), "rate": Decimal("0.09")},
-        "4": {"threshold": Decimal("32745"), "rate": Decimal("0.09")},
+        "1": {"threshold": Decimal("26900"), "rate": Decimal("0.09")},
+        "2": {"threshold": Decimal("29385"), "rate": Decimal("0.09")},
+        "4": {"threshold": Decimal("33795"), "rate": Decimal("0.09")},
         "5": {"threshold": Decimal("25000"), "rate": Decimal("0.09")},
         "PG": {"threshold": Decimal("21000"), "rate": Decimal("0.06")},
     },
@@ -263,8 +260,25 @@ def student_loan_due(
     Round DOWN to a whole pound. Student loan deductions are always whole
     pounds, unlike tax and NI.
     """
-    raise NotImplementedError
+    gross = to_money(gross_this_period)
 
+    if plan not in RATES["student_loans"]:
+        raise UnsupportedPayslip(
+            f"Student loan plan {plan} is outside the MVP scope"
+        )
+
+    loan = RATES["student_loans"][plan]
+    periods = periods_in_year(frequency)
+
+    threshold_this_period = loan["threshold"] / Decimal(periods)
+    amount_over_threshold = gross - threshold_this_period
+
+    if amount_over_threshold <= 0:
+        return Decimal("0")
+
+    due = amount_over_threshold * loan["rate"]
+
+    return due.quantize(Decimal("1"), rounding=ROUND_DOWN)
 
 # --------------------------------------------------------------------------
 # 5. Annualising

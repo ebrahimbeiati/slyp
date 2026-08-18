@@ -171,7 +171,7 @@ def test_no_student_loan_below_threshold():
 
 def test_student_loan_plan_2():
     # £3,000/month. TODO: expected figure, rounded down to a whole pound.
-    assert student_loan_due(Decimal("3000"), "2", "monthly") == Decimal("TODO")
+    assert student_loan_due(Decimal("3000"), "2", "monthly") == Decimal("49")
 
 
 def test_student_loan_rounds_down_to_whole_pounds():
