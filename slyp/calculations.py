@@ -286,7 +286,9 @@ def annualise(
     whose whole year's pay sits under the personal allowance but who is
     paying income tax anyway.
     """
-    raise NotImplementedError
+    periods = periods_in_year(frequency)
+
+    return gross_ytd + gross_this_period * (periods - period_number)
 
 
 # --------------------------------------------------------------------------
