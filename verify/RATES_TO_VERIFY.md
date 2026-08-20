@@ -2,7 +2,7 @@
 
 Every figure the engine depends on, as it currently sits in `slyp/calculations.py` on `main` (`d538c36`). Case is **(a)**: these are the real, live constants that the shipped code runs on — not placeholders substituted for testing. Confirmed by diffing `slyp/calculations.py` against `verify/patched_pkg/slyp/calculations.py`: the only differences are the two import/typo fixes (F2, F4); every numeric constant is identical between the two.
 
-**Provenance flag**, because it matters for how much to trust each row: the module's original docstring (still present as a dead comment at the top of the file) said *"IMPORTANT: take every rate and threshold below from gov.uk for 2026/27. The values currently in RATES are placeholders and are very likely wrong... Replace them and delete this warning."* That warning is gone in the live version, but there is no commit, comment, or citation showing anyone actually did the replacement-and-check step it asked for. Income tax and NI figures below are numerically identical to the old placeholder dict (still visible as a comment, `slyp/calculations.py:43-73`) — so either the placeholder was already correct, or nobody touched it. The three student loan figures marked below are **not** identical to the placeholder and have no citation for either the old or the new number.
+**Provenance flag**, because it matters for how much to trust each row: the module's original docstring (still present as a dead comment at the top of the file) said *"IMPORTANT: take every rate and threshold below from gov.uk for 2026/27. The values currently in RATES are placeholders and are very likely wrong... Replace them and delete this warning."* That warning is gone in the live version, and there was no commit, comment, or citation showing anyone had done the replacement-and-check step it asked for — hence this file. Income tax (below) and student loans (below) are now independently confirmed against real GOV.UK sources. NI is still open.
 
 Tick column is for you.
 
@@ -23,9 +23,9 @@ Verified against https://www.gov.uk/income-tax-rates (printed 21/08/2026, curren
 
 Note: Personal Allowance taper (the £1-lost-per-£2-over-£100k rule) is explicitly out of MVP scope — income over £100,000 raises `UnsupportedPayslip` rather than being calculated. `personal_allowance_for_income()` implements the taper formula but no live call site currently uses it above the £100k gate. (Separately: `cumulative_income_tax_due()`, the function actually used for every real payslip, doesn't enforce this £100k gate itself — only the unused `annual_income_tax()` does. Flagged in the session's final report as a real gap, not fixed — out of scope for any phase item.)
 
-## National Insurance and student loans — still open
+## National Insurance — still open
 
-Not covered by the income tax PDF above. NI thresholds (£1,048/£4,189 monthly, £242/£967 weekly, 8%/2%) and student loan thresholds below still need their own GOV.UK source, particularly Plan 1/2/4.
+Not covered by either GOV.UK source checked so far. NI thresholds (£1,048/£4,189 monthly, £242/£967 weekly, 8%/2%) still need their own source.
 
 ## Employee National Insurance (Class 1)
 
@@ -40,19 +40,24 @@ Not covered by the income tax PDF above. NI thresholds (£1,048/£4,189 monthly,
 
 Other NI categories are also baked into `NI_CATEGORY_RATES` (lines 505-566) but are not part of the MVP's stated scope (category A only) — B, C, D, E, F, H, I, J, L, M, N, V, Z all have hardcoded rate pairs with no source comment at all. Flagging for awareness; not asking you to verify all 13 unless the MVP scope has widened.
 
-## Student loans
+## Student loans — CONFIRMED 2026-08-21
 
-| Plan | Monthly threshold in code | Weekly threshold in code | Implied annual threshold | Rate | Old placeholder annual (dead comment, line 67-71) | Matches? | ✓ |
-|---|---|---|---|---|---|---|---|
-| Plan 1 | £2,241.66 | £517.30 | ≈ £26,900 | 9% | £26,065 | **✗ different** | ☐ |
-| Plan 2 | £2,448.75 | £565.09 | £29,385 | 9% | £28,470 | **✗ different** | ☐ |
-| Plan 4 | £2,816.25 | £649.90 | £33,795 | 9% | £32,745 | **✗ different** | ☐ |
-| Plan 5 | £2,083.33 | £480.76 | £25,000 | 9% | £25,000 | ✓ same | ☐ |
-| Postgraduate (PG) | £1,750.00 | £403.84 | £21,000 | 6% | £21,000 | ✓ same | ☐ |
+Verified against https://www.gov.uk/repaying-your-student-loan/what-you-pay. Every yearly threshold and rate matches exactly — this fully resolves the Plan 1/2/4 discrepancy originally flagged here against the old placeholder dict. The code was correct; the placeholder (dead comment, never live) was the outdated one.
 
-**Flagging Plan 1, 2, and 4 specifically** — these three don't match the old placeholder dict and have no citation for the new number either. I have not corrected these; I don't have a source to cite. Please check these three against gov.uk/repaying-your-student-loan/what-you-pay before the demo — they're the ones most likely to be either a genuine 2026/27 uprating (plausible, thresholds move most years) or an uncredited guess.
+| Plan | Yearly threshold (GOV.UK) | Code's implied annual (monthly×12 / weekly×52) | Rate | ✓ |
+|---|---|---|---|---|
+| Plan 1 | £26,900 | £26,900 | 9% | ✅ |
+| Plan 2 | £29,385 | £29,385 | 9% | ✅ |
+| Plan 4 | £33,795 | £33,795 | 9% | ✅ |
+| Plan 5 | £25,000 | £25,000 | 9% | ✅ |
+| Postgraduate (PG) | £21,000 | £21,000 | 6% | ✅ |
 
-Source in code: `STUDENT_LOAN_THRESHOLDS_MONTHLY` / `STUDENT_LOAN_THRESHOLDS_WEEKLY` / `STUDENT_LOAN_RATES` (`slyp/calculations.py:465-487`).
+GOV.UK's page displays whole-pound monthly/weekly figures (e.g. Plan 1: "£2,241") in its plain-English worked examples; the code carries the mathematically exact `annual/12` and `annual/52`, floored to the penny (Plan 1: £2,241.66 / £517.30) — the correct derivation for actual payroll deduction, not a discrepancy. Reproduced all three of GOV.UK's own worked examples exactly through the live `student_loan_due()` function:
+- Plan 1, £2,750/month → £45 ✓
+- Plan 4, £3,000/month → £16 ✓
+- Postgraduate portion of the multi-loan example, £2,500/month → £45 ✓
+
+Source in code: `STUDENT_LOAN_THRESHOLDS_MONTHLY` / `STUDENT_LOAN_THRESHOLDS_WEEKLY` / `STUDENT_LOAN_RATES` (`slyp/calculations.py`).
 
 ## Not yet implemented / not applicable
 
