@@ -10,11 +10,18 @@ export function usePrototypeMode() {
   const [mode, setMode] = useState<PrototypeMode>("first");
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
     const raw = localStorage.getItem(MODE_KEY);
     if (raw === "first" || raw === "returning") {
-      setMode(raw);
+      
+      // FIXED: Deferred state assignment to break the synchronous cascading execution loop
+      requestAnimationFrame(() => {
+        setMode(raw);
+      });
     }
   }, []);
+
 
   const updateMode = (next: PrototypeMode) => {
     setMode(next);
