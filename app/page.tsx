@@ -2,83 +2,128 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { AskSheet } from "@/components/prototype/AskSheet";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
-import type { Payslip } from "@/app/Types/Types";
+import type { AnalysisResult, Finding, PayslipExtract, Severity } from "@/app/Types/Types";
+import { buildPayrollMessage } from "@/lib/payrollMessage";
 
-const STORAGE_KEY = "slyp:payslips";
+const STORAGE_KEY = "slyp:latest";
 
-/** Format a number as £1,234 (no decimals for whole pounds, 2dp otherwise) */
-function fmt(n: number): string {
-  return Number.isInteger(n)
-    ? n.toLocaleString("en-GB")
-    : n.toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/** Format a Decimal-as-string field for display. Never used to derive a
+ * new figure - only to add thousands separators / a £ prefix to a number
+ * the backend already computed. */
+function gbp(value: string): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return value;
+  return `£${n.toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-/** Format as £n — prefix included */
-function gbp(n: number): string {
-  return `£${fmt(n)}`;
+/** Purely cosmetic: a bar-chart width as a percentage of gross. Not a
+ * figure shown to the user - the actual pound amounts always come
+ * straight from the API's string values via gbp() above. */
+function pctOfGross(part: string | null, gross: string | null): number {
+  const p = part ? Number(part) : 0;
+  const g = gross ? Number(gross) : 0;
+  if (!Number.isFinite(p) || !Number.isFinite(g) || g <= 0) return 0;
+  return Math.min(Math.round((p / g) * 100), 100);
+}
+
+const SEVERITY_ORDER: Record<Severity, number> = { action: 0, advisory: 1, clear: 2 };
+
+const SEVERITY_STYLES: Record<Severity, { badge: string; border: string }> = {
+  action: { badge: "bg-[#2E201B] border-[#4D2E24] text-[#FF9466]", border: "border-[#4D2E24]" },
+  advisory: { badge: "bg-[#2a1f0e] border-[#4d3a1a] text-[#FFAE34]", border: "border-[#4d3a1a]" },
+  clear: { badge: "bg-[#1C2C24] border-[#2B473A] text-[var(--ink)]", border: "border-[var(--border)]" },
+};
+
+/** Renders a money field with the confidence-gate state made explicit:
+ * a field the backend couldn't read confidently is never blank space or
+ * a silent zero - it says so. */
+function GatedMoney({
+  extract,
+  field,
+  value,
+}: {
+  extract: PayslipExtract;
+  field: string;
+  value: string | null;
+}) {
+  if (extract.unreadable_fields.includes(field)) {
+    return <span className="text-[var(--sage)] opacity-70 italic text-[0.9em]">Could not be read</span>;
+  }
+  if (value === null) {
+    return <span className="text-[var(--sage)] opacity-50">—</span>;
+  }
+  return <>{gbp(value)}</>;
+}
+
+function FindingCard({ finding }: { finding: Finding }) {
+  const style = SEVERITY_STYLES[finding.severity];
+  return (
+    <div className={`w-full bg-[var(--surface-2)] border ${style.border} rounded-2xl p-4 mb-3`}>
+      <div className="flex items-start gap-3">
+        <div
+          className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${style.badge}`}
+        >
+          {finding.severity}
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className="text-[var(--ink)] text-xs font-bold leading-tight mb-1">{finding.title}</h3>
+          <p className="text-[var(--sage)] text-[10px] leading-relaxed">{finding.explanation}</p>
+          {finding.estimate && (
+            <div className="mt-2 text-[11px] font-bold text-[var(--ink)]">
+              {finding.estimate.label}: {gbp(finding.estimate.amount_gbp)}
+            </div>
+          )}
+          {finding.next_step && (
+            <p className="text-[var(--sage)] text-[10px] mt-2 opacity-80">→ {finding.next_step}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function HomePage() {
-  const [payslip, setPayslip] = useState<Payslip | null>(null);
+  const [result, setResult] = useState<AnalysisResult | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [askOpen, setAskOpen] = useState(false);
-  const [bracketExpanded, setBracketExpanded] = useState(false);
-  const [partTimeExpanded, setPartTimeExpanded] = useState(false);
   const [showHomeWarning, setShowHomeWarning] = useState(false);
   const [premiumFeature, setPremiumFeature] = useState<string | null>(null);
+  const [copyLabel, setCopyLabel] = useState("Copy for payroll");
 
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     try {
-      const list: Payslip[] = JSON.parse(raw);
-      if (list.length > 0) setPayslip(list[list.length - 1]);
+      setResult(JSON.parse(raw) as AnalysisResult);
     } catch (err) {
-      console.error("Failed to read payslips from storage:", err);
+      console.error("Failed to read saved analysis:", err);
     }
   }, []);
 
-  const hasData = payslip !== null;
-
-  // ── Derived values (all from flat Payslip, all monthly) ─────────────────
-  const gross        = payslip?.grossPay           ?? 0;
-  const net          = payslip?.netPay             ?? 0;
-  const incomeTax    = payslip?.incomeTax          ?? 0;
-  const ni           = payslip?.nationalInsurance  ?? 0;
-  const pension      = payslip?.pensionContribution ?? 0;
-  const hourlyRate   = payslip?.hourlyRate         ?? null;
-  const taxCode      = payslip?.taxCode            ?? "1257L";
-
-  // Bar widths — each deduction as % of gross, clamped so they never overflow
-  const taxPct     = gross > 0 ? Math.min(Math.round((incomeTax / gross) * 100), 100) : 0;
-  const niPct      = gross > 0 ? Math.min(Math.round((ni        / gross) * 100), 100) : 0;
-  const pensionPct = gross > 0 ? Math.min(Math.round((pension   / gross) * 100), 100) : 0;
-  // Net bar fills the remainder — no explicit calculation needed (flex-1)
-
-  // Annual projections (monthly × 12)
-  const annualGross = gross * 12;
-  const annualNet   = net   * 12;
-
-  // Tax-free hours (personal allowance £12,570 / 12 = £1,047.50/month)
-  const monthlyAllowance = 1047.5;
-  const taxFreeHours = hourlyRate && hourlyRate > 0
-    ? Math.floor(monthlyAllowance / hourlyRate)
-    : null;
+  const hasData = result !== null;
 
   const wipeAndReset = () => {
-    localStorage.clear();
-    setPayslip(null);
+    localStorage.removeItem(STORAGE_KEY);
+    setResult(null);
     setShowHomeWarning(false);
   };
 
-  return (
-    <PrototypeScaffold step={hasData ? 1 : 0} nextHref="/upload" backHref="/manual-entry">
-      {() => (
-        <>
-          <div className="basis-screen active relative pb-14 h-full flex flex-col justify-between text-[var(--ink)] font-sans select-none">
+  const handleCopyToPayroll = async () => {
+    if (!result) return;
+    const message = buildPayrollMessage(result);
+    try {
+      await navigator.clipboard.writeText(message);
+      setCopyLabel("Copied");
+    } catch {
+      setCopyLabel("Couldn't copy");
+    }
+    setTimeout(() => setCopyLabel("Copy for payroll"), 2000);
+  };
 
+  return (
+    <PrototypeScaffold step={hasData ? 1 : 0} nextHref="/upload">
+      {() => (
+        <div className="basis-screen active relative pb-14 h-full flex flex-col justify-between text-[var(--ink)] font-sans select-none">
             {/* ── Empty state ── */}
             {!hasData ? (
               <div className="flex flex-col flex-1 animate-fadeIn">
@@ -88,12 +133,6 @@ export default function HomePage() {
                     <div className="text-white text-xl font-bold tracking-tight mt-0.5">
                       <span className="inline-block animate-wave transform-gpu origin-[70%_70%]">👋</span>
                     </div>
-                  </div>
-                  <div className="w-9 h-9 rounded-full bg-[#18231F] border border-[#263730] flex items-center justify-center text-[#FFAE34] shadow-inner">
-                    <svg width="16" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-                      <circle cx="12" cy="7" r="4" />
-                    </svg>
                   </div>
                 </div>
 
@@ -110,35 +149,22 @@ export default function HomePage() {
                   <p className="text-gray-400 text-[11px] leading-relaxed mb-6 font-normal">
                     Takes about 20 seconds. We read the numbers, then forget the file.
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => setSheetOpen(true)}
-                    className="w-full py-3 bg-[#FFAE34] hover:bg-[#E59A2B] text-black text-xs font-bold rounded-xl transition-all border-0 shadow-sm uppercase tracking-wider cursor-pointer active:scale-[0.99]"
+                  <Link
+                    href="/upload"
+                    className="w-full py-3 bg-[#FFAE34] hover:bg-[#E59A2B] text-black text-xs font-bold rounded-xl transition-all border-0 shadow-sm uppercase tracking-wider cursor-pointer active:scale-[0.99] text-center block"
                   >
                     Scan payslip
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2.5 mb-6">
-                  {["Take-Home", "Tax Paid", "Pension"].map((label) => (
-                    <div key={label} className="w-full bg-[#34423d] border border-[#515a57] rounded-xl p-3 text-left">
-                      <div className="text-white text-[9px] font-bold uppercase tracking-wider mb-1">{label}</div>
-                      <div className="text-white font-bold text-sm tracking-widest">--</div>
-                    </div>
-                  ))}
+                  </Link>
                 </div>
               </div>
-
-            ) : (
-              /* ── Dashboard ── */
-              <div className="flex flex-col flex-1 overflow-y-auto custom-scrollbar pr-1">
-
-                {/* Header */}
+            ) : result!.status !== "ok" ? (
+              /* ── Could not analyse this payslip ── */
+              <div className="flex flex-col flex-1 animate-fadeIn">
                 <div className="flex justify-between items-center w-full my-4 shrink-0">
-                  <Link href="/upload" className="text-[var(--sage)] text-base font-bold hover:text-[var(--ink)] transition-colors">‹</Link>
-                  <h1 className="text-[var(--ink)] text-xs font-bold uppercase tracking-widest flex items-center gap-1.5">
-                    <span className="inline-block animate-wave transform-gpu origin-[70%_70%]">👋</span> Welcome
-                  </h1>
+                  <Link href="/upload" className="text-[var(--sage)] text-base font-bold hover:text-[var(--ink)] transition-colors">
+                    ‹
+                  </Link>
+                  <h1 className="text-[var(--ink)] text-xs font-bold uppercase tracking-widest">Result</h1>
                   <button
                     type="button"
                     onClick={() => setShowHomeWarning(true)}
@@ -148,129 +174,174 @@ export default function HomePage() {
                   </button>
                 </div>
 
-                {/* Net pay hero */}
-                <div className="mb-5 flex flex-col items-start w-full">
-                  <span className="text-[var(--sage)] text-[10px] uppercase tracking-wider mb-1">
-                    Net Pay · {payslip.month}
-                  </span>
-                  <div
-                    className="text-[var(--ink)] text-3xl font-bold tracking-tight mb-1"
-                    style={{ textShadow: "0 0 8px var(--border)" }}
+                <div className="w-full bg-[#2a1f0e] border border-[#FFAE34]/40 rounded-2xl p-5 flex flex-col items-start text-left">
+                  <div className="text-[#FFAE34] text-xs font-bold uppercase tracking-wider mb-2">
+                    {result!.verdict?.headline ?? "We couldn't check this payslip"}
+                  </div>
+                  <p className="text-[var(--sage)] text-[11px] leading-relaxed mb-5">
+                    {result!.failure_reason ?? "Please try a different file or a clearer scan."}
+                  </p>
+                  <Link
+                    href="/upload"
+                    className="w-full py-2.5 bg-[#FFAE34] text-black text-xs font-bold rounded-xl text-center uppercase tracking-wider"
                   >
-                    {gbp(net)}
-                  </div>
-                  <div className="text-[var(--sage)] text-[11px]">
-                    of <span className="text-[var(--ink)] font-bold">{gbp(gross)} gross</span>
-                    {hourlyRate !== null && (
-                      <> · <span className="text-[var(--ink)] font-bold">{gbp(hourlyRate)}/hr</span></>
-                    )}
-                  </div>
+                    Try another payslip
+                  </Link>
                 </div>
+              </div>
+            ) : (
+              /* ── Dashboard ── */
+              <div className="flex flex-col flex-1 overflow-y-auto custom-scrollbar pr-1">
+                {(() => {
+                  const extract = result!.extract!;
+                  const gross = extract.pay.gross_this_period;
+                  const net = extract.net_pay;
+                  const tax = extract.deductions.income_tax;
+                  const ni = extract.deductions.national_insurance;
+                  const pension = extract.deductions.pension_employee;
+                  const taxCode = extract.tax_code.value;
 
-                {/* Breakdown bar — widths from real data */}
-                <div className="w-full mb-3">
-                  <div className="w-full h-2.5 bg-[var(--surface-2)] border border-[var(--border)] rounded-full overflow-hidden flex">
-                    <div className="h-full bg-[#FF9466] transition-all" style={{ width: `${taxPct}%` }} title="Tax" />
-                    <div className="h-full bg-[#5C7569] transition-all" style={{ width: `${niPct}%` }} title="NI" />
-                    {pensionPct > 0 && (
-                      <div className="h-full bg-[#2A3E34] transition-all" style={{ width: `${pensionPct}%` }} title="Pension" />
-                    )}
-                    <div className="h-full bg-[var(--ink)] flex-1 shadow-[0_0_8px_var(--ink)]" title="Net" />
-                  </div>
-                </div>
+                  const taxPct = pctOfGross(tax, gross);
+                  const niPct = pctOfGross(ni, gross);
+                  const pensionPct = pctOfGross(pension, gross);
 
-                {/* Legend — every value sourced directly from payslip */}
-                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[9px] text-[var(--sage)] mb-6">
-                  <span className="flex items-center gap-1">
-                    <span className="w-1 h-1 rounded-full bg-[#FF9466]" />
-                    Tax {gbp(incomeTax)}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-1 h-1 rounded-full bg-[#5C7569]" />
-                    NI {gbp(ni)}
-                  </span>
-                  {pension > 0 && (
-                    <span className="flex items-center gap-1">
-                      <span className="w-1 h-1 rounded-full bg-[#2A3E34]" />
-                      Pension {gbp(pension)}
-                    </span>
-                  )}
-                  <span className="flex items-center gap-1 text-[var(--ink)] font-bold">
-                    <span className="w-1 h-1 rounded-full bg-[var(--ink)]" />
-                    Net {gbp(net)}
-                  </span>
-                </div>
+                  const sortedFindings = [...result!.findings].sort(
+                    (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
+                  );
 
-                {/* Tax bracket card */}
-                <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl mb-3 overflow-hidden">
-                  <button
-                    type="button"
-                    onClick={() => setBracketExpanded(!bracketExpanded)}
-                    className="w-full p-4 flex items-center justify-between text-left focus:outline-none cursor-pointer border-0 bg-transparent"
-                  >
-                    <div className="flex items-start gap-3">
-                      <div className="w-6 h-6 rounded-lg bg-[#2E201B] border border-[#4D2E24] text-[#FF9466] flex items-center justify-center font-bold text-xs">!</div>
-                      <div>
-                        <h3 className="text-[var(--ink)] text-xs font-bold leading-tight">Tax bracket info</h3>
-                        <p className="text-[var(--sage)] text-[10px] mt-0.5">Tap to see what changes if you cross it</p>
+                  return (
+                    <>
+                      {/* Header */}
+                      <div className="flex justify-between items-center w-full my-4 shrink-0">
+                        <Link href="/upload" className="text-[var(--sage)] text-base font-bold hover:text-[var(--ink)] transition-colors">
+                          ‹
+                        </Link>
+                        <h1 className="text-[var(--ink)] text-xs font-bold uppercase tracking-widest flex items-center gap-1.5">
+                          <span className="inline-block animate-wave transform-gpu origin-[70%_70%]">👋</span> Welcome
+                        </h1>
+                        <button
+                          type="button"
+                          onClick={() => setShowHomeWarning(true)}
+                          className="text-red-500 border-0 bg-transparent text-[9px] uppercase cursor-pointer hover:underline"
+                        >
+                          Wipe
+                        </button>
                       </div>
-                    </div>
-                    <span className="text-[var(--sage)] text-xs">{bracketExpanded ? "▲" : "▼"}</span>
-                  </button>
-                  {bracketExpanded && (
-                    <div className="px-4 pb-4 pt-1 border-t border-[var(--border)] text-[10px] text-[var(--sage)] leading-relaxed animate-fadeIn">
-                      Your projected annual gross is{" "}
-                      <span className="text-[var(--ink)] font-bold">{gbp(annualGross)}</span>.{" "}
-                      {annualGross > 50270
-                        ? <>You are already in the Higher Rate (40%) band — earnings above <span className="text-[var(--ink)] font-bold">£50,270</span> are taxed at 40%.</>
-                        : <>Earnings above <span className="text-[var(--ink)] font-bold">£50,270</span> move into the Higher Rate (40%) band.{" "}
-                            You are <span className="text-[var(--ink)] font-bold">{gbp(50270 - annualGross)}</span> away from that threshold.</>
-                      }
-                    </div>
-                  )}
-                </div>
 
-                {/* Part-time card */}
-                <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl mb-4 overflow-hidden">
-                  <button
-                    type="button"
-                    onClick={() => setPartTimeExpanded(!partTimeExpanded)}
-                    className="w-full p-4 flex items-center justify-between text-left focus:outline-none cursor-pointer border-0 bg-transparent"
-                  >
-                    <div className="flex items-start gap-3">
-                      <div className="w-6 h-6 rounded-lg bg-[#1C2C24] border border-[#2B473A] text-[var(--ink)] flex items-center justify-center text-xs">🎓</div>
-                      <div>
-                        <h3 className="text-[var(--ink)] text-xs font-bold leading-tight">Working part-time at uni?</h3>
-                        <p className="text-[var(--sage)] text-[10px] mt-0.5">Tap for your tax-free hours per month</p>
+                      {/* Net pay hero */}
+                      <div className="mb-5 flex flex-col items-start w-full">
+                        <span className="text-[var(--sage)] text-[10px] uppercase tracking-wider mb-1">
+                          Net Pay{extract.period.tax_year ? ` · ${extract.period.tax_year}` : ""}
+                        </span>
+                        <div
+                          className="text-[var(--ink)] text-3xl font-bold tracking-tight mb-1"
+                          style={{ textShadow: "0 0 8px var(--border)" }}
+                        >
+                          <GatedMoney extract={extract} field="net_pay" value={net} />
+                        </div>
+                        <div className="text-[var(--sage)] text-[11px]">
+                          of{" "}
+                          <span className="text-[var(--ink)] font-bold">
+                            <GatedMoney extract={extract} field="pay.gross_this_period" value={gross} />
+                          </span>{" "}
+                          gross
+                          {taxCode && (
+                            <>
+                              {" "}
+                              · <span className="text-[var(--ink)] font-bold">{taxCode}</span>
+                            </>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    <span className="text-[var(--sage)] text-xs">{partTimeExpanded ? "▲" : "▼"}</span>
-                  </button>
-                  {partTimeExpanded && (
-                    <div className="px-4 pb-4 pt-1 border-t border-[var(--border)] text-[10px] text-[var(--sage)] leading-relaxed animate-fadeIn">
-                      Under a <span className="text-[var(--ink)] font-bold">{taxCode} tax code</span>, your personal
-                      allowance is <span className="text-[var(--ink)] font-bold">£12,570/year</span> — about{" "}
-                      <span className="text-[var(--ink)] font-bold">{gbp(monthlyAllowance)}/month</span> before tax applies.
-                      {taxFreeHours !== null
-                        ? <> At {gbp(hourlyRate!)}/hr that's roughly{" "}
-                            <span className="text-[var(--ink)] font-bold">{taxFreeHours} hours/month</span> tax-free.</>
-                        : <> Add your hourly rate when entering a payslip to see your tax-free hours.</>
-                      }
-                    </div>
-                  )}
-                </div>
 
-                {/* Annual projection */}
-                <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl p-4 mb-4 flex flex-col items-start shadow-xs">
-                  <span className="text-[var(--sage)] text-[10px] uppercase font-mono tracking-wider mb-1">
-                    Projected annual take-home
-                  </span>
-                  <div className="text-[var(--ink)] text-lg font-bold tracking-tight">{gbp(annualNet)}</div>
-                  <div className="text-[var(--sage)] text-[10px] mt-0.5">
-                    {gbp(net)}/month × 12 — based on {payslip.month}
-                  </div>
-                </div>
+                      {/* Breakdown bar */}
+                      <div className="w-full mb-3">
+                        <div className="w-full h-2.5 bg-[var(--surface-2)] border border-[var(--border)] rounded-full overflow-hidden flex">
+                          <div className="h-full bg-[#FF9466] transition-all" style={{ width: `${taxPct}%` }} title="Tax" />
+                          <div className="h-full bg-[#5C7569] transition-all" style={{ width: `${niPct}%` }} title="NI" />
+                          {pensionPct > 0 && (
+                            <div className="h-full bg-[#2A3E34] transition-all" style={{ width: `${pensionPct}%` }} title="Pension" />
+                          )}
+                          <div className="h-full bg-[var(--ink)] flex-1 shadow-[0_0_8px_var(--ink)]" title="Net" />
+                        </div>
+                      </div>
 
+                      {/* Legend */}
+                      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[9px] text-[var(--sage)] mb-6">
+                        <span className="flex items-center gap-1">
+                          <span className="w-1 h-1 rounded-full bg-[#FF9466]" />
+                          Tax <GatedMoney extract={extract} field="deductions.income_tax" value={tax} />
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <span className="w-1 h-1 rounded-full bg-[#5C7569]" />
+                          NI <GatedMoney extract={extract} field="deductions.national_insurance" value={ni} />
+                        </span>
+                        {pension !== null && (
+                          <span className="flex items-center gap-1">
+                            <span className="w-1 h-1 rounded-full bg-[#2A3E34]" />
+                            Pension <GatedMoney extract={extract} field="deductions.pension_employee" value={pension} />
+                          </span>
+                        )}
+                        <span className="flex items-center gap-1 text-[var(--ink)] font-bold">
+                          <span className="w-1 h-1 rounded-full bg-[var(--ink)]" />
+                          Net <GatedMoney extract={extract} field="net_pay" value={net} />
+                        </span>
+                      </div>
+
+                      {/* Verdict + score */}
+                      {result!.verdict && (
+                        <div
+                          className={`w-full rounded-2xl p-4 mb-4 border ${
+                            SEVERITY_STYLES[result!.verdict.severity].border
+                          } bg-[var(--surface-2)]`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-[var(--ink)] text-xs font-bold">{result!.verdict.headline}</span>
+                            {result!.score && (
+                              <span className="text-[var(--sage)] text-[10px]">
+                                {result!.score.checks_passed}/{result!.score.checks_run} checks clear
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Findings */}
+                      {sortedFindings.length > 0 && (
+                        <div className="w-full mb-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
+                            What we found
+                          </div>
+                          {sortedFindings.map((finding) => (
+                            <FindingCard key={finding.id} finding={finding} />
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Fields that couldn't be read */}
+                      {extract.unreadable_fields.length > 0 && (
+                        <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl p-4 mb-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
+                            Couldn&apos;t read confidently
+                          </div>
+                          <p className="text-[var(--sage)] text-[10px] leading-relaxed">
+                            {extract.unreadable_fields.join(", ")} — nothing was guessed for these; any check that
+                            depends on them was skipped rather than estimated.
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Copy to payroll */}
+                      <button
+                        type="button"
+                        onClick={handleCopyToPayroll}
+                        className="w-full py-3 mb-4 bg-[var(--surface-2)] border border-[var(--border)] text-[var(--ink)] text-xs font-bold rounded-xl uppercase tracking-wider hover:border-[#FFAE34]/40 transition-colors cursor-pointer"
+                      >
+                        {copyLabel}
+                      </button>
+                    </>
+                  );
+                })()}
               </div>
             )}
 
@@ -278,7 +349,9 @@ export default function HomePage() {
             <div className="basis-bottom-nav flex justify-center items-center gap-16 border-t border-[var(--border)] pt-4 mt-auto shrink-0 w-full relative z-20">
               <button
                 type="button"
-                onClick={() => { if (hasData) setShowHomeWarning(true); }}
+                onClick={() => {
+                  if (hasData) setShowHomeWarning(true);
+                }}
                 className="text-[var(--amber)] text-xs flex flex-col items-center gap-1 font-bold cursor-pointer border-0 bg-transparent focus:outline-none"
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-[#FFAE34]" />
@@ -293,15 +366,6 @@ export default function HomePage() {
               </button>
             </div>
 
-            {/* ── FAB ── */}
-            <button
-              type="button"
-              onClick={() => setAskOpen(true)}
-              className="absolute right-4 bottom-14 w-12 h-12 bg-[#FFAE34] hover:bg-[#E59A2B] text-black font-bold text-lg rounded-full flex items-center justify-center shadow-lg cursor-pointer border-0 active:scale-95 transition-transform z-50"
-            >
-              ?
-            </button>
-
             {/* ── Sheet backdrop ── */}
             <button
               type="button"
@@ -309,33 +373,6 @@ export default function HomePage() {
               onClick={() => setSheetOpen(false)}
               aria-label="Close menu"
             />
-
-            {/* ── Add payslip sheet ── */}
-            <div className={`fixed bottom-0 left-0 right-0 max-w-sm mx-auto bg-[var(--surface)] border-t border-[var(--border)] rounded-t-2xl px-6 pt-3 pb-8 transition-transform duration-300 z-50 flex flex-col shadow-2xl ${sheetOpen ? "translate-y-0" : "translate-y-full"}`}>
-              <div className="w-12 h-1.5 bg-[var(--surface-2)] rounded-full mx-auto mb-6" />
-              <div className="text-[var(--ink)] text-base font-bold mb-4 uppercase tracking-wider">Add your payslip</div>
-              <Link
-                className="flex items-center gap-4 bg-[var(--surface-2)] border border-[var(--border)] text-[var(--ink)] p-4 rounded-xl mb-3 font-medium transition-all hover:opacity-90"
-                href="/upload?source=file"
-                onClick={() => setSheetOpen(false)}
-              >
-                📄 Upload PDF
-              </Link>
-              <Link
-                className="flex items-center gap-4 bg-[var(--surface-2)] border border-[var(--border)] text-[var(--ink)] p-4 rounded-xl mb-6 font-medium transition-all hover:opacity-90"
-                href="/upload"
-                onClick={() => setSheetOpen(false)}
-              >
-                ✍️ Enter manually
-              </Link>
-              <button
-                type="button"
-                onClick={() => setSheetOpen(false)}
-                className="w-full py-3 bg-transparent border border-[var(--border)] text-[var(--sage)] hover:text-[var(--ink)] font-bold rounded-xl text-xs uppercase tracking-widest cursor-pointer transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
 
             {/* ── Wipe warning modal ── */}
             {showHomeWarning && (
@@ -345,7 +382,7 @@ export default function HomePage() {
                     ⚠️ Clear data?
                   </div>
                   <p className="text-[var(--ink)] text-xs leading-relaxed font-normal mb-6">
-                    This will remove all saved payslips from this device. You'll need to scan or enter them again.
+                    This will remove the saved payslip result from this device. You&apos;ll need to scan it again.
                   </p>
                   <div className="flex flex-col gap-2">
                     <button
@@ -372,27 +409,13 @@ export default function HomePage() {
               <div className="absolute inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-5 z-50 animate-fadeIn">
                 <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl p-5 flex flex-col text-left font-mono">
                   <div className="text-[var(--amber)] text-sm font-bold uppercase tracking-wider mb-3">🔒 Premium Feature</div>
-                  {premiumFeature === "insights" ? (
-                    <>
-                      <h3 className="text-white text-xs font-bold mb-3">Historical Pay Trend Analytics</h3>
-                      <ul className="text-[var(--sage)] text-[11px] list-none p-0 m-0 flex flex-col gap-2 mb-6 font-normal">
-                        <li>• Historic timeline graphing</li>
-                        <li>• Tax year reconciliations</li>
-                        <li>• Multi-job aggregate tracking</li>
-                        <li>• Tax refund estimator</li>
-                      </ul>
-                    </>
-                  ) : (
-                    <>
-                      <h3 className="text-white text-xs font-bold mb-3">Workspace Cloud Sync</h3>
-                      <ul className="text-[var(--sage)] text-[11px] list-none p-0 m-0 flex flex-col gap-2 mb-6 font-normal">
-                        <li>• Secure cloud backups</li>
-                        <li>• Custom tax-code overrides</li>
-                        <li>• Multiple profile workspaces</li>
-                        <li>• Exportable HMRC ledger reports</li>
-                      </ul>
-                    </>
-                  )}
+                  <h3 className="text-white text-xs font-bold mb-3">Historical Pay Trend Analytics</h3>
+                  <ul className="text-[var(--sage)] text-[11px] list-none p-0 m-0 flex flex-col gap-2 mb-6 font-normal">
+                    <li>• Historic timeline graphing</li>
+                    <li>• Tax year reconciliations</li>
+                    <li>• Multi-job aggregate tracking</li>
+                    <li>• Tax refund estimator</li>
+                  </ul>
                   <div className="flex flex-col gap-2">
                     <button
                       type="button"
@@ -412,11 +435,7 @@ export default function HomePage() {
                 </div>
               </div>
             )}
-
           </div>
-
-          <AskSheet open={askOpen} onOpen={() => setAskOpen(true)} onClose={() => setAskOpen(false)} />
-        </>
       )}
     </PrototypeScaffold>
   );
