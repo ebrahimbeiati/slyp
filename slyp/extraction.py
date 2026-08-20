@@ -111,13 +111,18 @@ class RedactionMap:
         self.replacements.setdefault(token, []).append(original)
 
 
+# Separator class shared by every structured-number pattern below: space,
+# period, hyphen or slash, any number of them, including a line break
+# (\s matches \n). A real payslip prints these numbers with arbitrary
+# internal punctuation ("AB 12 34 56 C", "AB.12.34.56.C", a value split
+# across a wrapped line) - every character boundary tolerates this rather
+# than assuming one canonical separator.
+_SEP = r"[\s./-]*"
+
 # NI number: two letters (excluding D,F,I,Q,U,V - not valid prefix
-# letters), six digits, one suffix letter A-D. Real payslips print these
-# with arbitrary internal spacing ("AB 12 34 56 C"), so every boundary
-# between characters gets an optional \s* rather than requiring the
-# compact form.
+# letters), six digits, one suffix letter A-D.
 _NI_NUMBER_RE = re.compile(
-    r"\b[A-CEGHJ-PR-TW-Z]\s*[A-CEGHJ-PR-TW-Z]\s*(?:\d\s*){6}[A-D]\b",
+    rf"\b[A-CEGHJ-PR-TW-Z]{_SEP}[A-CEGHJ-PR-TW-Z]{_SEP}(?:\d{_SEP}){{6}}[A-D]\b",
     re.IGNORECASE,
 )
 
@@ -127,15 +132,25 @@ _NI_NUMBER_RE = re.compile(
 # address block with a regex.
 _POSTCODE_RE = re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", re.IGNORECASE)
 
-# Sort code: "12-34-56" or "12 34 56".
-_SORT_CODE_RE = re.compile(r"\b\d{2}[-\s]\d{2}[-\s]\d{2}\b")
+# Sort code: three pairs of digits, each pair separated by one of
+# space/hyphen/slash - "12-34-56", "12 34 56", "12/34/56", or mixed
+# ("12-34/56"). Deliberately NOT "." here (unlike the other patterns in
+# this section): two adjacent currency amounts like "37.60 13.85" would
+# otherwise match as a fake sort code ("60 13.85") purely because a
+# decimal point is a valid separator character - a collision that can't
+# happen for NI numbers (which require letters at fixed positions no
+# money figure has). Sort codes aren't printed with periods on a real
+# payslip anyway; the reported gap (F6) was slashes, not periods.
+_SORT_CODE_RE = re.compile(r"\b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b")
 
-# Account number: bare 8 digits. Deliberately not label-anchored - real
-# payslips don't always print an "Account Number:" label next to it. That
-# also makes it the noisiest pattern here (an 8-digit reference number
-# would also match); assert_safe_to_send and the allowlist are the
-# backstops for what this over-redacts or misses, not this regex alone.
-_ACCOUNT_NUMBER_RE = re.compile(r"\b\d{8}\b")
+# Account number: 8 digits, each optionally separated from the next by
+# one of the same characters (excluding "." for the same reason as sort
+# code, above). Deliberately not label-anchored - real payslips don't
+# always print an "Account Number:" label next to it. That also makes it
+# the noisiest pattern here (an 8-digit reference number would also
+# match); assert_safe_to_send and the allowlist are the backstops for
+# what this over-redacts or misses, not this regex alone.
+_ACCOUNT_NUMBER_RE = re.compile(r"\b\d(?:[-\s/]?\d){7}\b")
 
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
@@ -332,13 +347,49 @@ _PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("phone", _PHONE_RE),
 )
 
+# A run of 6 or more digits, tolerating the same separators as the
+# structured-number patterns above. Used only as the SECOND, independent
+# check in assert_safe_to_send() - see there for why. Applied to text that
+# has already had every recognised-safe numeric shape (currency, percent,
+# date, tax code) masked out, so a legitimate payslip figure never reaches
+# it: by that point in the pipeline, any digit run this long left over
+# isn't a gross figure or a YTD total (both always have a two-decimal-
+# place currency shape in this codebase), it's something unaccounted for.
+_UNEXPLAINED_DIGIT_RUN_RE = re.compile(r"(?:\d[\s./-]*){6,}")
+
+
+def _mask_known_safe_numbers(text: str) -> str:
+    """Strip every span that legitimately explains a run of digits on a
+    payslip line, leaving only what neither the allowlist nor a normal
+    payslip figure accounts for."""
+    masked = _CURRENCY_RE.sub(" ", text)
+    masked = _PERCENT_RE.sub(" ", masked)
+    masked = _DATE_RE.sub(" ", masked)
+    masked = _TAX_CODE_LINE_RE.sub(" ", masked)
+    return masked
+
 
 def assert_safe_to_send(payload: str) -> None:
     """
-    Final gate, immediately before the API call. Re-scans the exact
-    payload about to be sent with the same patterns redact() uses, and
-    raises rather than sending if anything still matches. Fails closed:
-    if this raises, the caller must not send the payload anyway.
+    Final gate, immediately before the API call. Fails closed: if this
+    raises, the caller must not send the payload anyway.
+
+    Two independent checks, not one:
+
+    1. Re-scans with the same shaped patterns redact() uses. This catches
+       PII that survives on an otherwise-legitimate line - e.g. an NI
+       number sitting next to a currency amount, which the allowlist
+       keeps for the currency amount alone (see the module docstring for
+       why redact() must run before financial_lines_only()).
+
+    2. Masks out every recognised-safe numeric shape (currency, percent,
+       date, tax code) and refuses if 6 or more digits remain anywhere in
+       what's left. This doesn't know what an NI number, sort code or
+       account number looks like, so it can't share check 1's blind spot
+       for a shape neither regex set recognises yet - it catches by the
+       ABSENCE of an explanation for a run of digits, not by recognising
+       a specific kind of personal data. "Two labels on one control" is
+       exactly what this function used to be with only check 1.
 
     Deliberately does not include the matched text in the exception
     message - the point of this function is to stop PII leaving the
@@ -347,6 +398,11 @@ def assert_safe_to_send(payload: str) -> None:
     for label, pattern in _PII_RECHECK_PATTERNS:
         if pattern.search(payload):
             raise RedactionFailure(f"payload still matches a PII pattern: {label}")
+
+    if _UNEXPLAINED_DIGIT_RUN_RE.search(_mask_known_safe_numbers(payload)):
+        raise RedactionFailure(
+            "payload has an unexplained run of digits with no financial shape"
+        )
 
 
 # ==========================================================================

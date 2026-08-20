@@ -129,9 +129,13 @@ def test_extract_text_raises_on_no_text_layer():
     [
         "AB 12 34 56 C",  # spaced NI number - the real-world case
         "AB123456C",  # compact NI number
+        "AB.12.34.56.C",  # periods (F6 - was a full bypass)
+        "ry449943d",  # lowercase, no separators
         "ZZ99 9ZZ",  # postcode
         "12-34-56",  # sort code, dashed
         "12 34 56",  # sort code, spaced
+        "12/34/56",  # sort code, slashed (F6 - was a full bypass)
+        "12-34/56",  # sort code, mixed separators
     ],
 )
 def test_canary_values_do_not_survive_redaction(canary):
@@ -139,6 +143,13 @@ def test_canary_values_do_not_survive_redaction(canary):
     redacted, redaction_map = redact(text)
     assert canary not in redacted
     assert any(canary in values for values in redaction_map.replacements.values())
+
+
+def test_ni_number_split_across_a_line_break_is_redacted():
+    text = "NI Number RY 44 99\n43 D National Insurance 0.00"
+    redacted, redaction_map = redact(text)
+    assert "RY 44 99\n43 D" not in redacted
+    assert "[NI]" in redacted
 
 
 def test_canary_values_do_not_survive_the_full_outbound_payload():
@@ -181,6 +192,20 @@ def test_labelled_employee_number_is_redacted():
     redacted, redaction_map = redact("Works Number 602")
     assert "602" not in redacted
     assert "[EMPLOYEE_NO]" in redacted
+
+
+def test_multi_line_address_is_dropped_by_the_allowlist():
+    # A multi-line address has no labelled anchor on every line, so
+    # redact() only catches the postcode - it's financial_lines_only()
+    # that drops the unlabelled street/town lines, since they carry no
+    # currency, date, tax-code or known-label content either.
+    text = "123 Fake Street\nFaketown\nSW1A 1AA"
+    redacted, _ = redact(text)
+    payload = financial_lines_only(redacted)
+    assert "123 Fake Street" not in payload
+    assert "Faketown" not in payload
+    assert "SW1A 1AA" not in payload
+    assert_safe_to_send(payload)
 
 
 # --------------------------------------------------------------------------
@@ -258,6 +283,36 @@ def test_assert_safe_to_send_does_not_leak_the_match_in_its_message():
         assert "payroll@example.com" not in str(exc)
     else:
         pytest.fail("expected RedactionFailure")
+
+
+def test_gate_catches_a_shape_none_of_the_named_pii_patterns_recognise():
+    """
+    The independence check for the gate's second layer (item 35): a bare
+    digit run that doesn't match ANY of the specific PII shapes redact()
+    knows about (not an NI number, not a sort code, not an account
+    number, not a phone number) still trips the gate, because it has no
+    financial explanation (no currency/percent/date/tax-code shape). This
+    is the property that makes the gate more than "the same regex, run
+    twice" - see slyp.extraction._PII_RECHECK_PATTERNS.
+    """
+    from slyp.extraction import _PII_RECHECK_PATTERNS
+
+    payload = "Some Internal Reference 123456789 National Insurance 0.00"
+
+    assert not any(pattern.search(payload) for _label, pattern in _PII_RECHECK_PATTERNS)
+
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(payload)
+
+
+def test_gate_does_not_false_positive_on_clean_multi_field_text():
+    payload = (
+        "Tax Code 1257L Income Tax 0.00\n"
+        "Pay Date 31-Mar-2026 Rate 1 37.60 13.85 520.76\n"
+        "National Insurance 0.00\n"
+        "Taxable Gross Pay 854.07\n"
+    )
+    assert_safe_to_send(payload)
 
 
 # --------------------------------------------------------------------------
