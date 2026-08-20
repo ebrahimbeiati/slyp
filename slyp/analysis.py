@@ -145,7 +145,7 @@ def analyse_payslip(
 
         breakdown = calculate_pay_breakdown(facts)
 
-        comparison = comparison_from_breakdown(breakdown)
+        comparison = comparison_from_breakdown(breakdown, extract)
 
         # Full-year projection, for the under-Personal-Allowance gate.
         # This is a gate, not a displayed figure — see annualise()'s

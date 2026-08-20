@@ -1247,6 +1247,18 @@ def generate_findings(
         findings.append(finding)
 
     # ----------------------------------------------------------------------
+    # 5b. Net pay
+    # ----------------------------------------------------------------------
+
+    finding = _check_net_pay(
+        extract=extract,
+        comparison=comparison,
+    )
+
+    if finding is not None:
+        findings.append(finding)
+
+    # ----------------------------------------------------------------------
     # 6. Pension
     # ----------------------------------------------------------------------
 
@@ -2008,6 +2020,88 @@ def _check_student_loan(
 
 
 # ============================================================================
+# Net pay
+# ============================================================================
+
+
+def _check_net_pay(
+    extract: PayslipExtract,
+    comparison: CalculationComparison,
+) -> Optional[Finding]:
+    """
+    Compare payslip net pay against the engine's expected net pay.
+
+    comparison.expected_net already accounts for the payslip's own
+    pension and other-deduction lines (see comparison_from_breakdown) -
+    it is only ever populated when the engine is confident every
+    deduction line was captured, so this can never raise a mismatch
+    caused solely by an uncounted pension or other deduction.
+    """
+
+    if comparison.expected_net is None:
+        return None
+
+    if _any_unreadable(extract, ["net_pay", "pay.gross_this_period"]):
+        return None
+
+    actual = extract.net_pay
+
+    if actual is None:
+        return None
+
+    difference = actual - comparison.expected_net
+
+    if abs(difference) < MEANINGFUL_DIFFERENCE:
+        return None
+
+    if difference > 0:
+        title = "Net pay looks higher than expected"
+
+        explanation = (
+            f"The payslip shows £{actual:.2f} net pay. Based on the "
+            f"deductions shown and the calculation engine, the expected "
+            f"amount is £{comparison.expected_net:.2f}. That is "
+            f"£{difference:.2f} higher."
+        )
+    else:
+        difference_abs = abs(difference)
+
+        title = "Net pay looks lower than expected"
+
+        explanation = (
+            f"The payslip shows £{actual:.2f} net pay. Based on the "
+            f"deductions shown and the calculation engine, the expected "
+            f"amount is £{comparison.expected_net:.2f}. That is "
+            f"£{difference_abs:.2f} lower."
+        )
+
+    return Finding(
+        id="net_pay_differs_from_calculation",
+        severity="action",
+        title=title,
+        explanation=explanation,
+        estimate=Estimate(
+            label="Difference from calculated net pay",
+            amount_gbp=abs(difference),
+        ),
+        next_step=(
+            "Check the deductions shown on the payslip against this "
+            "figure. If the difference remains unexplained, ask payroll "
+            "to confirm it."
+        ),
+        source_fields=[
+            "net_pay",
+            "pay.gross_this_period",
+            "deductions.income_tax",
+            "deductions.national_insurance",
+            "deductions.student_loan",
+            "deductions.pension_employee",
+            "deductions.other",
+        ],
+    )
+
+
+# ============================================================================
 # Pension
 # ============================================================================
 
@@ -2419,16 +2513,36 @@ def _is_not_a_payslip(
 
 def comparison_from_breakdown(
     breakdown: PayBreakdown,
+    extract: PayslipExtract,
 ) -> CalculationComparison:
     """
     Convert the calculation engine's PayBreakdown into the format expected
     by the findings layer.
 
+    expected_pension is always None. calculate_pay_breakdown() never
+    calculates pension independently (it's scheme-specific - see that
+    function's own docstring), so there is no genuine "expected" pension
+    figure to hold the payslip's pension line up against. Comparing the
+    real figure against a hardcoded zero is not a comparison, it's a
+    guaranteed false mismatch on every payslip with a pension deduction -
+    which is most of them.
+
+    expected_net accounts for that same gap: it subtracts the payslip's
+    own pension and other-deduction lines (real money the engine can't
+    independently calculate but can still subtract), not just the three
+    components the engine does calculate. It is None - never a wrong
+    number - unless pension is confidently readable AND the payslip's
+    own figures are confirmed to reconcile (extract.reconciles is True,
+    not just not-False). reconciles is the one signal already in the
+    contract for "every deduction line was actually captured"; anything
+    less certain than an explicit True means a deduction could be
+    missing, so there's nothing safe to compare net pay against.
+
     Example:
 
         breakdown = calculate_pay(facts)
 
-        comparison = comparison_from_breakdown(breakdown)
+        comparison = comparison_from_breakdown(breakdown, extract)
 
         findings = generate_findings(
             extract,
@@ -2436,10 +2550,38 @@ def comparison_from_breakdown(
         )
     """
 
+    pension_readable = "deductions.pension_employee" not in extract.unreadable_fields
+    every_deduction_captured = extract.reconciles is True
+
+    expected_net = None
+
+    if pension_readable and every_deduction_captured:
+        pension = extract.deductions.pension_employee or ZERO_GBP
+
+        other_total = sum(
+            (item.amount for item in extract.deductions.other),
+            ZERO_GBP,
+        )
+
+        expected_net = (
+            breakdown.gross
+            - breakdown.income_tax
+            - breakdown.national_insurance
+            - breakdown.student_loan
+            - pension
+            - other_total
+        )
+
+    net_difference = None
+
+    if expected_net is not None and extract.net_pay is not None:
+        net_difference = extract.net_pay - expected_net
+
     return CalculationComparison(
         expected_income_tax=breakdown.income_tax,
         expected_national_insurance=breakdown.national_insurance,
         expected_student_loan=breakdown.student_loan,
-        expected_pension=breakdown.pension_employee,
-        expected_net=breakdown.net,
+        expected_pension=None,
+        expected_net=expected_net,
+        net_difference=net_difference,
     )
