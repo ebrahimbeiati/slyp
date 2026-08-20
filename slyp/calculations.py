@@ -366,7 +366,7 @@ Never use float for money.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 

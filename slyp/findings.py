@@ -1071,7 +1071,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
-from contract import (
+from .contract import (
     AnalysisResult,
     Estimate,
     Finding,
@@ -1080,7 +1080,7 @@ from contract import (
     UserContext,
     Verdict,
 )
-from types import (
+from .types import (
     PayBreakdown,
     TaxCode,
 )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from contract import (
+from .contract import (
     AnalysisResult,
     Finding,
     PayslipExtract,
@@ -14,12 +14,12 @@ from contract import (
     Verdict,
 )
 
-from calculations import (
+from .calculations import (
     calculate_pay_breakdown,
     parse_tax_code,
 )
 
-from findings import (
+from .findings import (
     CalculationComparison,
     comparison_from_breakdown,
     generate_findings,
