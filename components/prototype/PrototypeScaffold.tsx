@@ -1,73 +1,92 @@
 "use client";
 
 import Link from "next/link";
-import { ReactNode } from "react";
+import { useState, useEffect, ReactNode } from "react";
 
 interface ScaffoldProps {
   step: number;
   nextHref: string;
-  backHref?: string; // 👈 FIXED: Added the "?" symbol to make this an optional string
-  annotation: {
-    number: string;
-    title: string;
-    description: string;
-  };
+  backHref?: string;
   children: () => ReactNode;
 }
 
-export function PrototypeScaffold({ step, nextHref, backHref, annotation, children }: ScaffoldProps) {
+export function PrototypeScaffold({ step, nextHref, backHref, children }: ScaffoldProps) {
+  const [isDark, setIsDark] = useState(true);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const savedTheme = localStorage.getItem("slyp:theme");
+      // Default to dark mode if no previous preference is recorded
+      const darkActive = savedTheme ? savedTheme === "dark" : true;
+      
+      // FIXED: Deferred state assignment to prevent cascading render layout warnings
+      requestAnimationFrame(() => {
+        setIsDark(darkActive);
+        
+        if (darkActive) {
+          document.documentElement.classList.add("dark");
+        } else {
+          document.documentElement.classList.remove("dark");
+        }
+      });
+    }
+  }, []);
+
+
+  const handleToggleTheme = () => {
+    const nextDark = !isDark;
+    setIsDark(nextDark);
+    
+    if (typeof window !== "undefined") {
+      localStorage.setItem("slyp:theme", nextDark ? "dark" : "light");
+      if (nextDark) {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#090D0B] text-gray-200 flex flex-col items-center justify-start p-4 font-sans select-none">
+    <div className="min-h-screen bg-[var(--bg-deep)] text-[var(--ink)] flex flex-col items-center justify-start p-4 font-mono select-none transition-colors duration-300 w-full">
+      
       {/* Top Global Flow Controller Bar */}
-      <div className="w-full max-w-md text-center mb-6 pt-2">
-        <div className="text-[10px] text-gray-500 font-mono tracking-widest uppercase mb-3">
-          BASIS — PAYSLIP & INCOME COMPANION · CLICK THROUGH THE FLOW
-        </div>
-        <div className="inline-flex bg-[#161C19] border border-[#232A26] rounded-full p-1 gap-1">
-          <Link href="/" className={`px-4 py-1.5 rounded-full text-xs font-medium transition-colors ${step === 0 ? "bg-[#FFAE34] text-black" : "text-gray-400 hover:text-white"}`}>
-            First payslip
-          </Link>
-          <Link href="/" className={`px-4 py-1.5 rounded-full text-xs font-medium transition-colors ${step === 1 ? "bg-[#FFAE34] text-black" : "text-gray-400 hover:text-white"}`}>
-            After 4 payslips
-          </Link>
+      <div className="w-full max-w-md text-center mb-6 pt-2 flex flex-col items-center gap-3">
+      
+        <div className="flex items-center gap-3 justify-center">
+          <div className="inline-flex bg-[var(--surface-2)] border border-[var(--border)] rounded-full p-1 gap-1 shadow-sm">
+            <Link href="/" className={`px-4 py-2 rounded-3xl text-xs font-bold transition-colors bg-[#FFAE34] hover:bg-[#E59A2B] text-black font-bold" : "text-gray-400 hover:text-[var(--ink)]"}`}>
+              First payslip
+            </Link>
+            <Link href="#" onClick={(e) => { e.preventDefault(); alert("🔒 Premium Tier\n\nMulti-payslip timelines require an upgraded active subscription."); }} className="px-4 py-1.5 rounded-full text-xs font-medium text-gray-500 hover:text-[var(--amber)]">
+              After 4 payslips
+            </Link>
+          </div>
+          
+          {/* Native Inline Mode Toggle Button Trigger */}
+          <button 
+            type="button" 
+            onClick={handleToggleTheme} 
+            className="px-3 py-1.5 rounded-full bg-[var(--surface)] border border-[var(--border)] text-[var(--ink)] text-xs font-medium cursor-pointer shadow-sm min-w-[76px] hover:opacity-90 active:scale-95 transition-all"
+          >
+            {isDark ? "☀️ Light" : "🌙 Dark"}
+          </button>
         </div>
       </div>
 
       {/* Main Interactive Mobile Viewport Frame */}
-      <div className="w-full max-w-sm bg-[#0D110F] border border-[#1C2420] rounded-[40px] p-6 shadow-2xl relative overflow-hidden aspect-[9/19] flex flex-col justify-between mb-6">
+      <div className="w-full max-w-sm bg-[var(--surface)] border border-[var(--border)] rounded-[40px] p-6 shadow-2xl relative overflow-hidden aspect-[9/19] flex flex-col justify-between mb-6 transition-colors duration-300">
         {children()}
       </div>
 
-      {/* Bottom Interactive Annotation Frame */}
-      <div className="w-full max-w-sm bg-[#111614] border border-[#1E2522] rounded-2xl p-5 text-left font-mono">
-        <div className="text-[#FFAE34] text-xs font-bold mb-1">{annotation.number}</div>
-        <div className="text-white text-sm font-semibold mb-2">{annotation.title}</div>
-        <div className="text-gray-400 text-xs leading-relaxed mb-4">{annotation.description}</div>
-        
-        {/* Navigation Buttons */}
-        <div className="flex justify-between items-center border-t border-[#1C2420] pt-3">
-          {/* FIXED: Check if backHref exists. If yes, render Link. If no, render disabled button to prevent 500 crashes */}
-          {backHref ? (
-            <Link 
-              href={backHref} 
-              className="text-gray-300 hover:text-white text-xs flex items-center gap-1 transition-colors font-medium"
-            >
-              ← Back
-            </Link>
-          ) : (
-            <button 
-              type="button"
-              className="text-gray-600 text-xs flex items-center gap-1 cursor-not-allowed font-medium" 
-              disabled
-            >
-              ← Back
-            </button>
-          )}
-
-          <Link href={nextHref} className="bg-white hover:bg-gray-200 text-black text-xs font-semibold px-4 py-1.5 rounded-lg flex items-center gap-1 transition-colors">
-            Next →
-          </Link>
-        </div>
+      {/* Navigation Footers positioned outside phone layout frame */}
+      <div className="w-full max-w-sm flex justify-between items-center px-4 pt-1">
+        {backHref ? (
+          <Link href={backHref} className="bg-[var(--ink)] text-[var(--surface)] hover:text-[var(--ink)] text-xs font-bold rounded-lg px-4 py-2">← Back</Link>
+        ) : (
+          <button type="button" className="bg-[var(--ink)] text-[var(--surface)] opacity-30 text-xs font-bold px-4 py-2 rounded-lg cursor-not-allowed" disabled>← Back</button>
+        )}
+        <Link href={nextHref} className="bg-[var(--ink)] text-[var(--surface)] hover:opacity-90 text-xs font-bold px-4 py-2 rounded-lg shadow-sm">Next →</Link>
       </div>
     </div>
   );

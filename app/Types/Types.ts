@@ -1,6 +1,4 @@
-// Data model — build spec §1.
-// Everything on screen derives from these. If a screen needs a field
-// that isn't here, add it here first, not as a one-off prop.
+
 
 export type Payslip = {
   id: string;

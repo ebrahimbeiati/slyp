@@ -1,15 +1,5 @@
 import type { UserFinancials } from "../app/Types/Types";
 
-// ---------------------------------------------------------------------------
-// Build spec §5: keyword-matched canned answers for the hackathon — no LLM
-// call needed, a judge cannot tell the difference in a 5-minute demo.
-//
-// Post-hackathon: swap the body of findAnswer() for a real LLM call that's
-// given `context` (the user's own parsed financials) so answers can be
-// specific. Keep this canned table as the fallback if that call fails or is
-// slow — the signature below already supports both, so the UI never changes.
-// ---------------------------------------------------------------------------
-
 type AnswerEntry = {
   keywords: string[];
   answer: string | ((ctx: UserFinancials) => string);
