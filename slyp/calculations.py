@@ -998,25 +998,12 @@ def cumulative_income_tax_due(
     if facts.tax_code.cumulative is False:
         return non_cumulative_income_tax_due(facts)
 
-    # We need the tax allowance accumulated up to the current period.
-    periods = periods_in_year(facts.frequency)
-
     current_period = facts.period_number
 
-    accumulated_allowance = (
-        facts.tax_code.free_pay_annual * Decimal(current_period) / Decimal(periods)
-    )
-
-    # K codes have negative allowance.
-    cumulative_taxable = facts.gross_ytd - accumulated_allowance
-
-    cumulative_taxable = max(
-        ZERO,
-        cumulative_taxable,
-    )
-
-    cumulative_tax = cumulative_tax_on_taxable_amount(
-        cumulative_taxable,
+    cumulative_tax = cumulative_tax_due_to_date(
+        facts.gross_ytd,
+        current_period,
+        facts.frequency,
         facts.tax_code,
     )
 
@@ -1032,17 +1019,10 @@ def cumulative_income_tax_due(
     if current_period <= 1 or previous_gross_ytd <= ZERO:
         return money(cumulative_tax)
 
-    previous_allowance = (
-        facts.tax_code.free_pay_annual * Decimal(current_period - 1) / Decimal(periods)
-    )
-
-    previous_taxable = max(
-        ZERO,
-        previous_gross_ytd - previous_allowance,
-    )
-
-    previous_tax = cumulative_tax_on_taxable_amount(
-        previous_taxable,
+    previous_tax = cumulative_tax_due_to_date(
+        previous_gross_ytd,
+        current_period - 1,
+        facts.frequency,
         facts.tax_code,
     )
 
@@ -1053,6 +1033,41 @@ def cumulative_income_tax_due(
             ZERO,
             current_tax,
         )
+    )
+
+
+def cumulative_tax_due_to_date(
+    gross_ytd: Decimal,
+    period_number: int,
+    frequency: Frequency,
+    tax_code: TaxCode,
+) -> Decimal:
+    """
+    Tax that should have been deducted in total, from period 1 through the
+    given period, under a cumulative tax code.
+
+    Used both by cumulative_income_tax_due() (this period's figure is
+    to-date minus the prior period's to-date figure) and by the findings
+    layer, which uses it to work out what a cumulative code WOULD have
+    deducted by now — the comparison an emergency/non-cumulative code's
+    overpayment estimate depends on.
+    """
+
+    periods = periods_in_year(frequency)
+
+    accumulated_allowance = (
+        tax_code.free_pay_annual * Decimal(period_number) / Decimal(periods)
+    )
+
+    # K codes have negative allowance.
+    cumulative_taxable = max(
+        ZERO,
+        non_negative(gross_ytd) - accumulated_allowance,
+    )
+
+    return cumulative_tax_on_taxable_amount(
+        cumulative_taxable,
+        tax_code,
     )
 
 

@@ -1114,11 +1114,24 @@ class CalculationComparison:
     pension_difference: Optional[Decimal] = None
     net_difference: Optional[Decimal] = None
 
+    # Full-year projection (annualise()) and the tax code's implied Personal
+    # Allowance — used only to gate the under-allowance finding. Never
+    # shown to the user as a pound figure.
+    annualised_gross_ytd: Optional[Decimal] = None
+    personal_allowance_annual: Optional[Decimal] = None
+
+    # What a cumulative tax code would have deducted year-to-date, on the
+    # same figures — the comparator for the emergency-code overpayment
+    # estimate. Only meaningful when the actual code is non-cumulative.
+    cumulative_equivalent_tax_ytd: Optional[Decimal] = None
+
 
 # ============================================================================
 # Constants
 # ============================================================================
 
+
+ZERO_GBP = Decimal("0")
 
 MONEY_TOLERANCE = Decimal("0.01")
 
@@ -1181,6 +1194,7 @@ def generate_findings(
         _check_tax_code(
             extract=extract,
             user_context=context,
+            comparison=comparison,
         )
     )
 
@@ -1189,6 +1203,18 @@ def generate_findings(
     # ----------------------------------------------------------------------
 
     finding = _check_income_tax(
+        extract=extract,
+        comparison=comparison,
+    )
+
+    if finding is not None:
+        findings.append(finding)
+
+    # ----------------------------------------------------------------------
+    # 3b. Full year under the Personal Allowance, but tax is being deducted
+    # ----------------------------------------------------------------------
+
+    finding = _check_under_personal_allowance(
         extract=extract,
         comparison=comparison,
     )
@@ -1409,6 +1435,7 @@ def _check_reconciliation(
 def _check_tax_code(
     extract: PayslipExtract,
     user_context: UserContext,
+    comparison: CalculationComparison,
 ) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -1550,10 +1577,75 @@ def _check_tax_code(
                     "you have recently changed jobs."
                 ),
                 source_fields=["tax_code.value"],
+                estimate=_emergency_code_overpayment_estimate(
+                    extract=extract,
+                    comparison=comparison,
+                    user_context=user_context,
+                ),
             )
         )
 
     return findings
+
+
+def _emergency_code_overpayment_estimate(
+    extract: PayslipExtract,
+    comparison: CalculationComparison,
+    user_context: UserContext,
+) -> Optional[Estimate]:
+    """
+    How much more this non-cumulative code has deducted so far this tax
+    year than a cumulative code would have, on the same figures.
+
+    Three guards. Any one of them withholds the estimate entirely rather
+    than showing a hedged or partial figure:
+
+      1. Only job: the contract has no field for "previous employment YTD"
+         or "first job of the tax year" separately from the payslip's own
+         YTD totals, so user_context.only_job is the closest safe signal
+         we have. Anything other than an explicit True (False, or
+         unanswered) trips this gate — a second job is exactly the
+         situation where this comparison stops meaning anything.
+      2. Required fields readable: the actual YTD tax and the figures the
+         cumulative-equivalent comparison depends on must all be present.
+      3. Clamp: the estimate can never exceed the tax actually deducted
+         YTD. If the arithmetic somehow produced more, refuse to show a
+         figure at all rather than show a wrong one.
+    """
+
+    if user_context.only_job is not True:
+        return None
+
+    required = [
+        "deductions.income_tax_ytd",
+        "pay.gross_ytd",
+        "pay.gross_this_period",
+        "period.period_number",
+        "period.frequency",
+        "tax_code.value",
+    ]
+
+    if _any_unreadable(extract, required):
+        return None
+
+    actual_ytd = extract.deductions.income_tax_ytd
+    cumulative_equivalent = comparison.cumulative_equivalent_tax_ytd
+
+    if actual_ytd is None or cumulative_equivalent is None:
+        return None
+
+    overpayment = actual_ytd - cumulative_equivalent
+
+    if overpayment <= ZERO_GBP:
+        return None
+
+    # Clamp: never more than what was actually deducted.
+    overpayment = min(overpayment, actual_ytd)
+
+    return Estimate(
+        label="Possible overpayment so far this tax year",
+        amount_gbp=overpayment,
+    )
 
 
 def _br_tax_code_finding(
@@ -1715,6 +1807,83 @@ def _check_income_tax(
             "pay.gross_ytd",
             "period.period_number",
             "period.frequency",
+        ],
+    )
+
+
+# ============================================================================
+# Full year under the Personal Allowance, but tax is being deducted
+# ============================================================================
+
+
+def _check_under_personal_allowance(
+    extract: PayslipExtract,
+    comparison: CalculationComparison,
+) -> Optional[Finding]:
+    """
+    Spot someone whose projected full-year earnings sit under their tax
+    code's Personal Allowance while income tax is still being deducted
+    from this payslip.
+
+    This is a gate, not a projection: annualise() exists to detect the
+    situation, not to produce a number. This finding must never state a
+    projected pound amount — only describe what's happening. See
+    calculations.annualise().
+    """
+
+    required = [
+        "tax_code.value",
+        "pay.gross_this_period",
+        "pay.gross_ytd",
+        "period.period_number",
+        "period.frequency",
+        "deductions.income_tax",
+    ]
+
+    if _any_unreadable(extract, required):
+        return None
+
+    if comparison.annualised_gross_ytd is None:
+        return None
+
+    if comparison.personal_allowance_annual is None:
+        return None
+
+    # BR / D0 / D1 / NT grant no allowance at all — this check is about a
+    # standard code's allowance being wasted, not about a fixed-rate code.
+    if comparison.personal_allowance_annual <= ZERO_GBP:
+        return None
+
+    actual_tax = extract.deductions.income_tax
+
+    if actual_tax is None or actual_tax <= ZERO_GBP:
+        return None
+
+    if comparison.annualised_gross_ytd >= comparison.personal_allowance_annual:
+        return None
+
+    return Finding(
+        id="under_personal_allowance_but_taxed",
+        severity="action",
+        title="Your pay this year looks set to stay under your tax-free allowance",
+        explanation=(
+            "Based on what you've been paid so far and this period's pay, "
+            "your total earnings for the tax year look on track to stay "
+            "under your Personal Allowance — but income tax is still being "
+            "deducted from this payslip. If your pay carries on as it has, "
+            "you may be paying tax you don't end up owing for the year."
+        ),
+        next_step=(
+            "Check your tax code with HMRC, particularly if this is your "
+            "only job or your income has dropped this tax year."
+        ),
+        source_fields=[
+            "tax_code.value",
+            "pay.gross_this_period",
+            "pay.gross_ytd",
+            "period.period_number",
+            "period.frequency",
+            "deductions.income_tax",
         ],
     )
 
@@ -2159,7 +2328,7 @@ def build_analysis_result(
         status = "ok"
         failure_reason = None
 
-    from contract import Score
+    from .contract import Score
 
     return AnalysisResult(
         status=status,

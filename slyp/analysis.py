@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from typing import Optional
 
@@ -15,7 +16,9 @@ from .contract import (
 )
 
 from .calculations import (
+    annualise,
     calculate_pay_breakdown,
+    cumulative_tax_due_to_date,
     parse_tax_code,
 )
 
@@ -24,6 +27,8 @@ from .findings import (
     comparison_from_breakdown,
     generate_findings,
 )
+
+from .types import PayPeriodFacts
 
 # ============================================================================
 # Public API
@@ -131,25 +136,47 @@ def analyse_payslip(
 
     breakdown = None
 
+    comparison: Optional[CalculationComparison] = None
+
     calculation_error: Optional[str] = None
 
     try:
-        breakdown = calculate_pay_breakdown(
-            extract=extract,
-            tax_code=tax_code,
+        facts = _facts_from_extract(extract, tax_code)
+
+        breakdown = calculate_pay_breakdown(facts)
+
+        comparison = comparison_from_breakdown(breakdown)
+
+        # Full-year projection, for the under-Personal-Allowance gate.
+        # This is a gate, not a displayed figure — see annualise()'s
+        # docstring.
+        annualised_gross_ytd = annualise(
+            facts.gross_this_period,
+            facts.gross_ytd,
+            facts.period_number,
+            facts.frequency,
         )
 
-    except TypeError:
-        # Compatibility fallback for a calculations.py implementation
-        # that expects the internal PayPeriodFacts object instead.
-        try:
-            breakdown = _calculate_using_pay_period_facts(
-                extract,
-                tax_code,
+        # What a cumulative code would have deducted YTD on the same
+        # figures — only meaningful (and only computed) for a
+        # non-cumulative code, since that's the comparison the
+        # emergency-code overpayment estimate depends on.
+        cumulative_equivalent_tax_ytd = None
+
+        if not tax_code.cumulative:
+            cumulative_equivalent_tax_ytd = cumulative_tax_due_to_date(
+                facts.gross_ytd,
+                facts.period_number,
+                facts.frequency,
+                replace(tax_code, cumulative=True),
             )
 
-        except Exception as exc:
-            calculation_error = str(exc)
+        comparison = replace(
+            comparison,
+            annualised_gross_ytd=annualised_gross_ytd,
+            personal_allowance_annual=tax_code.free_pay_annual,
+            cumulative_equivalent_tax_ytd=cumulative_equivalent_tax_ytd,
+        )
 
     except Exception as exc:
         calculation_error = str(exc)
@@ -159,10 +186,6 @@ def analyse_payslip(
     # ------------------------------------------------------------------
 
     if breakdown is not None:
-
-        comparison = comparison_from_breakdown(
-            breakdown,
-        )
 
         findings = generate_findings(
             extract=extract,
@@ -298,22 +321,23 @@ def validate_extract(
 
 
 # ============================================================================
-# Compatibility adapter
+# Facts adapter
 # ============================================================================
 
 
-def _calculate_using_pay_period_facts(
+def _facts_from_extract(
     extract: PayslipExtract,
     tax_code,
-):
+) -> PayPeriodFacts:
     """
-    Adapter for the calculations.py design described in types.py.
+    Build the calculation engine's PayPeriodFacts from what extraction read
+    off the payslip.
 
-    The calculation engine receives PayPeriodFacts rather than the
-    extraction object directly.
+    Raises ValueError for a field the calculation can't run without — the
+    caller treats that the same as any other calculation_error: no
+    breakdown, no comparison, and the findings layer falls back to
+    structural-only findings for this payslip.
     """
-
-    from types import PayPeriodFacts
 
     frequency = extract.period.frequency
 
@@ -334,7 +358,7 @@ def _calculate_using_pay_period_facts(
     if gross_ytd is None:
         raise ValueError("Year-to-date gross pay is required.")
 
-    facts = PayPeriodFacts(
+    return PayPeriodFacts(
         gross_this_period=gross_this_period,
         gross_ytd=gross_ytd,
         tax_code=tax_code,
@@ -343,12 +367,6 @@ def _calculate_using_pay_period_facts(
         ni_category=extract.deductions.ni_category or "A",
         student_loan_plan=extract.deductions.student_loan_plan,
     )
-
-    # Try the most likely public calculation function names.
-
-    from calculations import calculate
-
-    return calculate(facts)
 
 
 # ============================================================================
@@ -476,7 +494,11 @@ def build_score(
         checks_run += 1
 
         income_tax_finding = next(
-            (finding for finding in findings if finding.id == "income_tax_difference"),
+            (
+                finding
+                for finding in findings
+                if finding.id == "income_tax_differs_from_calculation"
+            ),
             None,
         )
 
@@ -497,7 +519,7 @@ def build_score(
             (
                 finding
                 for finding in findings
-                if finding.id == "national_insurance_difference"
+                if finding.id == "national_insurance_differs_from_calculation"
             ),
             None,
         )
