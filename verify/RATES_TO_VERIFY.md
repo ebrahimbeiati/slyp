@@ -6,20 +6,26 @@ Every figure the engine depends on, as it currently sits in `slyp/calculations.p
 
 Tick column is for you.
 
-## Income tax
+## Income tax — CONFIRMED 2026-08-21
+
+Verified against https://www.gov.uk/income-tax-rates (printed 21/08/2026, current tax year stated as "6 April 2026 to 5 April 2027" — i.e. 2026/27, matching the code's claim). Every figure below matches exactly.
 
 | Rate/threshold | Value in code | Tax year claimed | Source (`slyp/calculations.py`) | ✓ |
 |---|---|---|---|---|
-| Personal Allowance | £12,570 | 2026/27 | `PERSONAL_ALLOWANCE` (line 403) | ☐ |
-| Personal Allowance taper start | £100,000 | 2026/27 | `PERSONAL_ALLOWANCE_TAPER_START` (line 415) | ☐ |
-| Basic rate band width (above allowance) | £37,700 | 2026/27 | `BASIC_RATE_LIMIT` (line 406) | ☐ |
-| Higher rate threshold (allowance + basic band) | £50,270 | 2026/27 | `HIGHER_RATE_THRESHOLD` (line 409) | ☐ |
-| Additional rate threshold | £125,140 | 2026/27 | `ADDITIONAL_RATE_THRESHOLD` (line 412) | ☐ |
-| Basic rate | 20% | 2026/27 | `BASIC_RATE` (line 419) | ☐ |
-| Higher rate | 40% | 2026/27 | `HIGHER_RATE` (line 420) | ☐ |
-| Additional rate | 45% | 2026/27 | `ADDITIONAL_RATE` (line 421) | ☐ |
+| Personal Allowance | £12,570 | 2026/27 | `PERSONAL_ALLOWANCE` (line 403) | ✅ |
+| Personal Allowance taper start | £100,000 | 2026/27 | `PERSONAL_ALLOWANCE_TAPER_START` (line 415) | ✅ |
+| Basic rate band width (above allowance) | £37,700 | 2026/27 | `BASIC_RATE_LIMIT` (line 406) | ✅ |
+| Higher rate threshold (allowance + basic band) | £50,270 | 2026/27 | `HIGHER_RATE_THRESHOLD` (line 409) | ✅ |
+| Additional rate threshold | £125,140 | 2026/27 | `ADDITIONAL_RATE_THRESHOLD` (line 412) | ✅ |
+| Basic rate | 20% | 2026/27 | `BASIC_RATE` (line 419) | ✅ |
+| Higher rate | 40% | 2026/27 | `HIGHER_RATE` (line 420) | ✅ |
+| Additional rate | 45% | 2026/27 | `ADDITIONAL_RATE` (line 421) | ✅ |
 
-Note: Personal Allowance taper (the £1-lost-per-£2-over-£100k rule) is explicitly out of MVP scope — income over £100,000 raises `UnsupportedPayslip` rather than being calculated. `personal_allowance_for_income()` implements the taper formula but no live call site currently uses it above the £100k gate.
+Note: Personal Allowance taper (the £1-lost-per-£2-over-£100k rule) is explicitly out of MVP scope — income over £100,000 raises `UnsupportedPayslip` rather than being calculated. `personal_allowance_for_income()` implements the taper formula but no live call site currently uses it above the £100k gate. (Separately: `cumulative_income_tax_due()`, the function actually used for every real payslip, doesn't enforce this £100k gate itself — only the unused `annual_income_tax()` does. Flagged in the session's final report as a real gap, not fixed — out of scope for any phase item.)
+
+## National Insurance and student loans — still open
+
+Not covered by the income tax PDF above. NI thresholds (£1,048/£4,189 monthly, £242/£967 weekly, 8%/2%) and student loan thresholds below still need their own GOV.UK source, particularly Plan 1/2/4.
 
 ## Employee National Insurance (Class 1)
 
