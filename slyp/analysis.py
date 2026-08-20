@@ -333,30 +333,57 @@ def _facts_from_extract(
     Build the calculation engine's PayPeriodFacts from what extraction read
     off the payslip.
 
+    Every field consumed here is checked against unreadable_fields, not
+    just None-ness. extract_payslip() already nulls out anything it
+    flags unreadable (a generic loop over the full unreadable set, not a
+    hand-picked subset), so in practice the two checks agree for data
+    that came through that pipeline. But nothing in the contract
+    enforces that a field can't be present while also listed as
+    unreadable - PayslipExtract is a plain pydantic model with no
+    validator tying the two together - and this function is reachable
+    from analyse_payslip(), a public entry point callable with any
+    hand-built PayslipExtract. findings.py's _check_* functions have
+    always checked both explicitly for exactly this reason; this
+    function previously only checked None-ness.
+
     Raises ValueError for a field the calculation can't run without — the
     caller treats that the same as any other calculation_error: no
     breakdown, no comparison, and the findings layer falls back to
     structural-only findings for this payslip.
     """
 
+    def _unreadable(field: str) -> bool:
+        return field in extract.unreadable_fields
+
     frequency = extract.period.frequency
 
-    if frequency is None:
+    if frequency is None or _unreadable("period.frequency"):
         raise ValueError("Pay frequency is required to calculate deductions.")
 
     period_number = extract.period.period_number
 
-    if period_number is None:
+    if period_number is None or _unreadable("period.period_number"):
         raise ValueError("Pay period number is required to calculate deductions.")
 
     gross_this_period = extract.pay.gross_this_period
     gross_ytd = extract.pay.gross_ytd
 
-    if gross_this_period is None:
+    if gross_this_period is None or _unreadable("pay.gross_this_period"):
         raise ValueError("Gross pay for this period is required.")
 
-    if gross_ytd is None:
+    if gross_ytd is None or _unreadable("pay.gross_ytd"):
         raise ValueError("Year-to-date gross pay is required.")
+
+    # ni_category and student_loan_plan being None is a legitimate value
+    # (assume category A; assume no student loan) - only refuse when the
+    # field is present but not confidently readable, since guessing "A"
+    # or "no loan" over a value we're not sure of is exactly the kind of
+    # silent wrong-field risk this function exists to avoid.
+    if _unreadable("deductions.ni_category"):
+        raise ValueError("NI category is not confidently readable.")
+
+    if _unreadable("deductions.student_loan_plan"):
+        raise ValueError("Student loan plan is not confidently readable.")
 
     return PayPeriodFacts(
         gross_this_period=gross_this_period,
