@@ -490,6 +490,59 @@ def test_net_pay_difference_flagged_once_every_deduction_is_confidently_captured
     assert finding.estimate.amount_gbp == Decimal("60.00")
 
 
+def test_net_pay_gated_when_reconciles_is_explicitly_false():
+    # False ("we checked, and it's wrong") must gate the same as None
+    # ("nothing confirmed") - only an explicit True is safe to build on.
+    extract = _extract(
+        gross_this_period="800.00", gross_ytd="800.00",
+        pension_employee="40.00", net_pay="760.00", reconciles=False,
+    )
+    breakdown = calculate_from_values(
+        gross_this_period="800.00", gross_ytd="800.00",
+        tax_code="1257L", period_number=1, frequency="monthly",
+    )
+    comparison = comparison_from_breakdown(breakdown, extract)
+    assert comparison.expected_net is None
+
+    findings = generate_findings(extract, comparison=comparison)
+    assert not any(f.id == "net_pay_differs_from_calculation" for f in findings)
+
+
+def test_net_pay_check_gated_when_net_pay_itself_unreadable():
+    # Isolates _check_net_pay's own gate: even if expected_net somehow
+    # already has a value, an unreadable net_pay must still suppress it.
+    extract = _extract(net_pay="760.00", unreadable_fields=["net_pay"])
+    comparison = _comparison(expected_net=Decimal("760.00"))
+    findings = generate_findings(extract, comparison=comparison)
+    assert not any(f.id == "net_pay_differs_from_calculation" for f in findings)
+
+
+def test_net_pay_check_gated_when_gross_this_period_unreadable():
+    # expected_net is built from the engine's breakdown, which came from
+    # pay.gross_this_period - if that field is untrusted, the finding
+    # must not fire even though expected_net already has a value.
+    extract = _extract(net_pay="760.00", unreadable_fields=["pay.gross_this_period"])
+    comparison = _comparison(expected_net=Decimal("760.00"))
+    findings = generate_findings(extract, comparison=comparison)
+    assert not any(f.id == "net_pay_differs_from_calculation" for f in findings)
+
+
+def test_net_pay_check_gated_when_actual_net_pay_is_none():
+    # net_pay was never extracted at all - distinct from "unreadable" -
+    # nothing to compare against, must not crash or fire.
+    extract = _extract(gross_this_period="800.00").model_copy(update={"net_pay": None})
+    comparison = _comparison(expected_net=Decimal("760.00"))
+    findings = generate_findings(extract, comparison=comparison)
+    assert not any(f.id == "net_pay_differs_from_calculation" for f in findings)
+
+
+def test_net_pay_tiny_difference_is_not_flagged():
+    extract = _extract(net_pay="760.00")
+    comparison = _comparison(expected_net=Decimal("760.005"))
+    findings = generate_findings(extract, comparison=comparison)
+    assert not any(f.id == "net_pay_differs_from_calculation" for f in findings)
+
+
 # --------------------------------------------------------------------------
 # Missing fields
 # --------------------------------------------------------------------------
