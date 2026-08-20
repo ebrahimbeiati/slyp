@@ -2,7 +2,7 @@
 
 Every figure the engine depends on, as it currently sits in `slyp/calculations.py` on `main` (`d538c36`). Case is **(a)**: these are the real, live constants that the shipped code runs on — not placeholders substituted for testing. Confirmed by diffing `slyp/calculations.py` against `verify/patched_pkg/slyp/calculations.py`: the only differences are the two import/typo fixes (F2, F4); every numeric constant is identical between the two.
 
-**Provenance flag**, because it matters for how much to trust each row: the module's original docstring (still present as a dead comment at the top of the file) said *"IMPORTANT: take every rate and threshold below from gov.uk for 2026/27. The values currently in RATES are placeholders and are very likely wrong... Replace them and delete this warning."* That warning is gone in the live version, and there was no commit, comment, or citation showing anyone had done the replacement-and-check step it asked for — hence this file. Income tax (below) and student loans (below) are now independently confirmed against real GOV.UK sources. NI is still open.
+**Provenance flag**, because it matters for how much to trust each row: the module's original docstring (still present as a dead comment at the top of the file) said *"IMPORTANT: take every rate and threshold below from gov.uk for 2026/27. The values currently in RATES are placeholders and are very likely wrong... Replace them and delete this warning."* That warning is gone in the live version, and there was no commit, comment, or citation showing anyone had done the replacement-and-check step it asked for — hence this file. **All three sections below (income tax, NI, student loans) are now independently confirmed against real GOV.UK/HMRC sources.** Every figure the calculation engine actually uses checks out exactly.
 
 Tick column is for you.
 
@@ -23,22 +23,24 @@ Verified against https://www.gov.uk/income-tax-rates (printed 21/08/2026, curren
 
 Note: Personal Allowance taper (the £1-lost-per-£2-over-£100k rule) is explicitly out of MVP scope — income over £100,000 raises `UnsupportedPayslip` rather than being calculated. `personal_allowance_for_income()` implements the taper formula but no live call site currently uses it above the £100k gate. (Separately: `cumulative_income_tax_due()`, the function actually used for every real payslip, doesn't enforce this £100k gate itself — only the unused `annual_income_tax()` does. Flagged in the session's final report as a real gap, not fixed — out of scope for any phase item.)
 
-## National Insurance — still open
+## Employee National Insurance (Class 1) — CONFIRMED 2026-08-21
 
-Not covered by either GOV.UK source checked so far. NI thresholds (£1,048/£4,189 monthly, £242/£967 weekly, 8%/2%) still need their own source.
-
-## Employee National Insurance (Class 1)
+Verified against GOV.UK's "Rates and allowances: National Insurance contributions" (HMRC guidance, updated 6 April 2026), 2026 to 2027 column. Every figure in the MVP's actual scope (category A) matches exactly.
 
 | Rate/threshold | Value in code | Tax year claimed | Source | ✓ |
 |---|---|---|---|---|
-| Primary threshold, monthly | £1,048 | 2026/27 | `NI_MONTHLY_PRIMARY_THRESHOLD` (line 451) | ☐ |
-| Upper earnings limit, monthly | £4,189 | 2026/27 | `NI_MONTHLY_UPPER_EARNINGS_LIMIT` (line 452) | ☐ |
-| Primary threshold, weekly | £242 | 2026/27 | `NI_WEEKLY_PRIMARY_THRESHOLD` (line 454) | ☐ |
-| Upper earnings limit, weekly | £967 | 2026/27 | `NI_WEEKLY_UPPER_EARNINGS_LIMIT` (line 455) | ☐ |
-| Category A main rate (between PT and UEL) | 8% | 2026/27 | `NI_CATEGORY_RATES["A"]` (line 507) | ☐ |
-| Category A upper rate (above UEL) | 2% | 2026/27 | `NI_CATEGORY_RATES["A"]` (line 507) | ☐ |
+| Primary threshold, monthly | £1,048 | 2026/27 | `NI_MONTHLY_PRIMARY_THRESHOLD` (line 451) | ✅ |
+| Upper earnings limit, monthly | £4,189 | 2026/27 | `NI_MONTHLY_UPPER_EARNINGS_LIMIT` (line 452) | ✅ |
+| Primary threshold, weekly | £242 | 2026/27 | `NI_WEEKLY_PRIMARY_THRESHOLD` (line 454) | ✅ |
+| Upper earnings limit, weekly | £967 | 2026/27 | `NI_WEEKLY_UPPER_EARNINGS_LIMIT` (line 455) | ✅ |
+| Category A main rate (between PT and UEL) | 8% | 2026/27 | `NI_CATEGORY_RATES["A"]` (line 507) | ✅ |
+| Category A upper rate (above UEL) | 2% | 2026/27 | `NI_CATEGORY_RATES["A"]` (line 507) | ✅ |
 
-Other NI categories are also baked into `NI_CATEGORY_RATES` (lines 505-566) but are not part of the MVP's stated scope (category A only) — B, C, D, E, F, H, I, J, L, M, N, V, Z all have hardcoded rate pairs with no source comment at all. Flagging for awareness; not asking you to verify all 13 unless the MVP scope has widened.
+Bonus check: the source also states the Married Women's reduced rate as 1.85% (between PT and UEL) for 2026/27, which matches `NI_CATEGORY_RATES["B"]` exactly — a useful cross-check even though category B isn't in the MVP's stated scope.
+
+Other NI categories are also baked into `NI_CATEGORY_RATES` (lines 505-566) but are not part of the MVP's stated scope (category A only) — C, D, E, F, H, I, J, L, M, N, V, Z all have hardcoded rate pairs with no source comment at all, and the source document doesn't itemise all of them either. Not asking for further verification unless the MVP scope widens.
+
+Not needed by the engine, so not checked: employer-side rates and thresholds (Secondary Threshold, UST, AUST, FUST, IZUST, VUST — all employer-facing), the Lower Earnings Limit (record-keeping only, not a deduction threshold), and Class 2/3/4 (self-employed/voluntary NI — out of scope, this engine only handles employee Class 1 via payroll).
 
 ## Student loans — CONFIRMED 2026-08-21
 
