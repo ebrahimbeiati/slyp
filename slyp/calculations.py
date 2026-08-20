@@ -366,7 +366,7 @@ Never use float for money.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 
@@ -1449,99 +1449,6 @@ def reconcile_payslip(
     )
 
     return money(expected_net) == money(net_pay)
-
-
-# ============================================================================
-# COMPARE ACTUAL VS EXPECTED
-# ============================================================================
-
-
-@dataclass(frozen=True)
-class CalculationComparison:
-    """
-    Difference between what the payslip says and what the engine calculates.
-    """
-
-    income_tax_actual: Decimal
-    income_tax_expected: Decimal
-    income_tax_difference: Decimal
-
-    national_insurance_actual: Decimal
-    national_insurance_expected: Decimal
-    national_insurance_difference: Decimal
-
-    student_loan_actual: Decimal
-    student_loan_expected: Decimal
-    student_loan_difference: Decimal
-
-    net_pay_actual: Decimal
-    net_pay_expected: Decimal
-    net_pay_difference: Decimal
-
-    reconciles: bool
-
-
-def compare_with_payslip(
-    facts: PayPeriodFacts,
-    actual_income_tax: Decimal,
-    actual_national_insurance: Decimal,
-    actual_net_pay: Decimal,
-    actual_student_loan: Decimal = ZERO,
-    pension_employee: Decimal = ZERO,
-    other_deductions: Decimal = ZERO,
-) -> CalculationComparison:
-    """
-    Compare engine output against the figures actually printed on the
-    payslip.
-
-    This is the function the findings layer should use when determining
-    whether something looks unusual.
-    """
-
-    expected = calculate_pay_breakdown(facts)
-
-    expected_net = (
-        expected.gross
-        - expected.income_tax
-        - expected.national_insurance
-        - expected.student_loan
-        - money(pension_employee)
-        - money(other_deductions)
-    )
-
-    actual_tax = money(actual_income_tax)
-
-    actual_ni = money(actual_national_insurance)
-
-    actual_loan = money(actual_student_loan)
-
-    actual_net = money(actual_net_pay)
-
-    expected_net = money(expected_net)
-
-    tax_difference = money(actual_tax - expected.income_tax)
-
-    ni_difference = money(actual_ni - expected.national_insurance)
-
-    loan_difference = money(actual_loan - expected.student_loan)
-
-    net_difference = money(actual_net - expected_net)
-
-    return CalculationComparison(
-        income_tax_actual=actual_tax,
-        income_tax_expected=expected.income_tax,
-        income_tax_difference=tax_difference,
-        national_insurance_actual=actual_ni,
-        national_insurance_expected=expected.national_insurance,
-        national_insurance_difference=ni_difference,
-        student_loan_actual=actual_loan,
-        student_loan_expected=expected.student_loan,
-        student_loan_difference=loan_difference,
-        net_pay_actual=actual_net,
-        net_pay_expected=expected_net,
-        net_pay_difference=net_difference,
-        reconciles=(abs(net_difference) <= TWO_DP),
-    )
 
 
 # ============================================================================
