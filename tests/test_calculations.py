@@ -1,15 +1,7 @@
 """
 Tests for the calculation layer.
 
-These fail right now because the functions are stubs. Making them pass is
-the job. Add more cases as you go, especially odd ones.
-
 Run with:  pytest -q
-
-IMPORTANT: the expected numbers marked TODO are placeholders. Work each
-one out by hand from the gov.uk figures, then check it against an online
-PAYE calculator. If you and the calculator disagree, find out why before
-moving on — do not just change the test to match your code.
 """
 
 from decimal import Decimal
@@ -51,6 +43,14 @@ def test_zero_t_code():
     assert code.free_pay_annual == Decimal("0")
 
 
+def test_nt_code_is_supported_and_zero_rated():
+    # NT is genuinely "no tax", not out of scope — distinct from a code
+    # that we refuse to calculate at all.
+    code = parse_tax_code("NT")
+    assert code.kind == "NT"
+    assert code.free_pay_annual == Decimal("0")
+
+
 @pytest.mark.parametrize("raw", ["1257L W1", "1257L M1", "1257LX", "1257L X"])
 def test_emergency_suffixes_are_non_cumulative(raw):
     code = parse_tax_code(raw)
@@ -59,24 +59,26 @@ def test_emergency_suffixes_are_non_cumulative(raw):
     assert code.free_pay_annual == Decimal("12570")
 
 
-def test_k_code_is_a_negative_allowance():
-    code = parse_tax_code("K475")
-    assert code.kind == "K"
-    assert code.free_pay_annual == Decimal("-4750")
+def test_k_code_is_unsupported():
+    # K codes add notional pay and carry a regulatory limit — refuse
+    # rather than approximate.
+    with pytest.raises(UnsupportedPayslip):
+        parse_tax_code("K475")
 
 
-def test_scottish_prefix_is_recorded():
-    code = parse_tax_code("S1257L")
-    assert code.region == "S"
+def test_scottish_prefix_is_unsupported():
+    # Rest-of-UK bands would be confidently wrong for a Scottish code.
+    with pytest.raises(UnsupportedPayslip):
+        parse_tax_code("S1257L")
+
+
+def test_welsh_prefix_is_unsupported():
+    with pytest.raises(UnsupportedPayslip):
+        parse_tax_code("C1257L")
 
 
 def test_lowercase_and_spacing_are_handled():
     assert parse_tax_code(" br ").kind == "BR"
-
-
-def test_nt_is_unsupported():
-    with pytest.raises(UnsupportedPayslip):
-        parse_tax_code("NT")
 
 
 def test_nonsense_is_unsupported():
@@ -93,26 +95,29 @@ def test_no_ni_below_primary_threshold():
 
 
 def test_ni_at_main_rate():
-    # £2,000/month. TODO: work out by hand from the gov.uk thresholds.
+    # £2,000/month. PT is £1,048. (2000 - 1048) * 8% = 76.16.
     result = national_insurance_due(Decimal("2000"), "monthly")
     assert result == Decimal("76.16")
 
 
 def test_ni_weekly_uses_weekly_thresholds():
-    # £400/week. TODO: expected figure.
+    # £400/week. PT is £242. (400 - 242) * 8% = 12.64.
     result = national_insurance_due(Decimal("400"), "weekly")
     assert result == Decimal("12.64")
 
 
 def test_ni_above_upper_earnings_limit():
-    # £6,000/month: main rate up to the UEL, then 2% above. TODO.
+    # £6,000/month: main rate up to the UEL (£4,189), then 2% above.
+    # (4189 - 1048) * 8% = 251.28. (6000 - 4189) * 2% = 36.22. Total 287.50.
     result = national_insurance_due(Decimal("6000"), "monthly")
     assert result == Decimal("287.50")
 
 
-def test_other_ni_categories_unsupported():
+def test_unrecognised_ni_category_unsupported():
+    # "C" is a real, supported category (no employee NI) — this needs a
+    # letter that genuinely isn't in the table.
     with pytest.raises(UnsupportedPayslip):
-        national_insurance_due(Decimal("2000"), "monthly", category="C")
+        national_insurance_due(Decimal("2000"), "monthly", ni_category="Q")
 
 
 # --------------------------------------------------------------------------
@@ -135,8 +140,12 @@ def test_no_tax_when_under_the_allowance():
 
 
 def test_basic_rate_cumulative():
-    # £2,000 in month 1 on 1257L. TODO: expected figure.
-    assert income_tax_due(_facts("2000", "2000", "1257L")) == Decimal("TODO")
+    # £2,000 in month 1 on 1257L.
+    # Free pay to date = 12570 / 12 * 1 = 1047.50.
+    # Taxable to date  = 2000 - 1047.50 = 952.50.
+    # Tax to date       = 952.50 * 20% = 190.50.
+    # Period 1: nothing to subtract, so tax this period = 190.50.
+    assert income_tax_due(_facts("2000", "2000", "1257L")) == Decimal("190.50")
 
 
 def test_br_code_taxes_every_pound():
@@ -144,12 +153,21 @@ def test_br_code_taxes_every_pound():
     assert income_tax_due(_facts("476", "476", "BR")) == Decimal("95.20")
 
 
+def test_nt_code_always_zero():
+    assert income_tax_due(_facts("5000", "5000", "NT")) == Decimal("0")
+
+
 def test_non_cumulative_ignores_the_year_so_far():
     # Same period pay, big year to date, W1 basis: the year is ignored,
     # so this should equal the month 1 cumulative figure for the same pay.
+    # Free pay this period = 12570 / 12 = 1047.50.
+    # Taxable this period  = 2000 - 1047.50 = 952.50.
+    # Tax this period        = 952.50 * 20% = 190.50 — same as cumulative
+    # month 1, because a single month's slice of the allowance is the same
+    # either way.
     cumulative = income_tax_due(_facts("2000", "2000", "1257L", period=1))
     non_cumulative = income_tax_due(_facts("2000", "16000", "1257L W1", period=8))
-    assert non_cumulative == cumulative
+    assert non_cumulative == cumulative == Decimal("190.50")
 
 
 def test_zero_pay_period():
@@ -161,22 +179,39 @@ def test_never_returns_negative():
     assert income_tax_due(_facts("0", "1000", "1257L", period=10)) >= Decimal("0")
 
 
+def test_scottish_code_trips_the_gate_not_a_calculation():
+    # Refusal has to happen at parse time, before a PayPeriodFacts can even
+    # be built — there is no calculation to run on a code we don't support.
+    with pytest.raises(UnsupportedPayslip):
+        parse_tax_code("S1257L")
+
+
+def test_k_code_trips_the_gate_not_a_calculation():
+    with pytest.raises(UnsupportedPayslip):
+        parse_tax_code("K475")
+
+
 # --------------------------------------------------------------------------
 # 4. student_loan_due
 # --------------------------------------------------------------------------
 
 def test_no_student_loan_below_threshold():
-    assert student_loan_due(Decimal("1000"), "2", "monthly") == Decimal("0")
+    assert student_loan_due(Decimal("1000"), "monthly", "2") == Decimal("0")
 
 
 def test_student_loan_plan_2():
-    # £3,000/month. TODO: expected figure, rounded down to a whole pound.
-    assert student_loan_due(Decimal("3000"), "2", "monthly") == Decimal("TODO")
+    # £3,000/month, Plan 2 threshold £2,448.75.
+    # (3000 - 2448.75) * 9% = 49.6125, floored to a whole pound = 49.
+    assert student_loan_due(Decimal("3000"), "monthly", "2") == Decimal("49")
 
 
 def test_student_loan_rounds_down_to_whole_pounds():
-    result = student_loan_due(Decimal("3000"), "2", "monthly")
+    result = student_loan_due(Decimal("3000"), "monthly", "2")
     assert result == result.to_integral_value()
+
+
+def test_student_loan_none_plan_is_zero():
+    assert student_loan_due(Decimal("3000"), "monthly", None) == Decimal("0")
 
 
 # --------------------------------------------------------------------------

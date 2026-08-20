@@ -619,21 +619,28 @@ def periods_in_year(frequency: Frequency) -> int:
 
 
 def annualise(
-    amount: Decimal,
+    gross_this_period: Decimal,
+    gross_ytd: Decimal,
+    period_number: int,
     frequency: Frequency,
 ) -> Decimal:
     """
-    Convert one pay-period amount into an annual equivalent.
+    Estimate total pay for the whole tax year if things carry on as they are.
+
+    Year to date, plus this period's gross repeated for the periods left:
+
+        gross_ytd + gross_this_period * (periods_in_year - period_number)
+
+    This is a gate, not a displayed figure: it exists so the findings layer
+    can detect someone whose full-year earnings look set to land under the
+    Personal Allowance while tax is still being deducted. Its output must
+    never be shown to the user as a projected pound amount.
     """
-    amount = to_money(amount)
+    periods = periods_in_year(frequency)
 
-    if frequency == "monthly":
-        return amount * Decimal("12")
-
-    if frequency == "weekly":
-        return amount * Decimal("52")
-
-    raise UnsupportedPayslip(f"Unsupported pay frequency: {frequency}")
+    return to_money(gross_ytd) + to_money(gross_this_period) * Decimal(
+        periods - period_number
+    )
 
 
 # ============================================================================
@@ -681,9 +688,26 @@ def parse_tax_code(
             compact = compact[: -len(suffix)]
             break
 
-    # NT
+    # Scottish (S) or Welsh (C) prefix. Applying rest-of-UK bands to these
+    # would produce a confidently wrong number, so refuse rather than
+    # approximate. Standard codes always start with a digit, so this
+    # cannot collide with them.
+    if compact[:1] == "S":
+        raise UnsupportedPayslip(f"Scottish tax codes are outside the MVP: {raw}")
+
+    if compact[:1] == "C":
+        raise UnsupportedPayslip(f"Welsh tax codes are outside the MVP: {raw}")
+
+    # NT — no tax due, always. Distinct from 0T: NT is exempt, not banded
+    # on a zero allowance.
     if compact == "NT":
-        raise UnsupportedPayslip("NT tax code is outside the MVP calculation scope.")
+        return TaxCode(
+            raw=raw,
+            kind="NT",
+            free_pay_annual=ZERO,
+            cumulative=cumulative,
+            region="UK",
+        )
 
     # BR
     if compact == "BR":
@@ -725,22 +749,10 @@ def parse_tax_code(
             region="UK",
         )
 
-    # K code.
+    # K code. Adds notional pay rather than deducting free pay, and carries
+    # a regulatory limit on how much can be added — out of MVP scope.
     if compact.startswith("K"):
-        number = compact[1:]
-
-        if not number.isdigit():
-            raise UnsupportedPayslip(f"Unrecognised K tax code: {raw}")
-
-        allowance = Decimal(number) * Decimal("-10")
-
-        return TaxCode(
-            raw=raw,
-            kind="K",
-            free_pay_annual=allowance,
-            cumulative=cumulative,
-            region="UK",
-        )
+        raise UnsupportedPayslip(f"K tax codes are outside the MVP: {raw}")
 
     # Standard numeric + letter tax code.
     #
@@ -877,7 +889,7 @@ def annual_income_tax(
         )
 
     if tax_code.kind == "NT":
-        raise UnsupportedPayslip("NT tax code is outside the MVP.")
+        return ZERO
 
     # ------------------------------------------------------------
     # BR
@@ -985,11 +997,6 @@ def cumulative_income_tax_due(
 
     if facts.tax_code.cumulative is False:
         return non_cumulative_income_tax_due(facts)
-
-    annualised_current = annualised(
-        facts.gross_ytd,
-        facts.frequency,
-    )
 
     # We need the tax allowance accumulated up to the current period.
     periods = periods_in_year(facts.frequency)
@@ -1137,6 +1144,36 @@ def non_cumulative_income_tax_due(
         taxable,
         facts.tax_code,
     )
+
+
+# ============================================================================
+# INCOME TAX — PUBLIC ENTRY POINT
+# ============================================================================
+
+
+def income_tax_due(
+    facts: PayPeriodFacts,
+) -> Decimal:
+    """
+    Income tax that should be deducted THIS pay period.
+
+    Single entry point for the findings layer and the API. Owns dispatch
+    between the cumulative and non-cumulative calculations; BR, D0 and D1
+    are handled inside both via cumulative_tax_on_taxable_amount(). NT is
+    always zero regardless of basis.
+
+    Raises UnsupportedPayslip — never approximates — for anything outside
+    MVP scope: Scottish/Welsh tax codes, K codes, an unparseable tax code,
+    an unsupported NI category, or an out-of-range period number. Callers
+    must treat that as "we cannot tell", not as zero or a hedged figure.
+    """
+
+    validate_pay_period_facts(facts)
+
+    if facts.tax_code.kind == "NT":
+        return ZERO
+
+    return cumulative_income_tax_due(facts)
 
 
 # ============================================================================
@@ -1296,7 +1333,7 @@ def calculate_pay_breakdown(
 
     validate_pay_period_facts(facts)
 
-    income_tax = cumulative_income_tax_due(facts)
+    income_tax = income_tax_due(facts)
 
     national_insurance = national_insurance_due(
         facts.gross_this_period,
