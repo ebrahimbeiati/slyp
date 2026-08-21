@@ -399,6 +399,13 @@ WHOLE_POUND = Decimal("1")
 
 TAX_YEAR = "2026/27"
 
+# Tax years the rates/thresholds in this module are correct for. A
+# payslip whose derived tax year isn't in this set must be refused, not
+# calculated with the wrong year's rates - keep this beside the rates
+# constants below so it's updated in the same change when a new tax
+# year is added.
+SUPPORTED_TAX_YEARS: frozenset[str] = frozenset({TAX_YEAR})
+
 # Standard Personal Allowance.
 PERSONAL_ALLOWANCE = Decimal("12570")
 
@@ -641,6 +648,34 @@ def annualise(
     return to_money(gross_ytd) + to_money(gross_this_period) * Decimal(
         periods - period_number
     )
+
+
+# ============================================================================
+# TAX YEAR VALIDATION
+# ============================================================================
+
+
+def validate_tax_year(tax_year: Optional[str]) -> None:
+    """
+    Raise UnsupportedPayslip unless `tax_year` is one this engine has
+    rates for.
+
+    `None` (tax year could not be derived - the pay date was unreadable
+    or absent) refuses too, rather than silently assuming the current
+    tax year: a payslip with no determinable date is exactly the case
+    where guessing "current year" would be most likely wrong and least
+    likely to be noticed.
+    """
+    if tax_year is None:
+        raise UnsupportedPayslip(
+            "The tax year for this payslip could not be determined."
+        )
+
+    if tax_year not in SUPPORTED_TAX_YEARS:
+        raise UnsupportedPayslip(
+            f"This payslip is from tax year {tax_year}, which is not "
+            f"currently supported."
+        )
 
 
 # ============================================================================

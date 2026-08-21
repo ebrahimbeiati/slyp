@@ -14,8 +14,27 @@ from slyp.calculations import (
     national_insurance_due,
     parse_tax_code,
     student_loan_due,
+    validate_tax_year,
 )
 from slyp.types import PayPeriodFacts, UnsupportedPayslip
+
+
+# --------------------------------------------------------------------------
+# 0. validate_tax_year
+# --------------------------------------------------------------------------
+
+def test_validate_tax_year_accepts_the_supported_year():
+    validate_tax_year("2026/27")  # must not raise
+
+
+def test_validate_tax_year_refuses_a_prior_year():
+    with pytest.raises(UnsupportedPayslip):
+        validate_tax_year("2025/26")
+
+
+def test_validate_tax_year_refuses_when_undeterminable():
+    with pytest.raises(UnsupportedPayslip):
+        validate_tax_year(None)
 
 
 # --------------------------------------------------------------------------

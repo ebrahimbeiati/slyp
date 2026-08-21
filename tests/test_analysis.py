@@ -30,10 +30,10 @@ from slyp.contract import (
 TAX_CODE = parse_tax_code("1257L")
 
 
-def _extract(*, unreadable_fields=None, ni_category="A", student_loan_plan=None):
+def _extract(*, unreadable_fields=None, ni_category="A", student_loan_plan=None, tax_year="2026/27"):
     return PayslipExtract(
         source=Source(filename="t.pdf", pages=1, scanned_at=datetime.now(timezone.utc)),
-        period=Period(period_number=1, frequency="monthly", tax_year="2026/27"),
+        period=Period(period_number=1, frequency="monthly", tax_year=tax_year),
         tax_code=TaxCodeRead(value="1257L"),
         pay=Pay(gross_this_period=Decimal("800.00"), gross_ytd=Decimal("800.00")),
         deductions=Deductions(
@@ -146,3 +146,34 @@ def test_analyse_payslip_degrades_gracefully_when_ni_category_unreadable():
     assert result.status == "ok"
     assert any(f.id == "calculation_unavailable" for f in result.findings)
     assert not any(f.id == "national_insurance_differs_from_calculation" for f in result.findings)
+
+
+# --------------------------------------------------------------------------
+# Tax year gate - a payslip must not be calculated with the wrong year's
+# rates, and an undeterminable tax year must refuse rather than assume
+# the current one.
+# --------------------------------------------------------------------------
+
+
+def test_analyse_payslip_proceeds_for_the_supported_tax_year():
+    extract = _extract(tax_year="2026/27")
+    result = analyse_payslip(extract)
+    assert result.status == "ok"
+
+
+def test_analyse_payslip_refuses_a_prior_tax_year():
+    extract = _extract(tax_year="2025/26")
+    result = analyse_payslip(extract)
+    assert result.status == "unsupported"
+    assert "2025/26" in result.failure_reason
+    assert result.findings == []
+    assert result.score is None
+
+
+def test_analyse_payslip_refuses_when_tax_year_is_undeterminable():
+    extract = _extract(tax_year=None)
+    result = analyse_payslip(extract)
+    assert result.status == "unsupported"
+    assert "could not be determined" in result.failure_reason
+    assert result.findings == []
+    assert result.score is None

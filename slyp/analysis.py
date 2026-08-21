@@ -20,6 +20,7 @@ from .calculations import (
     calculate_pay_breakdown,
     cumulative_tax_due_to_date,
     parse_tax_code,
+    validate_tax_year,
 )
 
 from .findings import (
@@ -28,7 +29,7 @@ from .findings import (
     generate_findings,
 )
 
-from .types import PayPeriodFacts
+from .types import PayPeriodFacts, UnsupportedPayslip
 
 # ============================================================================
 # Public API
@@ -88,7 +89,34 @@ def analyse_payslip(
         )
 
     # ------------------------------------------------------------------
-    # 2. Parse the tax code
+    # 2. Confirm the tax year is one this engine has rates for
+    # ------------------------------------------------------------------
+    #
+    # Checked before tax code parsing and deliberately kept as its own
+    # step with its own message: "this payslip is from a tax year we
+    # don't yet support" is a different fact than "this tax code isn't
+    # supported", and conflating them would leave the user checking the
+    # wrong thing.
+
+    try:
+        validate_tax_year(extract.period.tax_year)
+
+    except UnsupportedPayslip as exc:
+        return AnalysisResult(
+            status="unsupported",
+            failure_reason=str(exc),
+            extract=extract,
+            verdict=Verdict(
+                headline="This payslip is from a tax year we don't yet support",
+                severity="action",
+            ),
+            findings=[],
+            projections=[],
+            score=None,
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Parse the tax code
     # ------------------------------------------------------------------
 
     tax_code_value = extract.tax_code.value
@@ -131,7 +159,7 @@ def analyse_payslip(
         )
 
     # ------------------------------------------------------------------
-    # 3. Calculate expected deductions
+    # 4. Calculate expected deductions
     # ------------------------------------------------------------------
 
     breakdown = None
@@ -182,7 +210,7 @@ def analyse_payslip(
         calculation_error = str(exc)
 
     # ------------------------------------------------------------------
-    # 4. Generate findings
+    # 5. Generate findings
     # ------------------------------------------------------------------
 
     if breakdown is not None:
@@ -225,7 +253,7 @@ def analyse_payslip(
             )
 
     # ------------------------------------------------------------------
-    # 5. Build verdict
+    # 6. Build verdict
     # ------------------------------------------------------------------
 
     verdict = build_verdict(
@@ -234,7 +262,7 @@ def analyse_payslip(
     )
 
     # ------------------------------------------------------------------
-    # 6. Build score
+    # 7. Build score
     # ------------------------------------------------------------------
 
     score = build_score(
@@ -243,7 +271,7 @@ def analyse_payslip(
     )
 
     # ------------------------------------------------------------------
-    # 7. Build final response
+    # 8. Build final response
     # ------------------------------------------------------------------
 
     return AnalysisResult(
