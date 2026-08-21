@@ -416,4 +416,41 @@ def project_with_extra_hours(
 
     Do this last. It is only a wrapper around everything else.
     """
-    raise NotImplementedError
+    new_hours = current_hours + extra_hours
+    new_gross = to_money(hourly_rate * new_hours)
+
+    extra_gross = new_gross - facts.gross_this_period
+
+    projected_facts = PayPeriodFacts(
+        gross_this_period=new_gross,
+        gross_ytd=facts.gross_ytd + extra_gross,
+        tax_code=facts.tax_code,
+        period_number=facts.period_number,
+        frequency=facts.frequency,
+        ni_category=facts.ni_category,
+        student_loan_plan=facts.student_loan_plan,
+    )
+
+    income_tax = income_tax_due(projected_facts)
+
+    national_insurance = national_insurance_due(
+        new_gross,
+        facts.frequency,
+        facts.ni_category,
+    )
+
+    if facts.student_loan_plan is not None:
+        student_loan = student_loan_due(
+            new_gross,
+            facts.student_loan_plan,
+            facts.frequency,
+        )
+    else:
+        student_loan = Decimal("0")
+
+    return PayBreakdown(
+        gross=new_gross,
+        income_tax=income_tax,
+        national_insurance=national_insurance,
+        student_loan=student_loan,
+    )
