@@ -40,6 +40,7 @@ step is an LLM call and not a parser.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from decimal import Decimal
 from typing import Optional
 
 import anthropic
+import openai
 import pdfplumber
 from pydantic import BaseModel, Field, ValidationError
 
@@ -517,11 +519,35 @@ Rules:
   there.
 """
 
-# Model used for extraction. Overridable via env var so this can be
-# changed without a code deploy; the default is a placeholder pick, not a
-# benchmarked choice - revisit once real extractions have been checked
-# for accuracy against the sample payslips.
-_MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL", "claude-sonnet-5")
+# Which LLM provider does the extraction call. "anthropic" (default) or
+# "openai" - deliberately a separate setting from the model name, and
+# deliberately validated at import time (fails loudly on startup, not on
+# the first real upload during a demo).
+_MODEL_PROVIDER = os.environ.get("SLYP_MODEL_PROVIDER", "anthropic").strip().lower()
+
+if _MODEL_PROVIDER not in ("anthropic", "openai"):
+    raise ValueError(
+        f"Unsupported SLYP_MODEL_PROVIDER: {_MODEL_PROVIDER!r}. "
+        f"Expected 'anthropic' or 'openai'."
+    )
+
+if _MODEL_PROVIDER == "anthropic":
+    # Overridable via env var so this can be changed without a code
+    # deploy; the default is a placeholder pick, not a benchmarked
+    # choice - revisit once real extractions have been checked for
+    # accuracy against the sample payslips.
+    _MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL", "claude-sonnet-5")
+else:
+    # No default here, deliberately: a Claude model name is not a valid
+    # guess for an OpenAI model and vice versa, so there's no safe
+    # fallback to invent for a provider switch. Must be set explicitly.
+    _MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL")
+    if not _MODEL_NAME:
+        raise ValueError(
+            "SLYP_EXTRACTION_MODEL must be set when "
+            "SLYP_MODEL_PROVIDER=openai."
+        )
+
 _TOOL_NAME = "record_payslip_extract"
 
 # Below this, a field is not trusted even if the model didn't flag it
@@ -532,6 +558,19 @@ _CONFIDENCE_THRESHOLD = 0.7
 
 
 def _call_model(filtered_text: str) -> _ModelExtract:
+    """
+    Dispatches to whichever provider SLYP_MODEL_PROVIDER selects. Both
+    paths force a structured tool/function call against the exact same
+    _ModelExtract schema and _SYSTEM_PROMPT, so nothing downstream
+    (normalisation, confidence thresholding, reconciliation) needs to
+    know or care which provider actually answered.
+    """
+    if _MODEL_PROVIDER == "openai":
+        return _call_openai_model(filtered_text)
+    return _call_anthropic_model(filtered_text)
+
+
+def _call_anthropic_model(filtered_text: str) -> _ModelExtract:
     # anthropic.Anthropic() reads ANTHROPIC_API_KEY from the environment
     # on its own - no key is read or passed here, so there is nowhere in
     # this file for one to leak from.
@@ -563,6 +602,70 @@ def _call_model(filtered_text: str) -> _ModelExtract:
 
     try:
         return _ModelExtract.model_validate(tool_use.input)
+    except ValidationError as exc:
+        raise NotAPayslip(f"model output did not match the extraction schema: {exc}") from exc
+
+
+def _call_openai_model(filtered_text: str) -> _ModelExtract:
+    # openai.OpenAI() reads OPENAI_API_KEY from the environment on its
+    # own, same reasoning as the Anthropic path above - and deliberately
+    # a different env var name from ANTHROPIC_API_KEY. Putting one
+    # provider's key under the other provider's variable name is exactly
+    # how this integration broke the first time.
+    client = openai.OpenAI()
+
+    def _create(**extra_params):
+        return client.chat.completions.create(
+            model=_MODEL_NAME,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": filtered_text},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": _TOOL_NAME,
+                        "description": "Record the structured fields read off a UK payslip.",
+                        "parameters": _ModelExtract.model_json_schema(),
+                    },
+                }
+            ],
+            # Forces the tool call, same reasoning as the Anthropic path:
+            # no free-text path for the model to answer through instead.
+            tool_choice={"type": "function", "function": {"name": _TOOL_NAME}},
+            **extra_params,
+        )
+
+    try:
+        response = _create()
+    except openai.BadRequestError as exc:
+        # Some reasoning-capable models reject a tool call unless
+        # reasoning_effort is explicitly turned off for it (confirmed
+        # live against gpt-5.6-terra: "Function tools with
+        # reasoning_effort are not supported ... set reasoning_effort to
+        # 'none'"). Retry once with it added rather than sending it
+        # unconditionally - a model that doesn't recognise the parameter
+        # at all would otherwise break on every call instead of none.
+        if "reasoning_effort" in str(exc):
+            response = _create(reasoning_effort="none")
+        else:
+            raise
+
+    tool_calls = response.choices[0].message.tool_calls or []
+    tool_call = next((tc for tc in tool_calls if tc.function.name == _TOOL_NAME), None)
+
+    if tool_call is None:
+        raise NotAPayslip("model returned no structured output")
+
+    try:
+        arguments = json.loads(tool_call.function.arguments)
+    except json.JSONDecodeError as exc:
+        raise NotAPayslip(f"model output was not valid JSON: {exc}") from exc
+
+    try:
+        return _ModelExtract.model_validate(arguments)
     except ValidationError as exc:
         raise NotAPayslip(f"model output did not match the extraction schema: {exc}") from exc
 

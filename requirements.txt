@@ -2,6 +2,7 @@ pydantic>=2
 pytest
 pdfplumber
 anthropic
+openai
 fastapi
 uvicorn[standard]
 python-multipart
