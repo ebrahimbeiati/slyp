@@ -237,6 +237,50 @@ _EMPLOYEE_NO_LABEL_RE = re.compile(
 _NAME_LABEL_RE = re.compile(r"(?im)^(Employee Name|Name)\s*:?\s*(.+)$")
 _ADDRESS_LABEL_RE = re.compile(r"(?im)^(Address|Home Address)\s*:?\s*(.+)$")
 
+# Words that end a name: payslip vocabulary, plus the company suffixes.
+# Only consulted for the token AFTER a courtesy title, so this list
+# doesn't have to be exhaustive - it has to stop the common collisions
+# on a line where a name and a figure sit side by side.
+_NAME_STOP_WORD = (
+    r"PAYE|Tax|Pay|Payments|Deductions|Gross|Net|Total|National|Insurance|"
+    r"NI|NIC|Pension|Student|Loan|Period|Code|Basic|Holiday|Holidays|Rate|"
+    r"Hours|Earnings|Method|Dept|Ref|Ltd|Limited|PLC"
+)
+
+# Title-anchored employee name - the unlabelled case _NAME_LABEL_RE
+# cannot see.
+#
+# financial_lines_only() was documented as the backstop for an
+# unlabelled name, on the reasoning that a name line carries no
+# financial content and so never survives the allowlist. A real payslip
+# broke that: its identity row is
+#
+#     1195 Mr. K SAMPLE 13/02/2026 AB123456C
+#
+# - name, pay date and NI number on one collapsed row (see the module
+# docstring on collapsed columns). The NI number was redacted, and the
+# DATE then kept the whole line through the allowlist, carrying the
+# employee's name to the model. The allowlist is a backstop for a name
+# ALONE on a line, not for one sharing a line with a financial value -
+# exactly the same ordering hazard the module docstring already
+# describes for the NI number, one field over.
+#
+# A courtesy title is a genuine anchor, not a name-shaped guess: it is
+# the one token on such a row that cannot be mistaken for a payslip
+# figure or label. This does NOT try to find untitled names - see
+# redact()'s docstring for that residual gap, which is real.
+#
+# Bounded deliberately: at most four following tokens, each capitalised
+# and alphabetic (an initial, "O'Brien", "Smith-Jones"), and stopped by
+# _NAME_STOP_WORD so "Mr J Smith PAYE Tax 0.00" gives up the name
+# without swallowing the label beside it. Case-sensitive for the name
+# tokens (scoped (?i:...) on the title only), so a lowercase word after
+# a title can't extend the match.
+_TITLED_NAME_RE = re.compile(
+    r"\b(?i:Mr|Mrs|Ms|Miss|Mx|Dr|Prof|Rev)\b\.?"
+    rf"(?:\s+(?!(?i:{_NAME_STOP_WORD})\b)[A-Z][A-Za-z'’-]*\.?){{1,4}}"
+)
+
 # Colon required (unlike the name/address labels below) - "Employer" on
 # its own is too common a prefix on a real payslip ("Employer NIC 24.98"
 # is the employer's own NI contribution, not a name label) to match
@@ -327,6 +371,16 @@ def redact(text: str) -> tuple[str, RedactionMap]:
 
     Must run before financial_lines_only(). See the module docstring for
     why: a line can carry both PII and a currency amount together.
+
+    KNOWN RESIDUAL GAP, stated plainly because the allowlist is no longer
+    a complete backstop for it (see _TITLED_NAME_RE): a name that is
+    neither labelled ("Employee Name:") nor titled ("Mr", "Ms") and that
+    shares a line with a currency amount or date still reaches the
+    model. "K SAMPLE 13/02/2026" on one row would not be caught here.
+    Closing that needs a name detector, and every name-shaped heuristic
+    tried in this file so far has been wrong more often than right (see
+    _find_employer_name) - a wrong guess here redacts a financial label
+    and breaks extraction. Flagged rather than patched over.
     """
     redaction_map = RedactionMap()
     redacted = text
@@ -358,6 +412,10 @@ def redact(text: str) -> tuple[str, RedactionMap]:
     redacted = _redact_pattern(redacted, _PHONE_RE, "[PHONE]", redaction_map)
     redacted = _redact_labelled(redacted, _EMPLOYEE_NO_LABEL_RE, "[EMPLOYEE_NO]", redaction_map)
     redacted = _redact_labelled(redacted, _NAME_LABEL_RE, "[NAME]", redaction_map)
+    # After the labelled pass, so a labelled "Name: Mr K Onuoha" is
+    # already gone and this only sees the unlabelled rows. See
+    # _TITLED_NAME_RE.
+    redacted = _redact_pattern(redacted, _TITLED_NAME_RE, "[NAME]", redaction_map)
     redacted = _redact_labelled(redacted, _ADDRESS_LABEL_RE, "[ADDRESS]", redaction_map)
 
     # Last of the value passes, deliberately: every pattern above is more
@@ -404,7 +462,7 @@ _KNOWN_LABEL_RE = re.compile(
     r"tax code|gross|net pay|national insurance|nic|paye|income tax|"
     r"pension|student loan|postgraduate loan|pgl|"
     r"year to date|ytd|hours|rate|"
-    r"pay period|pay date|tax period|tax month|tax week|period number|"
+    r"pay(?:ment)? period|pay date|tax period|tax month|tax week|period number|"
     r"frequency|pay type|pay basis|"
     r"ni category|ni table|table letter"
     r")\b"
@@ -424,6 +482,16 @@ _KNOWN_LABEL_RE = re.compile(
 # for ni_category ("NI Table Letter A" contains neither "national
 # insurance" nor "nic" as a substring) and student_loan_plan
 # ("Postgraduate Loan" doesn't contain "student loan").
+#
+# "pay(ment)? period" rather than "pay period", same class of gap, found
+# on a real weekly payslip: the document stated its frequency exactly
+# once, as "Payment Period    Weekly", on a line carrying no currency
+# amount, date, percentage or tax code. "Payment Period" does not
+# contain "pay period" as a substring, so that line was dropped before
+# the model or infer_frequency_from_label() ever saw it - leaving
+# frequency null, period_number underivable, and every calculation
+# skipped behind "We could not complete every calculation", on a payslip
+# that printed both its frequency and its period number in plain text.
 
 
 def financial_lines_only(text: str) -> str:
@@ -436,7 +504,15 @@ def financial_lines_only(text: str) -> str:
     whatever the redaction regexes above missed - most importantly an
     unlabelled name or address line, which has no shape a PII regex can
     anchor to but also has no financial content, so it never survives
-    this filter either way.
+    this filter.
+
+    That last claim holds only for a name ALONE on its line. It used to
+    be written here as though it held for any unlabelled name, and a
+    real payslip disproved that: "1195 Mr. K SAMPLE 13/02/2026
+    AB123456C" is one collapsed row, and the date alone is enough to
+    keep it - name included. Redaction, not this filter, is what has to
+    catch a name sharing a line with a financial value; see
+    _TITLED_NAME_RE and redact()'s stated residual gap.
 
     Must run AFTER redact(). See the module docstring for why.
     """
@@ -469,6 +545,14 @@ _PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str], object], ...] = (
     ("account number", _ACCOUNT_NUMBER_RE, _looks_like_an_unambiguous_date),
     ("email", _EMAIL_RE, None),
     ("phone", _PHONE_RE, None),
+    # Shares redact()'s regex, like every entry above it, so it adds no
+    # independent detection power - what it adds is failing CLOSED if
+    # this pattern ever stops running in redact() (a reordering, an
+    # early return): the payload is refused instead of quietly sent with
+    # a name in it. Check 2 below cannot see a name at all - it only
+    # reasons about unexplained digits - so without this entry a name is
+    # the one PII class the gate has no opinion on whatsoever.
+    ("name", _TITLED_NAME_RE, None),
 )
 
 

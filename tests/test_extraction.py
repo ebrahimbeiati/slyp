@@ -204,6 +204,45 @@ def test_labelled_name_and_address_are_redacted():
     assert "[ADDRESS]" in redacted
 
 
+def test_titled_name_sharing_a_line_with_a_date_is_redacted():
+    """
+    The row that broke the "allowlist catches unlabelled names" claim, from
+    a real payslip: name, pay date and NI number collapsed onto one line.
+    The NI number was already redacted; the date then kept the whole line
+    through the allowlist, carrying the name to the model with it.
+    """
+    line = "1195 Mr. K SAMPLE 13/02/2026 AB123456C"
+    payload = financial_lines_only(redact(line)[0])
+
+    assert "SAMPLE" not in payload
+    assert "[NAME]" in payload
+    # the line still survives, and the pay date on it is untouched -
+    # period_number is derived from that date
+    assert "13/02/2026" in payload
+
+
+def test_titled_name_does_not_swallow_the_payslip_label_beside_it():
+    """Over-redaction here costs a field, so the name match stops at the
+    first payslip word rather than running to the end of the line."""
+    redacted, _ = redact("Mr J Smith PAYE Tax 0.00")
+
+    assert "Smith" not in redacted
+    assert redacted == "[NAME] PAYE Tax 0.00"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Employer NIC 24.98",
+        "Total Gross Pay 79.64",
+        "Tax Code: 1257L W1 Dept: Tax Period: 45 Method: BACS",
+        "Miss Pay 10.00",  # title followed immediately by a stop word
+    ],
+)
+def test_titled_name_pattern_leaves_financial_lines_alone(line):
+    assert redact(line)[0] == line
+
+
 def test_labelled_employee_number_is_redacted():
     redacted, redaction_map = redact("Works Number 602")
     assert "602" not in redacted
@@ -360,6 +399,41 @@ def test_allowlist_keeps_lines_with_financial_content(line):
     assert kept == line
 
 
+def test_allowlist_keeps_a_payment_period_line_with_no_figure_on_it():
+    """
+    "Payment Period    Weekly" is the only statement of frequency on a
+    real weekly payslip, and it carries no currency amount, date,
+    percentage or tax code - the label alone has to keep it. It didn't:
+    the vocabulary had "pay period", which "Payment Period" does not
+    contain, so the line was dropped and frequency came back null.
+    """
+    assert financial_lines_only("Payment Period Weekly") == "Payment Period Weekly"
+    assert financial_lines_only("Pay Period Monthly") == "Pay Period Monthly"
+
+
+def test_frequency_survives_the_allowlist_on_the_real_weekly_payslip():
+    """
+    End-to-end on the shape that produced "We could not complete every
+    calculation": frequency has to survive redact() AND the allowlist to
+    be readable, because infer_frequency_from_label() runs on the
+    filtered payload, not the raw text.
+    """
+    text = "\n".join(
+        [
+            "1195 Mr. K SAMPLE 13/02/2026 AB123456C",
+            "Total Gross Pay 79.64 Total Gross Pay TD 79.64",
+            "Payment Period Weekly",
+            "Tax Code: 1257L W1 Dept: Tax Period: 45 Method: BACS",
+        ]
+    )
+    payload = financial_lines_only(redact(text)[0])
+
+    assert infer_frequency_from_label(payload) == "weekly"
+    # and with the frequency known, the pay date on the identity row is
+    # all the period number needs
+    assert derive_period_number(date(2026, 2, 13), "weekly") == 45
+
+
 def test_redaction_runs_before_filtering_on_the_real_sample():
     """
     The key ordering case: a line with BOTH an NI number and a currency
@@ -389,6 +463,13 @@ def test_redaction_runs_before_filtering_on_the_real_sample():
 def test_assert_safe_to_send_raises_on_unredacted_pii():
     with pytest.raises(RedactionFailure):
         assert_safe_to_send("NI Number AB 12 34 56 C National Insurance 0.00")
+
+
+def test_assert_safe_to_send_raises_on_an_unredacted_titled_name():
+    """A name is the one PII class the gate's second (digit-run) check
+    cannot see at all, so the re-scan has to carry it."""
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send("1195 Mr. K SAMPLE 13/02/2026")
 
 
 def test_assert_safe_to_send_does_not_raise_on_clean_text():
@@ -749,6 +830,52 @@ def test_reconciles_accounts_for_other_deductions():
 # --------------------------------------------------------------------------
 # extract_payslip - full pipeline, model call mocked
 # --------------------------------------------------------------------------
+
+
+def test_user_context_never_reaches_the_extraction_model():
+    """
+    only_job (and any other application metadata) is answered by the user
+    in the UI, sent as a form field alongside the file, and consumed by
+    analyse_payslip() AFTER extraction. It must never be part of the
+    model payload.
+
+    Structural, not incidental: extract_payslip() has no parameter for it
+    to arrive through. This captures the exact string handed to the model
+    and checks it against the PDF's own text, so adding a metadata
+    parameter later would have to break this test to leak.
+    """
+    text = "\n".join(
+        [
+            "Pay Date: 28/08/2026",
+            "Tax Code: 1257L M1",
+            "Total Gross Pay 2,500.00 Net Pay 1,968.34",
+        ]
+    )
+    captured: dict[str, str] = {}
+
+    def _capture(payload: str) -> _ModelExtract:
+        captured["payload"] = payload
+        return _sample_model_extract()
+
+    with patch("slyp.extraction._call_model", side_effect=_capture):
+        extract_payslip(_make_pdf_bytes(text.splitlines()))
+
+    payload = captured["payload"]
+    for forbidden in ("only_job", "job_label", "true", "false", "not_sure"):
+        assert forbidden not in payload.lower()
+
+    # Everything sent came off the page, nothing was added to it.
+    source_lines = set(text.splitlines())
+    for line in payload.splitlines():
+        assert line in source_lines
+
+    # And there is no parameter to smuggle it through.
+    import inspect
+
+    assert set(inspect.signature(extract_payslip).parameters) == {
+        "pdf_bytes",
+        "filename",
+    }
 
 
 def _sample_model_extract() -> _ModelExtract:
