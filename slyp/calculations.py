@@ -406,6 +406,26 @@ TAX_YEAR = "2026/27"
 # year is added.
 SUPPORTED_TAX_YEARS: frozenset[str] = frozenset({TAX_YEAR})
 
+# TEMPORARY - demo only. Set False to bypass the tax-year refusal so
+# 2025/26 test payslips produce figures instead of being refused.
+#
+# What this actually costs, on the constants above:
+#   - Income tax: NOTHING. Personal Allowance (12,570), basic rate limit
+#     (37,700), higher (50,270) and additional (125,140) thresholds have
+#     been frozen since 2021/22 and stay frozen to 2027/28, so 2025/26
+#     and 2026/27 are identical. Tax figures are correct either way.
+#   - National Insurance: NOTHING. The 8%/2% employee rates and the
+#     12,570/50,270 PT/UEL are the same in both years.
+#   - Student loans: WRONG for plans 1, 2 and 4. Those thresholds are
+#     uprated every April and the values above are the 2026/27 ones
+#     (~£835-1,050/yr higher than 2025/26), so a 2025/26 payslip with a
+#     plan 1/2/4 loan gets too little expected repayment - roughly £7/mo
+#     on plan 2 - and may raise a student-loan mismatch that isn't real.
+#     Plan 5 (25,000) and PG (21,000) are frozen, so those are fine.
+#
+# Restore by setting this back to True - nothing else needs to change.
+ENFORCE_SUPPORTED_TAX_YEAR = False
+
 # Standard Personal Allowance.
 PERSONAL_ALLOWANCE = Decimal("12570")
 
@@ -665,7 +685,14 @@ def validate_tax_year(tax_year: Optional[str]) -> None:
     tax year: a payslip with no determinable date is exactly the case
     where guessing "current year" would be most likely wrong and least
     likely to be noticed.
+
+    Currently a no-op: ENFORCE_SUPPORTED_TAX_YEAR is off for the demo so
+    2025/26 test payslips still produce figures. See that constant for
+    exactly which of them are affected (student loan plans 1/2/4 only).
     """
+    if not ENFORCE_SUPPORTED_TAX_YEAR:
+        return
+
     if tax_year is None:
         raise UnsupportedPayslip(
             "The tax year for this payslip could not be determined."

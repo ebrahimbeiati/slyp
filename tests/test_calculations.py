@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import pytest
 
+from slyp import calculations
 from slyp.calculations import (
     annualise,
     income_tax_due,
@@ -23,18 +24,34 @@ from slyp.types import PayPeriodFacts, UnsupportedPayslip
 # 0. validate_tax_year
 # --------------------------------------------------------------------------
 
-def test_validate_tax_year_accepts_the_supported_year():
+@pytest.fixture
+def enforcing(monkeypatch):
+    """The guard is switched off for the demo (see
+    ENFORCE_SUPPORTED_TAX_YEAR). These tests cover the enforcing
+    behaviour so it's still verified when it's switched back on."""
+    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", True)
+
+
+def test_validate_tax_year_accepts_the_supported_year(enforcing):
     validate_tax_year("2026/27")  # must not raise
 
 
-def test_validate_tax_year_refuses_a_prior_year():
+def test_validate_tax_year_refuses_a_prior_year(enforcing):
     with pytest.raises(UnsupportedPayslip):
         validate_tax_year("2025/26")
 
 
-def test_validate_tax_year_refuses_when_undeterminable():
+def test_validate_tax_year_refuses_when_undeterminable(enforcing):
     with pytest.raises(UnsupportedPayslip):
         validate_tax_year(None)
+
+
+@pytest.mark.parametrize("tax_year", ["2026/27", "2025/26", "2024/25", None])
+def test_validate_tax_year_is_a_no_op_while_the_guard_is_off(monkeypatch, tax_year):
+    # The demo state: nothing is refused, including an undeterminable
+    # year. Delete this test when the guard goes back on.
+    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", False)
+    validate_tax_year(tax_year)  # must not raise
 
 
 # --------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from decimal import Decimal
 
 import pytest
 
+from slyp import calculations
 from slyp.analysis import _facts_from_extract, analyse_payslip
 from slyp.calculations import parse_tax_code
 from slyp.contract import (
@@ -155,13 +156,21 @@ def test_analyse_payslip_degrades_gracefully_when_ni_category_unreadable():
 # --------------------------------------------------------------------------
 
 
-def test_analyse_payslip_proceeds_for_the_supported_tax_year():
+@pytest.fixture
+def enforcing(monkeypatch):
+    """The guard is switched off for the demo (see
+    calculations.ENFORCE_SUPPORTED_TAX_YEAR). These tests cover the
+    enforcing behaviour so it's still verified when it goes back on."""
+    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", True)
+
+
+def test_analyse_payslip_proceeds_for_the_supported_tax_year(enforcing):
     extract = _extract(tax_year="2026/27")
     result = analyse_payslip(extract)
     assert result.status == "ok"
 
 
-def test_analyse_payslip_refuses_a_prior_tax_year():
+def test_analyse_payslip_refuses_a_prior_tax_year(enforcing):
     extract = _extract(tax_year="2025/26")
     result = analyse_payslip(extract)
     assert result.status == "unsupported"
@@ -170,10 +179,21 @@ def test_analyse_payslip_refuses_a_prior_tax_year():
     assert result.score is None
 
 
-def test_analyse_payslip_refuses_when_tax_year_is_undeterminable():
+def test_analyse_payslip_refuses_when_tax_year_is_undeterminable(enforcing):
     extract = _extract(tax_year=None)
     result = analyse_payslip(extract)
     assert result.status == "unsupported"
     assert "could not be determined" in result.failure_reason
     assert result.findings == []
     assert result.score is None
+
+
+# The demo state: a prior-year payslip must actually analyse rather than
+# be refused. Delete when the guard goes back on.
+@pytest.mark.parametrize("tax_year", ["2025/26", None])
+def test_analyse_payslip_proceeds_for_a_prior_year_while_the_guard_is_off(
+    monkeypatch, tax_year
+):
+    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", False)
+    result = analyse_payslip(_extract(tax_year=tax_year))
+    assert result.status == "ok"
