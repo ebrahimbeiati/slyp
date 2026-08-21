@@ -559,6 +559,121 @@ def test_extract_payslip_does_not_derive_period_number_when_frequency_is_unreada
 
 
 # --------------------------------------------------------------------------
+# Printed-period-label fallback: no pay date to derive from, but the
+# payslip prints an explicit period label the model read confidently.
+# --------------------------------------------------------------------------
+
+
+def test_extract_payslip_accepts_printed_period_label_when_no_pay_date_and_in_range():
+    """
+    The case the fallback exists for: a payslip that states its period as
+    "Month 9" with no calendar pay date anywhere - frequency is
+    confidently known, the label is a plausible value for that frequency,
+    so it's accepted rather than refused, and marked distinctly from a
+    derived value.
+    """
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.period_number = 9
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 9
+    assert "period.period_number" not in result.unreadable_fields
+    # Left as the model's own reading, not promoted to 1.0 like a derived
+    # value - this is what makes the two provenances distinguishable.
+    assert result.confidence["period.period_number"] == 0.9
+    assert any(
+        "read directly from a printed period label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_refuses_printed_period_label_out_of_range():
+    """A monthly payslip claiming period 45 is not a plausible reading -
+    refuse rather than accept an implausible label."""
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.period_number = 45
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number is None
+    assert "period.period_number" in result.unreadable_fields
+    assert not any(
+        "read directly from a printed period label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_refuses_printed_period_label_when_frequency_unconfirmed():
+    """No pay date, and the period label is in-range for monthly - but
+    frequency itself isn't confirmed, so there's no basis to judge
+    plausibility against. Must refuse, not assume monthly."""
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.frequency = None
+    model_extract.period.period_number = 9
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number is None
+    assert "period.period_number" in result.unreadable_fields
+
+
+def test_extract_payslip_pay_date_takes_precedence_over_printed_label():
+    """Pay date present and derivable -> always wins, the fallback branch
+    is never reached, even when the model's own printed-label reading
+    would itself have been accepted (in range) if pay date were absent."""
+    model_extract = _sample_model_extract()  # pay_date "2026-03-31", monthly -> derives to 12
+    model_extract.period.period_number = 9  # plausible on its own, but wrong
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 12
+    assert result.confidence["period.period_number"] == 1.0  # derived, not label-read
+    assert any("period.period_number" in w and "12" in w for w in result.warnings)
+    assert not any(
+        "read directly from a printed period label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_label_and_derived_disagreeing_prefers_derived():
+    """
+    Same scenario as the precedence test above, framed the other way: the
+    label and the derived value disagree, and there is no separate
+    conflict-resolution path for that - pay date being present already
+    means derivation runs and wins outright (see
+    test_extract_payslip_prefers_derived_period_number_over_model_and_warns
+    for the original version of this guarantee). The fallback only ever
+    activates when derivation has nothing to work with in the first
+    place, so "label vs derived" can only arise when pay date exists, at
+    which point derived has already won before the fallback is even
+    considered.
+    """
+    model_extract = _sample_model_extract()  # pay_date "2026-03-31", monthly -> derives to 12
+    model_extract.period.period_number = 3  # disagrees with the derived value
+    model_extract.confidence["period.period_number"] = 0.95
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 12
+    assert any("3" in w and "12" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------
 # employer_name
 # --------------------------------------------------------------------------
 

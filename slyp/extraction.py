@@ -746,6 +746,21 @@ def derive_period_number(
     return days_elapsed // 7 + 1
 
 
+# Valid period_number range per frequency - used only by the printed-
+# period-label fallback below, to reject an implausible combination
+# (e.g. "period 45" against a monthly payslip) rather than accept
+# anything the model reports once frequency is confirmed.
+_PERIOD_NUMBER_RANGE: dict[str, range] = {
+    "monthly": range(1, 13),
+    "weekly": range(1, 54),
+}
+
+
+def _period_number_plausible(period_number: int, frequency: Optional[Frequency]) -> bool:
+    valid_range = _PERIOD_NUMBER_RANGE.get(frequency or "")
+    return valid_range is not None and period_number in valid_range
+
+
 # Best-effort validation of the tax code shapes types.TaxCodeKind
 # recognises. A code failing this doesn't raise - it just means
 # tax_code.value goes into unreadable_fields like any other suspect
@@ -1015,6 +1030,10 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         else None
     )
     if derived_period_number is not None:
+        # Guard: pay date present -> derive as always. This branch is
+        # unchanged and takes priority regardless of anything the model
+        # separately reported - see the fallback branch below for why a
+        # disagreement here doesn't get a different resolution.
         if period_number is not None and period_number != derived_period_number:
             path_warnings.append(
                 "period.period_number: model reported "
@@ -1024,12 +1043,41 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         period_number = derived_period_number
         confidence["period.period_number"] = 1.0
         unreadable.discard("period.period_number")
+
+    elif (
+        frequency_known
+        and model_extract.period.pay_date is None
+        and period_number is not None
+        and "period.period_number" not in unreadable
+        and _period_number_plausible(period_number, model_extract.period.frequency)
+    ):
+        # No pay date to derive from, but the payslip prints an explicit
+        # period label (e.g. "Month 9") that the model read confidently,
+        # and it's a plausible value for the frequency we've separately
+        # confirmed. This is not the failure the strict branch above
+        # guards against: that was the model inventing a number with no
+        # signal behind it. Reading a printed label is extraction - the
+        # same operation already trusted for tax code and gross pay -
+        # not the model guessing. Left as read, not promoted to 1.0
+        # confidence: it still carries whatever uncertainty the model
+        # itself reported about having read it correctly, unlike a
+        # derived value which is mathematically certain given accurate
+        # inputs.
+        path_warnings.append(
+            f"period.period_number: read directly from a printed period "
+            f"label ({period_number}) - no pay date was available to "
+            f"derive it independently."
+        )
+
     else:
-        # No trustworthy frequency and/or pay date to derive from -
-        # never fall back to a model-guessed period_number here, even if
-        # the model itself reported it confidently. Assuming a frequency
-        # and then reporting the result as certain is exactly the
-        # failure this whole function exists to prevent.
+        # No trustworthy frequency and/or pay date to derive from, and
+        # no safely-acceptable printed period label either (out of
+        # range for the stated frequency, frequency itself unconfirmed,
+        # or the model didn't report one confidently) - never fall back
+        # to a model-guessed period_number here, even if the model
+        # itself reported it confidently. Assuming a frequency and then
+        # reporting the result as certain is exactly the failure this
+        # whole function exists to prevent.
         period_number = None
         confidence.pop("period.period_number", None)
         unreadable.add("period.period_number")
