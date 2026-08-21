@@ -93,7 +93,15 @@ function FindingCard({ finding }: { finding: Finding }) {
  * Both read as confidence the analysis had not earned.
  */
 function WhatWeChecked({ score }: { score: Score }) {
-  const notApplicable = score.not_applicable;
+  // Defaulted, despite the type saying these are always present: this
+  // component renders a result rehydrated from localStorage, which can
+  // have been written by an older build of the app. The hydration does
+  // `JSON.parse(raw) as AnalysisResult` - an unchecked cast - so the type
+  // describes what the API sends today, not what is actually on disk.
+  // not_applicable was added after some results were already saved, and
+  // reading .length off it crashed the whole page rather than degrading.
+  const notApplicable = score.not_applicable ?? [];
+  const movers = score.movers ?? [];
   const total = score.checks_run + notApplicable.length;
 
   return (
@@ -120,9 +128,9 @@ function WhatWeChecked({ score }: { score: Score }) {
         </ul>
       )}
 
-      {score.movers.length > 0 && (
+      {movers.length > 0 && (
         <ul className="mt-2 space-y-1">
-          {score.movers.map((mover) => (
+          {movers.map((mover) => (
             <li key={mover} className="text-[var(--sage)] text-[10px] leading-relaxed">
               → {mover}
             </li>
