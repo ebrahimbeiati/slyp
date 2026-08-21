@@ -35,12 +35,24 @@ CASES = [
     ("Sort code with mixed separators", "Sort Code 12-34/56 Account 12345678", True),
     ("Address multi-line postcode only", "123 Fake Street\nFaketown\nSW1A 1AA", True),
     (
-        # redact() has no pattern at all for an arbitrary internal
-        # reference number - this is only "safe" because the gate's
-        # second, independent layer refuses it. Different expectation
-        # from the rows above: here the gate firing IS the pass condition.
-        "Unknown PII shape, caught only by the gate's second layer",
+        # Was "gate" - redact() had no pattern for an arbitrary internal
+        # reference number, so the gate's second layer refusing the whole
+        # document was the only thing stopping it being sent. It's now
+        # redacted at source by _UNEXPLAINED_ID_RE ([NUMBER]), which is
+        # both safer and lets the payslip actually process, so the
+        # expectation is now full redaction like every row above.
+        "Unknown PII shape, now redacted at source rather than refused",
         "Some Internal Reference 123456789 National Insurance 0.00",
+        True,
+    ),
+    (
+        # The replacement gate-only case, keeping that property tested:
+        # digits printed in uniform groups are a shape redact() still has
+        # no pattern for (not a sort code - those are 2-digit groups; not
+        # an 8-digit account number), so the gate's split-group check is
+        # what catches it. Here the gate firing IS the pass condition.
+        "Group-printed digits, caught only by the gate's second layer",
+        "Code 123 456 789 National Insurance 0.00",
         "gate",
     ),
 ]

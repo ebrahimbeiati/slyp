@@ -469,6 +469,53 @@ def test_gate_still_refuses_unexplained_digits(payload):
 
 
 # --------------------------------------------------------------------------
+# Unexplained identifiers are REDACTED, not left for the gate to refuse
+#
+# A 6-7 digit employee/payroll number sits in a gap between the specific
+# patterns: too short for the 8-digit account number, no separators for
+# the sort code. It used to survive redact() untouched and then trip the
+# gate's digit-run check, refusing the whole document - which also means
+# the only thing stopping that number being sent was the gate. Redacting
+# it at source is both the safer outcome and the one that lets the
+# payslip actually process.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line,identifier",
+    [
+        ("Employee 123456 Gross Pay 2500.00", "123456"),
+        ("Employee ID 1234567 Tax Code 1257L", "1234567"),
+        ("Staff Number 123456 Net Pay 2000.00", "123456"),
+        ("Clock Number 12345678901 Hours 37.50", "12345678901"),
+    ],
+)
+def test_unexplained_identifier_is_redacted_and_then_passes_the_gate(line, identifier):
+    redacted, _ = redact(line)
+    assert identifier not in redacted
+    payload = financial_lines_only(redacted)
+    assert_safe_to_send(payload)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "line,must_survive",
+    [
+        # Six-plus digits before the decimal point is still money, not an
+        # identifier - the catch-all must not eat a large gross figure.
+        ("Gross Pay 125000.00 Tax Code 1257L", "125000.00"),
+        ("YTD Gross 1,234,567.89 Tax Code 1257L", "1,234,567.89"),
+        ("Gross Pay 2500.00 Net Pay 1987.65", "2500.00"),
+        # Dates must survive the catch-all too, in both orders.
+        ("Pay Date 15/12/2025 Gross 2500.00", "15/12/2025"),
+        ("Pay Date 2025-12-15 Gross 2500.00", "2025-12-15"),
+    ],
+)
+def test_catch_all_does_not_eat_money_or_dates(line, must_survive):
+    redacted, _ = redact(line)
+    assert must_survive in redacted, f"{must_survive!r} was redacted: {redacted!r}"
+
+
+# --------------------------------------------------------------------------
 # Tax year derivation
 # --------------------------------------------------------------------------
 

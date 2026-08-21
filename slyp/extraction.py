@@ -193,6 +193,26 @@ def _looks_like_an_unambiguous_date(span: str) -> bool:
 
     return False
 
+# Catch-all for an identifier the specific patterns above don't recognise:
+# a contiguous run of 6+ digits that isn't part of a decimal amount. A
+# 6- or 7-digit employee/payroll number falls in exactly this gap - too
+# short for the 8-digit account pattern, no separators for the sort-code
+# pattern - so it used to survive redact() untouched and then trip
+# assert_safe_to_send's digit-run check, refusing the whole document.
+#
+# The gate was right to distrust it; the defect was that redact() left it
+# in. Tokenising it here means the payslip still processes AND the number
+# never leaves the process, instead of the previous outcome where it was
+# only luck (the gate) that stopped it being sent.
+#
+# The lookbehind/lookahead keep this off legitimate money: "125000.00"
+# has a 6-digit run, but it's followed by ".00" so it isn't matched, and
+# ".123456" isn't matched because it's a decimal fraction. Comma-grouped
+# amounts ("1,234,567") never have a 6+ contiguous run at all. Runs this
+# long with no decimal point aren't any field in the extraction schema -
+# every money field on a UK payslip prints to two decimal places.
+_UNEXPLAINED_ID_RE = re.compile(r"(?<![\d.])\b\d{6,}\b(?!\.\d)")
+
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
 # UK phone number: leading 0 or +44, then 9-10 more digits with optional
@@ -302,8 +322,8 @@ def _redact_labelled(
 def redact(text: str) -> tuple[str, RedactionMap]:
     """
     Replace PII with tokens ([NAME], [NI], [ADDRESS], [EMPLOYEE_NO],
-    [BANK], [EMAIL], [PHONE]) rather than deleting it - layout matters,
-    and a deleted span would just shift everything after it.
+    [BANK], [EMAIL], [PHONE], [NUMBER]) rather than deleting it - layout
+    matters, and a deleted span would just shift everything after it.
 
     Must run before financial_lines_only(). See the module docstring for
     why: a line can carry both PII and a currency amount together.
@@ -339,6 +359,11 @@ def redact(text: str) -> tuple[str, RedactionMap]:
     redacted = _redact_labelled(redacted, _EMPLOYEE_NO_LABEL_RE, "[EMPLOYEE_NO]", redaction_map)
     redacted = _redact_labelled(redacted, _NAME_LABEL_RE, "[NAME]", redaction_map)
     redacted = _redact_labelled(redacted, _ADDRESS_LABEL_RE, "[ADDRESS]", redaction_map)
+
+    # Last of the value passes, deliberately: every pattern above is more
+    # specific and gets first claim on the same digits, so this only sees
+    # what none of them recognised. See _UNEXPLAINED_ID_RE.
+    redacted = _redact_pattern(redacted, _UNEXPLAINED_ID_RE, "[NUMBER]", redaction_map)
 
     # Runs last and reads the ORIGINAL text, not `redacted` - it needs to
     # see real label text ("Employer:"), and its own guard needs
