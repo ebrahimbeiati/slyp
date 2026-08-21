@@ -115,10 +115,15 @@ export interface Projection {
 }
 
 export interface Score {
-  value: number;
+  // null when no check applied - not 0, which would read as a failing
+  // payslip rather than an unscored one.
+  value: number | null;
   checks_passed: number;
   checks_run: number;
   movers: string[];
+  // Plain-English reasons a check did not apply. Neither passes nor
+  // failures, and excluded from checks_run.
+  not_applicable: string[];
 }
 
 export interface Verdict {

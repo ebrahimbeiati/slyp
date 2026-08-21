@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
-import type { AnalysisResult, Finding, PayslipExtract, Severity } from "@/app/Types/Types";
+import type { AnalysisResult, Finding, PayslipExtract, Score, Severity } from "@/app/Types/Types";
 import { buildPayrollMessage } from "@/lib/payrollMessage";
 
 const STORAGE_KEY = "slyp:latest";
@@ -79,6 +79,56 @@ function FindingCard({ finding }: { finding: Finding }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * What was checked, what wasn't, and why - in that order.
+ *
+ * A check that had nothing to compare is listed here as not applicable
+ * rather than counted as a pass. "4/4 checks clear" on a payslip under
+ * every threshold was four comparisons of £0.00 against £0.00, and on a
+ * payslip whose calculation never ran it was four absences of a finding.
+ * Both read as confidence the analysis had not earned.
+ */
+function WhatWeChecked({ score }: { score: Score }) {
+  const notApplicable = score.not_applicable;
+  const total = score.checks_run + notApplicable.length;
+
+  return (
+    <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl p-4 mb-4">
+      <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
+        What we checked
+      </div>
+
+      <p className="text-[var(--ink)] text-[11px] leading-relaxed">
+        {score.checks_run === 0
+          ? "No check could be completed on this payslip."
+          : `${score.checks_passed} of ${score.checks_run} ${
+              score.checks_run === 1 ? "check" : "checks"
+            } passed${total > score.checks_run ? ` (of ${total} we look at)` : ""}.`}
+      </p>
+
+      {notApplicable.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {notApplicable.map((reason) => (
+            <li key={reason} className="text-[var(--sage)] text-[10px] leading-relaxed">
+              • {reason}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {score.movers.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {score.movers.map((mover) => (
+            <li key={mover} className="text-[var(--sage)] text-[10px] leading-relaxed">
+              → {mover}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -295,14 +345,14 @@ export default function HomePage() {
                             SEVERITY_STYLES[result!.verdict.severity].border
                           } bg-[var(--surface-2)]`}
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-[var(--ink)] text-xs font-bold">{result!.verdict.headline}</span>
-                            {result!.score && (
-                              <span className="text-[var(--sage)] text-[10px]">
-                                {result!.score.checks_passed}/{result!.score.checks_run} checks clear
-                              </span>
-                            )}
-                          </div>
+                          {/* One statement, not two. The findings count and
+                              the checks-clear count are different kinds of
+                              thing - "1 thing worth checking" beside
+                              "4/4 checks clear" reads as a contradiction
+                              even when both are true. What was and wasn't
+                              checked now sits below the findings, in
+                              WhatWeChecked. */}
+                          <span className="text-[var(--ink)] text-xs font-bold">{result!.verdict.headline}</span>
                         </div>
                       )}
 
@@ -317,6 +367,13 @@ export default function HomePage() {
                           ))}
                         </div>
                       )}
+
+                      {/* What was actually checked. Sits below the
+                          findings deliberately: it is detail, not a
+                          headline, and pairing it with the verdict up top
+                          was what made "1 thing worth checking" read as a
+                          contradiction of "4/4 checks clear". */}
+                      {result!.score && <WhatWeChecked score={result!.score} />}
 
                       {/* Fields that couldn't be read */}
                       {extract.unreadable_fields.length > 0 && (

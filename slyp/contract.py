@@ -245,11 +245,23 @@ class Projection(BaseModel):
 # ==========================================================================
 
 class Score(BaseModel):
-    value: int = Field(ge=0, le=100)
+    # None when no check applied - deliberately not 0, which would read as
+    # a failing payslip rather than an unscored one. See
+    # analysis.build_score().
+    value: Optional[int] = Field(default=None, ge=0, le=100)
     checks_passed: int
     checks_run: int
     movers: list[str] = Field(
         default_factory=list, description="What would move it, plain English"
+    )
+    not_applicable: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Plain-English reasons a check did not apply to this payslip. "
+            "These are NOT failures and NOT passes - they are checks with "
+            "nothing to check, and they are excluded from checks_run so "
+            "the score never counts a vacuous comparison as confidence."
+        ),
     )
 
 

@@ -25,6 +25,7 @@ from .calculations import (
 
 from .findings import (
     CalculationComparison,
+    ZERO_GBP as ZERO,
     comparison_from_breakdown,
     generate_findings,
 )
@@ -268,6 +269,7 @@ def analyse_payslip(
     score = build_score(
         findings=findings,
         extract=extract,
+        comparison=comparison,
     )
 
     # ------------------------------------------------------------------
@@ -471,20 +473,59 @@ def build_verdict(
 # ============================================================================
 
 
+def _comparison_is_vacuous(
+    expected: Optional[Decimal],
+    actual: Optional[Decimal],
+) -> bool:
+    """
+    True when comparing these two establishes nothing.
+
+    Two distinct ways that happens, and both used to count as a pass:
+
+      - The engine produced no expected figure at all (`expected is
+        None`). Nothing was compared. This is the case behind "4/4 checks
+        clear" appearing on a payslip that also says "we could not
+        complete every calculation" - the checks counted the ABSENCE of a
+        finding as a pass, and a calculation that never ran cannot
+        produce a finding.
+      - Both figures are zero. Real, but nothing could have been wrong:
+        under the personal allowance and under the primary threshold,
+        £0.00 is compared against £0.00 and always agrees.
+    """
+    if expected is None:
+        return True
+    return expected == ZERO and (actual is None or actual == ZERO)
+
+
 def build_score(
     findings: list[Finding],
     extract: PayslipExtract,
+    comparison: Optional[CalculationComparison] = None,
 ) -> Score:
     """
     Produces the simple payslip health score.
 
     This is deliberately based on deterministic checks rather than
     an AI-generated score.
+
+    checks_run counts only checks that had something to check. A check
+    with nothing to compare is recorded in `not_applicable` with a plain
+    reason instead of being silently counted as a pass - "we verified
+    nothing and found nothing wrong" is not the same statement as "we
+    verified this and it was right", and only one of them belongs in a
+    score the user reads as confidence.
+
+    `value` is None - not 0 - when nothing applied. A zero would read as
+    a failing payslip, which is the same overstatement in the opposite
+    direction.
     """
 
     checks_run = 0
     checks_passed = 0
     movers: list[str] = []
+    not_applicable: list[str] = []
+
+    comparison = comparison if comparison is not None else CalculationComparison()
 
     # --------------------------------------------------------------
     # Check 1: reconciliation
@@ -496,6 +537,12 @@ def build_score(
         and extract.deductions.income_tax is not None
         and extract.deductions.national_insurance is not None
     )
+
+    if not reconciliation_available:
+        not_applicable.append(
+            "Gross, net and the main deductions weren't all readable, so we "
+            "couldn't check that the payslip adds up."
+        )
 
     if reconciliation_available:
 
@@ -521,7 +568,12 @@ def build_score(
     # Check 2: tax code
     # --------------------------------------------------------------
 
-    if extract.tax_code.value:
+    if not extract.tax_code.value or is_unreadable(extract, "tax_code.value"):
+        not_applicable.append(
+            "The tax code wasn't readable, so we couldn't check it."
+        )
+
+    if extract.tax_code.value and not is_unreadable(extract, "tax_code.value"):
 
         checks_run += 1
 
@@ -544,7 +596,20 @@ def build_score(
     # Check 3: income tax
     # --------------------------------------------------------------
 
-    if extract.deductions.income_tax is not None:
+    income_tax_vacuous = _comparison_is_vacuous(
+        comparison.expected_income_tax,
+        extract.deductions.income_tax,
+    )
+
+    if extract.deductions.income_tax is None or income_tax_vacuous:
+        not_applicable.append(
+            "No income tax was due or deducted this period, so there was "
+            "nothing to check against your tax code."
+            if income_tax_vacuous and comparison.expected_income_tax == ZERO
+            else "We couldn't work out the income tax due, so it wasn't checked."
+        )
+
+    if extract.deductions.income_tax is not None and not income_tax_vacuous:
 
         checks_run += 1
 
@@ -566,7 +631,21 @@ def build_score(
     # Check 4: National Insurance
     # --------------------------------------------------------------
 
-    if extract.deductions.national_insurance is not None:
+    ni_vacuous = _comparison_is_vacuous(
+        comparison.expected_national_insurance,
+        extract.deductions.national_insurance,
+    )
+
+    if extract.deductions.national_insurance is None or ni_vacuous:
+        not_applicable.append(
+            "Earnings were below the National Insurance threshold, so there "
+            "was no NI to check."
+            if ni_vacuous and comparison.expected_national_insurance == ZERO
+            else "We couldn't work out the National Insurance due, so it "
+            "wasn't checked."
+        )
+
+    if extract.deductions.national_insurance is not None and not ni_vacuous:
 
         checks_run += 1
 
@@ -588,18 +667,20 @@ def build_score(
     # Calculate score
     # --------------------------------------------------------------
 
-    if checks_run == 0:
-        score_value = 0
-    else:
-        score_value = round(
-            Decimal(checks_passed) / Decimal(checks_run) * Decimal("100")
-        )
+    # None, not 0: nothing applied, so there is no score to give. A 0
+    # would be read as a failing payslip.
+    score_value = (
+        None
+        if checks_run == 0
+        else int(round(Decimal(checks_passed) / Decimal(checks_run) * Decimal("100")))
+    )
 
     return Score(
-        value=int(score_value),
+        value=score_value,
         checks_passed=checks_passed,
         checks_run=checks_run,
         movers=movers,
+        not_applicable=not_applicable,
     )
 
 
