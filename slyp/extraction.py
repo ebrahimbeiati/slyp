@@ -956,6 +956,87 @@ _UNSUPPORTED_FREQUENCY_RE = re.compile(
 )
 
 
+# Pay date read from its printed label. Same motivation as
+# infer_frequency_from_label(): pay_date drives period_number, which
+# gates the whole calculation, and leaving it solely to the model makes
+# the result non-deterministic - the same payslip intermittently loses
+# the field and the user sees "We could not complete every calculation"
+# on some runs and not others, with temperature already pinned to 0.
+#
+# Label-anchored deliberately. A payslip carries several dates - period
+# start and end, continuous service date, tax year dates - and an
+# unanchored "first date on the page" read would confidently pick the
+# wrong one. That's the wrong-value failure this pipeline exists to
+# avoid, and it's worse than a missing field.
+_PAY_DATE_LABEL_RE = re.compile(
+    r"(?i)\b(?:pay\s*(?:ment)?\s*d(?:ate|ay)|date\s+paid)\b[^\n\d]{0,20}?("
+    rf"\d{{1,2}}(?:st|nd|rd|th)?[-\s/](?:{_MONTH_NAMES})[a-z]*[-\s/]\d{{2,4}}"
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r"|\d{4}[/-]\d{1,2}[/-]\d{1,2}"
+    r")"
+)
+
+_MONTH_NUMBER = {
+    name.lower(): index
+    for index, name in enumerate(_MONTH_NAMES.split("|"), start=1)
+}
+
+
+def _parse_labelled_date(raw: str) -> Optional[date]:
+    """Parse the date shapes _PAY_DATE_LABEL_RE captures, or None.
+
+    Day-first for the all-numeric forms: this is a UK payslip, where
+    05/06/2025 is 5 June. A two-digit year is read as 2000-2099 - a
+    payslip is a current document, not a historical one.
+    """
+    cleaned = re.sub(r"(?i)(\d)(st|nd|rd|th)", r"\1", raw.strip())
+    parts = re.split(r"[-\s/]+", cleaned)
+    if len(parts) != 3:
+        return None
+
+    try:
+        if parts[0].isdigit() and len(parts[0]) == 4:  # ISO, year first
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+        elif parts[1].isdigit():  # all numeric, day first
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+        else:  # "15 Dec 2025"
+            month_number = _MONTH_NUMBER.get(parts[1][:3].lower())
+            if month_number is None:
+                return None
+            day, month, year = int(parts[0]), month_number, int(parts[2])
+    except ValueError:
+        return None
+
+    if year < 100:
+        year += 2000
+
+    try:
+        return date(year, month, day)
+    except ValueError:  # e.g. 31 February
+        return None
+
+
+def read_pay_date_from_label(text: str) -> Optional[date]:
+    """
+    Pay date read from an explicit "Pay Date"/"Pay Day"/"Payment Date"/
+    "Date Paid" label, or None.
+
+    Returns None - never a guess - when no labelled date is found, when
+    one is found but doesn't parse to a real calendar date, or when two
+    labelled pay dates disagree. A disagreement means the layout isn't
+    what this assumes, which is exactly when picking one would be wrong.
+    """
+    found = {
+        parsed
+        for parsed in (
+            _parse_labelled_date(match.group(1))
+            for match in _PAY_DATE_LABEL_RE.finditer(text)
+        )
+        if parsed is not None
+    }
+    return found.pop() if len(found) == 1 else None
+
+
 def infer_frequency_from_label(text: str) -> Optional[Frequency]:
     """
     Frequency from an explicitly printed period label, or None.
@@ -1239,6 +1320,22 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     period_number = model_extract.period.period_number
     confidence = dict(model_extract.confidence)
     frequency = model_extract.period.frequency
+    pay_date = model_extract.period.pay_date
+
+    # Same reasoning as the frequency read below, and the same guard:
+    # only when the model returned nothing. This is what makes the
+    # result stable run to run - pay_date gates period_number, which
+    # gates the entire calculation, so a model that reads it on one run
+    # and misses it on the next makes "We could not complete every
+    # calculation" appear intermittently on an unchanged payslip.
+    if pay_date is None:
+        pay_date = read_pay_date_from_label(filtered_text)
+        if pay_date is not None:
+            unreadable.discard("period.pay_date")
+            path_warnings.append(
+                f"period.pay_date: read from its printed label ({pay_date}) - "
+                f"the model did not return one."
+            )
 
     # Only when the model returned NOTHING for frequency - not when it
     # returned a value it flagged unreadable, which is a different
@@ -1257,7 +1354,7 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
 
     frequency_known = frequency is not None and "period.frequency" not in unreadable
     derived_period_number = (
-        derive_period_number(model_extract.period.pay_date, frequency)
+        derive_period_number(pay_date, frequency)
         if frequency_known
         else None
     )
@@ -1278,7 +1375,7 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
 
     elif (
         frequency_known
-        and model_extract.period.pay_date is None
+        and pay_date is None
         and period_number is not None
         and "period.period_number" not in unreadable
         and _period_number_plausible(period_number, frequency)
@@ -1315,8 +1412,8 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         unreadable.add("period.period_number")
 
     tax_year = (
-        _tax_year_for(model_extract.period.pay_date)
-        if model_extract.period.pay_date is not None
+        _tax_year_for(pay_date)
+        if pay_date is not None
         else None
     )
 
@@ -1326,6 +1423,10 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     extract_dict["confidence"] = confidence
     extract_dict["period"]["period_number"] = period_number
     extract_dict["period"]["frequency"] = frequency
+    # Must be the resolved value, not the model's: deriving period_number
+    # from a label-read pay date while still reporting pay_date as null
+    # would leave the extract self-contradictory.
+    extract_dict["period"]["pay_date"] = pay_date
     extract_dict["period"]["tax_year"] = tax_year
     # employer_name never reaches the model - the allowlist drops that
     # line outright (no currency, date or known label on it) - so it's

@@ -108,6 +108,13 @@ Net Pay 583.55
 # never-guess property they exist to protect.
 SAMPLE_TEXT_NO_FREQUENCY = SAMPLE_TEXT.replace("Pay Type Monthly", "Pay Type")
 
+# Same again for the pay date: SAMPLE_TEXT prints "Pay Date 31-Mar-2026",
+# so read_pay_date_from_label() recovers it even when the model returns
+# none. Tests for the printed-period-label fallback need a payslip where
+# the pay date is genuinely unavailable, since that fallback exists
+# precisely for when there's nothing to derive from.
+SAMPLE_TEXT_NO_PAY_DATE = SAMPLE_TEXT.replace("Pay Date 31-Mar-2026 ", "")
+
 
 # --------------------------------------------------------------------------
 # extract_text
@@ -622,6 +629,58 @@ def test_printed_month_label_unblocks_period_number_and_the_calculation():
     assert any("period.frequency" in warning for warning in result.warnings)
 
 
+@pytest.mark.parametrize(
+    "model_pay_date,model_frequency",
+    [
+        (date(2025, 12, 15), "monthly"),  # model reads both
+        (date(2025, 12, 15), None),  # model drops the frequency
+        (None, "monthly"),  # model drops the pay date
+        (None, None),  # model drops both
+    ],
+)
+def test_period_number_is_stable_however_flaky_the_model_is(
+    model_pay_date, model_frequency
+):
+    """
+    The "works, but it sometimes shows up" report. Both pay_date and
+    frequency gate period_number, which gates the whole calculation, and
+    both used to come only from the model - so on an unchanged payslip
+    the advisory appeared on some runs and not others. temperature is
+    already pinned to 0 on both providers; that is not sufficient on its
+    own, because a model still varies run to run. Reading both off the
+    printed labels in code is what actually makes the result stable, so
+    all four of these must produce identical output.
+    """
+    text = (
+        "Pay Date 15/12/2025 Tax Month 9\n"
+        "Tax Code 1257L Income Tax 412.60\n"
+        "National Insurance 198.16\n"
+        "Total Gross Pay 2750.00\n"
+        "Taxable Gross Pay 24750.00\n"
+        "Net Pay 2139.24\n"
+    )
+
+    model_extract = _ModelExtract()
+    model_extract.period.pay_date = model_pay_date
+    model_extract.period.frequency = model_frequency
+    model_extract.tax_code.value = "1257L"
+    model_extract.pay.gross_this_period = Decimal("2750.00")
+    model_extract.pay.gross_ytd = Decimal("24750.00")
+    model_extract.deductions.income_tax = Decimal("412.60")
+    model_extract.deductions.national_insurance = Decimal("198.16")
+    model_extract.deductions.ni_category = "A"
+    model_extract.net_pay = Decimal("2139.24")
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.pay_date == date(2025, 12, 15)
+    assert result.period.frequency == "monthly"
+    assert result.period.period_number == 9
+    assert "period.period_number" not in result.unreadable_fields
+
+
 # --------------------------------------------------------------------------
 # Tax year derivation
 # --------------------------------------------------------------------------
@@ -884,7 +943,7 @@ def test_extract_payslip_accepts_printed_period_label_when_no_pay_date_and_in_ra
     model_extract.period.period_number = 9
     model_extract.confidence["period.period_number"] = 0.9
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
@@ -906,7 +965,7 @@ def test_extract_payslip_refuses_printed_period_label_out_of_range():
     model_extract.period.period_number = 45
     model_extract.confidence["period.period_number"] = 0.9
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
@@ -927,7 +986,7 @@ def test_extract_payslip_refuses_printed_period_label_when_frequency_unconfirmed
     model_extract.period.period_number = 9
     model_extract.confidence["period.period_number"] = 0.9
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_FREQUENCY.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.replace('Pay Type Monthly', 'Pay Type').splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
@@ -972,7 +1031,7 @@ def test_extract_payslip_label_and_derived_disagreeing_prefers_derived():
     model_extract.period.period_number = 3  # disagrees with the derived value
     model_extract.confidence["period.period_number"] = 0.95
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
