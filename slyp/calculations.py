@@ -406,25 +406,30 @@ TAX_YEAR = "2026/27"
 # year is added.
 SUPPORTED_TAX_YEARS: frozenset[str] = frozenset({TAX_YEAR})
 
-# TEMPORARY - demo only. Set False to bypass the tax-year refusal so
-# 2025/26 test payslips produce figures instead of being refused.
+# ONE YEAR ONLY, deliberately. There is no per-year rate selection in
+# this module - every constant below is a single 2026/27 value - so a
+# second entry in SUPPORTED_TAX_YEARS would silently run an older payslip
+# through this year's numbers. Supporting another year means making the
+# constants below year-aware FIRST, in the same change.
 #
-# What this actually costs, on the constants above:
+# What running a 2025/26 payslip through these constants would cost,
+# checked against the constants rather than assumed:
 #   - Income tax: NOTHING. Personal Allowance (12,570), basic rate limit
 #     (37,700), higher (50,270) and additional (125,140) thresholds have
 #     been frozen since 2021/22 and stay frozen to 2027/28, so 2025/26
-#     and 2026/27 are identical. Tax figures are correct either way.
+#     and 2026/27 are identical.
 #   - National Insurance: NOTHING. The 8%/2% employee rates and the
-#     12,570/50,270 PT/UEL are the same in both years.
+#     PT/UEL are the same in both years.
 #   - Student loans: WRONG for plans 1, 2 and 4. Those thresholds are
-#     uprated every April and the values above are the 2026/27 ones
+#     uprated every April and the values below are the 2026/27 ones
 #     (~£835-1,050/yr higher than 2025/26), so a 2025/26 payslip with a
 #     plan 1/2/4 loan gets too little expected repayment - roughly £7/mo
-#     on plan 2 - and may raise a student-loan mismatch that isn't real.
-#     Plan 5 (25,000) and PG (21,000) are frozen, so those are fine.
+#     on plan 2 - and can raise a student-loan mismatch that isn't real.
+#     Plan 5 (25,000) and PG (21,000) are frozen, so those two are the
+#     only ones that would survive the swap unharmed.
 #
-# Restore by setting this back to True - nothing else needs to change.
-ENFORCE_SUPPORTED_TAX_YEAR = False
+# That last point is the whole reason this is a refusal and not a
+# warning: two of the five plans would produce a confident, wrong figure.
 
 # Standard Personal Allowance.
 PERSONAL_ALLOWANCE = Decimal("12570")
@@ -686,13 +691,12 @@ def validate_tax_year(tax_year: Optional[str]) -> None:
     where guessing "current year" would be most likely wrong and least
     likely to be noticed.
 
-    Currently a no-op: ENFORCE_SUPPORTED_TAX_YEAR is off for the demo so
-    2025/26 test payslips still produce figures. See that constant for
-    exactly which of them are affected (student loan plans 1/2/4 only).
+    Enforced unconditionally. There is deliberately no bypass flag: one
+    existed for the demo, and a constant that turns a correctness guard
+    off is exactly the kind of thing that survives into production. See
+    SUPPORTED_TAX_YEARS for what an unsupported year would actually get
+    wrong (student loan plans 1, 2 and 4).
     """
-    if not ENFORCE_SUPPORTED_TAX_YEAR:
-        return
-
     if tax_year is None:
         raise UnsupportedPayslip(
             "The tax year for this payslip could not be determined."

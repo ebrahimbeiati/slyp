@@ -24,34 +24,40 @@ from slyp.types import PayPeriodFacts, UnsupportedPayslip
 # 0. validate_tax_year
 # --------------------------------------------------------------------------
 
-@pytest.fixture
-def enforcing(monkeypatch):
-    """The guard is switched off for the demo (see
-    ENFORCE_SUPPORTED_TAX_YEAR). These tests cover the enforcing
-    behaviour so it's still verified when it's switched back on."""
-    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", True)
-
-
-def test_validate_tax_year_accepts_the_supported_year(enforcing):
+def test_validate_tax_year_accepts_the_supported_year():
     validate_tax_year("2026/27")  # must not raise
 
 
-def test_validate_tax_year_refuses_a_prior_year(enforcing):
+@pytest.mark.parametrize("tax_year", ["2025/26", "2024/25"])
+def test_validate_tax_year_refuses_a_prior_year(tax_year):
     with pytest.raises(UnsupportedPayslip):
-        validate_tax_year("2025/26")
+        validate_tax_year(tax_year)
 
 
-def test_validate_tax_year_refuses_when_undeterminable(enforcing):
+def test_validate_tax_year_refuses_when_undeterminable():
+    """None refuses rather than assuming the current year - a payslip
+    with no readable date is exactly where that guess would be least
+    likely to be noticed."""
     with pytest.raises(UnsupportedPayslip):
         validate_tax_year(None)
 
 
-@pytest.mark.parametrize("tax_year", ["2026/27", "2025/26", "2024/25", None])
-def test_validate_tax_year_is_a_no_op_while_the_guard_is_off(monkeypatch, tax_year):
-    # The demo state: nothing is refused, including an undeterminable
-    # year. Delete this test when the guard goes back on.
-    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", False)
-    validate_tax_year(tax_year)  # must not raise
+def test_only_one_tax_year_is_supported_while_the_rates_are_single_valued():
+    """
+    Pins the invariant that makes the refusal safe: the rate constants in
+    this module hold one year's values, so SUPPORTED_TAX_YEARS must hold
+    exactly one year. Adding a second without making the constants
+    year-aware would run older payslips through this year's student loan
+    thresholds - wrong for plans 1, 2 and 4.
+    """
+    assert calculations.SUPPORTED_TAX_YEARS == frozenset({calculations.TAX_YEAR})
+
+
+def test_the_tax_year_guard_has_no_bypass_flag():
+    """A constant that switches a correctness guard off is exactly the
+    kind of thing that survives into production. It was removed; keep it
+    removed."""
+    assert not hasattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR")
 
 
 # --------------------------------------------------------------------------

@@ -156,21 +156,13 @@ def test_analyse_payslip_degrades_gracefully_when_ni_category_unreadable():
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture
-def enforcing(monkeypatch):
-    """The guard is switched off for the demo (see
-    calculations.ENFORCE_SUPPORTED_TAX_YEAR). These tests cover the
-    enforcing behaviour so it's still verified when it goes back on."""
-    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", True)
-
-
-def test_analyse_payslip_proceeds_for_the_supported_tax_year(enforcing):
+def test_analyse_payslip_proceeds_for_the_supported_tax_year():
     extract = _extract(tax_year="2026/27")
     result = analyse_payslip(extract)
     assert result.status == "ok"
 
 
-def test_analyse_payslip_refuses_a_prior_tax_year(enforcing):
+def test_analyse_payslip_refuses_a_prior_tax_year():
     extract = _extract(tax_year="2025/26")
     result = analyse_payslip(extract)
     assert result.status == "unsupported"
@@ -179,7 +171,7 @@ def test_analyse_payslip_refuses_a_prior_tax_year(enforcing):
     assert result.score is None
 
 
-def test_analyse_payslip_refuses_when_tax_year_is_undeterminable(enforcing):
+def test_analyse_payslip_refuses_when_tax_year_is_undeterminable():
     extract = _extract(tax_year=None)
     result = analyse_payslip(extract)
     assert result.status == "unsupported"
@@ -188,12 +180,17 @@ def test_analyse_payslip_refuses_when_tax_year_is_undeterminable(enforcing):
     assert result.score is None
 
 
-# The demo state: a prior-year payslip must actually analyse rather than
-# be refused. Delete when the guard goes back on.
-@pytest.mark.parametrize("tax_year", ["2025/26", None])
-def test_analyse_payslip_proceeds_for_a_prior_year_while_the_guard_is_off(
-    monkeypatch, tax_year
-):
-    monkeypatch.setattr(calculations, "ENFORCE_SUPPORTED_TAX_YEAR", False)
-    result = analyse_payslip(_extract(tax_year=tax_year))
-    assert result.status == "ok"
+def test_the_refusal_names_the_tax_year_as_the_reason():
+    """
+    Distinct status and a message naming the real reason - not "this tax
+    code needs a manual check" or a generic unreadable error, which would
+    send the user to check the wrong thing.
+    """
+    result = analyse_payslip(_extract(tax_year="2025/26"))
+
+    assert result.status == "unsupported"
+    assert "2025/26" in result.failure_reason
+    assert "not currently supported" in result.failure_reason
+    assert result.verdict.headline == (
+        "This payslip is from a tax year we don't yet support"
+    )
