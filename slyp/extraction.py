@@ -152,7 +152,29 @@ _SORT_CODE_RE = re.compile(r"\b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b")
 # the noisiest pattern here (an 8-digit reference number would also
 # match); assert_safe_to_send and the allowlist are the backstops for
 # what this over-redacts or misses, not this regex alone.
+#
+# Genuine collision, found live: a UK date in DD/MM/YYYY or DD-MM-YYYY
+# format ("15/12/2025") is exactly 8 digits with the same separator
+# tolerance, so it matches this pattern too - and since redact() runs
+# before financial_lines_only(), the date was gone (replaced with
+# "[BANK]") before the model ever saw it, silently breaking
+# period.pay_date and everything derived from it for the single most
+# common real-world date format. _looks_like_an_unambiguous_date() below
+# exempts a match from account-number redaction only when it's shaped
+# AND semantically valid as DD/MM/YYYY or DD-MM-YYYY (day 1-31, month
+# 1-12, a full 4-digit year) - see redact() for why this can't safely
+# extend to the 6-digit sort-code pattern too.
 _ACCOUNT_NUMBER_RE = re.compile(r"\b\d(?:[-\s/]?\d){7}\b")
+
+_UNAMBIGUOUS_DATE_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+
+
+def _looks_like_an_unambiguous_date(span: str) -> bool:
+    match = _UNAMBIGUOUS_DATE_RE.match(span)
+    if not match:
+        return False
+    day, month, _year = (int(group) for group in match.groups())
+    return 1 <= day <= 31 and 1 <= month <= 12
 
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
@@ -223,11 +245,24 @@ def _find_employer_name(text: str, redaction_map: RedactionMap) -> Optional[str]
 
 
 def _redact_pattern(
-    text: str, pattern: re.Pattern[str], token: str, redaction_map: RedactionMap
+    text: str,
+    pattern: re.Pattern[str],
+    token: str,
+    redaction_map: RedactionMap,
+    *,
+    skip_if=None,
 ) -> str:
-    """Replace every whole match of `pattern` with `token`."""
+    """Replace every whole match of `pattern` with `token`.
+
+    `skip_if`, if given, is called with the matched text; a True result
+    leaves that match untouched instead of redacting it. Used to exempt
+    a payslip date that happens to share a bank pattern's digit shape -
+    see _looks_like_an_unambiguous_date().
+    """
 
     def _sub(match: re.Match[str]) -> str:
+        if skip_if is not None and skip_if(match.group(0)):
+            return match.group(0)
         redaction_map.record(token, match.group(0))
         return token
 
@@ -265,8 +300,23 @@ def redact(text: str) -> tuple[str, RedactionMap]:
     # digits.
     redacted = _redact_pattern(redacted, _NI_NUMBER_RE, "[NI]", redaction_map)
     redacted = _redact_pattern(redacted, _POSTCODE_RE, "[ADDRESS]", redaction_map)
+    # Sort code has no date exemption: a 6-digit DD/MM/YY date and a real
+    # sort-code-with-slashes bypass (F6) are the same shape, and telling
+    # them apart would need the same day/month plausibility check that
+    # already can't reliably distinguish a coincidental sort code from a
+    # real date (a sort code's digits aren't meaningfully "random" in a
+    # way that rules out a day-1-31/month-1-12-shaped one). Payslips
+    # overwhelmingly print 4-digit years, so this residual gap - an
+    # uncommon 2-digit-year date getting redacted as a sort code - is the
+    # safer default over reopening F6.
     redacted = _redact_pattern(redacted, _SORT_CODE_RE, "[BANK]", redaction_map)
-    redacted = _redact_pattern(redacted, _ACCOUNT_NUMBER_RE, "[BANK]", redaction_map)
+    redacted = _redact_pattern(
+        redacted,
+        _ACCOUNT_NUMBER_RE,
+        "[BANK]",
+        redaction_map,
+        skip_if=_looks_like_an_unambiguous_date,
+    )
     redacted = _redact_pattern(redacted, _EMAIL_RE, "[EMAIL]", redaction_map)
     redacted = _redact_pattern(redacted, _PHONE_RE, "[PHONE]", redaction_map)
     redacted = _redact_labelled(redacted, _EMPLOYEE_NO_LABEL_RE, "[EMPLOYEE_NO]", redaction_map)
@@ -354,14 +404,28 @@ def financial_lines_only(text: str) -> str:
 # Final gate
 # ==========================================================================
 
-_PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("NI number", _NI_NUMBER_RE),
-    ("postcode", _POSTCODE_RE),
-    ("sort code", _SORT_CODE_RE),
-    ("account number", _ACCOUNT_NUMBER_RE),
-    ("email", _EMAIL_RE),
-    ("phone", _PHONE_RE),
+_PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str], object], ...] = (
+    ("NI number", _NI_NUMBER_RE, None),
+    ("postcode", _POSTCODE_RE, None),
+    ("sort code", _SORT_CODE_RE, None),
+    # Same exemption as redact() - see _looks_like_an_unambiguous_date()
+    # and the comment on _ACCOUNT_NUMBER_RE. This check re-scans with
+    # the same shaped patterns redact() uses, so it must apply the same
+    # exemption redact() does - otherwise a date that correctly survives
+    # redact() gets refused here anyway, on a payload that was already
+    # safe to send.
+    ("account number", _ACCOUNT_NUMBER_RE, _looks_like_an_unambiguous_date),
+    ("email", _EMAIL_RE, None),
+    ("phone", _PHONE_RE, None),
 )
+
+
+def _has_unexempted_match(pattern: re.Pattern[str], payload: str, skip_if) -> bool:
+    for match in pattern.finditer(payload):
+        if skip_if is not None and skip_if(match.group(0)):
+            continue
+        return True
+    return False
 
 # A run of 6 or more digits, tolerating the same separators as the
 # structured-number patterns above. Used only as the SECOND, independent
@@ -411,8 +475,8 @@ def assert_safe_to_send(payload: str) -> None:
     message - the point of this function is to stop PII leaving the
     process, so it must not leak it into a log line instead.
     """
-    for label, pattern in _PII_RECHECK_PATTERNS:
-        if pattern.search(payload):
+    for label, pattern, skip_if in _PII_RECHECK_PATTERNS:
+        if _has_unexempted_match(pattern, payload, skip_if):
             raise RedactionFailure(f"payload still matches a PII pattern: {label}")
 
     if _UNEXPLAINED_DIGIT_RUN_RE.search(_mask_known_safe_numbers(payload)):

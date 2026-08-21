@@ -299,7 +299,7 @@ def test_gate_catches_a_shape_none_of_the_named_pii_patterns_recognise():
 
     payload = "Some Internal Reference 123456789 National Insurance 0.00"
 
-    assert not any(pattern.search(payload) for _label, pattern in _PII_RECHECK_PATTERNS)
+    assert not any(pattern.search(payload) for _label, pattern, _skip_if in _PII_RECHECK_PATTERNS)
 
     with pytest.raises(RedactionFailure):
         assert_safe_to_send(payload)
