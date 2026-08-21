@@ -257,6 +257,36 @@ def test_account_number_still_redacted_in_every_separator_form(account_text):
     assert "[BANK]" in redacted
 
 
+@pytest.mark.parametrize(
+    "pay_date_text",
+    [
+        "15/12/2025",  # DD/MM/YYYY
+        "15-12-2025",  # DD-MM-YYYY
+        "2025-12-15",  # YYYY-MM-DD (ISO) - regressed the gate, not just redact()
+        "2025/12/15",  # YYYY/MM/DD
+    ],
+)
+def test_date_survives_the_full_pipeline_including_the_gate(pay_date_text):
+    # redact() surviving a date isn't enough on its own - _DATE_RE is a
+    # second, separate pattern from the account-number exemption above,
+    # used both by the allowlist and by assert_safe_to_send's independent
+    # digit-run check. An ISO date passed the account-number exemption
+    # but _DATE_RE didn't recognise year-first dates yet, so the date's
+    # leftover digits looked "unexplained" to the gate and got refused -
+    # a live 422 that only surfaced once a real ISO-dated payslip was
+    # run, because no existing test called assert_safe_to_send() on a
+    # payload containing a surviving date. This test goes through the
+    # whole pipeline for exactly that reason.
+    text = (
+        f"Pay Date {pay_date_text} Tax Code 1257L "
+        f"Gross 2500.00 Net 2000.00"
+    )
+    redacted, _ = redact(text)
+    filtered = financial_lines_only(redacted)
+    assert pay_date_text in filtered
+    assert_safe_to_send(filtered)  # must not raise
+
+
 def test_sort_code_with_slashes_bypass_not_reopened_by_the_date_exemption():
     """F6 regression guard: a 6-digit sort-code-with-slashes bypass must
     never be exempted just because it superficially resembles a date-

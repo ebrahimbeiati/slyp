@@ -357,7 +357,17 @@ _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s?%")
 _MONTH_NAMES = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
 _DATE_RE = re.compile(
     rf"\b\d{{1,2}}(?:st|nd|rd|th)?[-\s](?:{_MONTH_NAMES})[a-z]*[-\s]\d{{2,4}}\b"
-    rf"|\b\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}\b",
+    rf"|\b\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}\b"
+    # Year-first / ISO (YYYY-MM-DD). Without this alternative, an ISO
+    # pay date has no financial shape this pattern recognises: the
+    # allowlist (financial_lines_only, below) would drop a line whose
+    # only content is an ISO date, and assert_safe_to_send's digit-run
+    # check (_mask_known_safe_numbers) would flag the same date's
+    # leftover digits as unexplained and refuse a payload that's
+    # already safe - which is exactly what _looks_like_an_unambiguous_
+    # date's ISO branch fixed for account-number redaction, but this is
+    # a separate regex that needed the same fix independently.
+    rf"|\b\d{{4}}[/-]\d{{1,2}}[/-]\d{{1,2}}\b",
     re.IGNORECASE,
 )
 _TAX_CODE_LINE_RE = re.compile(

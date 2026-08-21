@@ -264,10 +264,17 @@ async def analyse(request: Request) -> AnalysisResult:
             "check the file and try again.",
         )
 
-    except RedactionFailure:
+    except RedactionFailure as exc:
         # Fails closed: this exception means the payload was never sent
-        # anywhere. The client just sees a refusal, never why.
-        logger.warning("analyse refused by the redaction gate in %.3fs", _elapsed())
+        # anywhere. The client just sees a refusal, never why - but the
+        # exception message itself is safe to log: assert_safe_to_send
+        # deliberately never includes the matched text, only which
+        # pattern/check fired (e.g. "sort code", "unexplained run of
+        # digits"), so logging it doesn't leak anything and turns the
+        # next gate refusal into something diagnosable.
+        logger.warning(
+            "analyse refused by the redaction gate in %.3fs: %s", _elapsed(), exc
+        )
         return _clean_error(
             422,
             "We couldn't safely process this document. Please try a "
