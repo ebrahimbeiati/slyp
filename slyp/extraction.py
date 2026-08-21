@@ -454,15 +454,38 @@ def _has_unexempted_match(pattern: re.Pattern[str], payload: str, skip_if) -> bo
         return True
     return False
 
-# A run of 6 or more digits, tolerating the same separators as the
-# structured-number patterns above. Used only as the SECOND, independent
-# check in assert_safe_to_send() - see there for why. Applied to text that
-# has already had every recognised-safe numeric shape (currency, percent,
-# date, tax code) masked out, so a legitimate payslip figure never reaches
-# it: by that point in the pipeline, any digit run this long left over
-# isn't a gross figure or a YTD total (both always have a two-decimal-
-# place currency shape in this codebase), it's something unaccounted for.
-_UNEXPLAINED_DIGIT_RUN_RE = re.compile(r"(?:\d[\s./-]*){6,}")
+# A run of 6 or more digits WITHIN ONE TOKEN - whitespace deliberately
+# not tolerated here, unlike the structured-number patterns above. Used
+# only as the SECOND, independent check in assert_safe_to_send() - see
+# there for why.
+#
+# Whitespace used to be in this class, which made the check count digits
+# across independent, adjacent numbers and refuse entirely benign lines:
+# "Period 09 2025" reads as a 6-digit run ("09 2025") though it's just a
+# period number beside a year. That produced a live 422 on a real
+# payslip. Space-separated PII is not lost by this: a sequence of
+# uniform digit groups is caught by _SPLIT_DIGIT_GROUPS_RE below, and
+# every space-separated PII shape the pipeline knows (NI number, sort
+# code, account number, phone) is independently caught by check 1.
+_UNEXPLAINED_DIGIT_RUN_RE = re.compile(r"(?:\d[./-]*){6,}")
+
+# The space-separated half of the same check: three or more groups of 2-4
+# digits in a row, each separated by a single space, totalling 6+ digits.
+# That is what PII looks like when it's printed in groups ("44 99 43",
+# "1234 5678 9012") and is a shape no legitimate payslip figure takes -
+# a payslip prints amounts as single tokens, not as uniform digit
+# groups. Requiring 3+ groups is what keeps "Period 09 2025" (two
+# groups, and not uniform) from matching.
+_SPLIT_DIGIT_GROUPS_RE = re.compile(r"\b\d{2,4}(?: \d{2,4}){2,}\b")
+
+# Any decimal number, to any precision - masking only, never used to
+# decide what the allowlist KEEPS (that's _CURRENCY_RE, which requires
+# exactly two decimal places and is deliberately left narrow: widening
+# it would widen what gets sent). Hourly rates are routinely printed to
+# 3-5 decimal places ("Rate 15.3846"), which _CURRENCY_RE doesn't match,
+# so those digits used to survive masking and read as an unexplained
+# run - the other half of the same live 422.
+_MASKABLE_DECIMAL_RE = re.compile(r"\b\d[\d,]*\.\d{1,6}\b")
 
 
 def _mask_known_safe_numbers(text: str) -> str:
@@ -473,6 +496,7 @@ def _mask_known_safe_numbers(text: str) -> str:
     masked = _PERCENT_RE.sub(" ", masked)
     masked = _DATE_RE.sub(" ", masked)
     masked = _TAX_CODE_LINE_RE.sub(" ", masked)
+    masked = _MASKABLE_DECIMAL_RE.sub(" ", masked)
     return masked
 
 
@@ -490,13 +514,23 @@ def assert_safe_to_send(payload: str) -> None:
        why redact() must run before financial_lines_only()).
 
     2. Masks out every recognised-safe numeric shape (currency, percent,
-       date, tax code) and refuses if 6 or more digits remain anywhere in
-       what's left. This doesn't know what an NI number, sort code or
-       account number looks like, so it can't share check 1's blind spot
-       for a shape neither regex set recognises yet - it catches by the
-       ABSENCE of an explanation for a run of digits, not by recognising
-       a specific kind of personal data. "Two labels on one control" is
-       exactly what this function used to be with only check 1.
+       date, tax code, any-precision decimal) and refuses if what's left
+       contains either 6+ digits inside a single token, or three or more
+       uniform digit groups in a row. This doesn't know what an NI
+       number, sort code or account number looks like, so it can't share
+       check 1's blind spot for a shape neither regex set recognises yet
+       - it catches by the ABSENCE of an explanation for a run of
+       digits, not by recognising a specific kind of personal data.
+       "Two labels on one control" is exactly what this function used to
+       be with only check 1.
+
+       The two halves of check 2 exist because whitespace is genuinely
+       ambiguous here: it separates PII printed in groups ("44 99 43")
+       and equally separates unrelated payslip numbers that just happen
+       to sit next to each other ("Period 09 2025"). Treating it as an
+       intra-number separator refused benign payslips; ignoring it
+       entirely would miss group-printed PII. Splitting the check keeps
+       both.
 
     Deliberately does not include the matched text in the exception
     message - the point of this function is to stop PII leaving the
@@ -506,9 +540,16 @@ def assert_safe_to_send(payload: str) -> None:
         if _has_unexempted_match(pattern, payload, skip_if):
             raise RedactionFailure(f"payload still matches a PII pattern: {label}")
 
-    if _UNEXPLAINED_DIGIT_RUN_RE.search(_mask_known_safe_numbers(payload)):
+    masked = _mask_known_safe_numbers(payload)
+
+    if _UNEXPLAINED_DIGIT_RUN_RE.search(masked):
         raise RedactionFailure(
             "payload has an unexplained run of digits with no financial shape"
+        )
+
+    if _SPLIT_DIGIT_GROUPS_RE.search(masked):
+        raise RedactionFailure(
+            "payload has an unexplained sequence of digit groups"
         )
 
 

@@ -419,6 +419,56 @@ def test_gate_does_not_false_positive_on_clean_multi_field_text():
 
 
 # --------------------------------------------------------------------------
+# The gate's second check: whitespace is ambiguous
+#
+# It separates PII printed in groups ("44 99 43") and equally separates
+# unrelated payslip numbers sitting next to each other ("Period 09 2025").
+# The digit-run pattern used to treat it as an intra-number separator,
+# so it counted digits across independent numbers and refused benign
+# payslips - a live 422 on a real ADP payslip. Both properties are
+# checked here because fixing one by loosening the other is exactly the
+# regression to guard against.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Adjacent-but-unrelated numbers - the false positive that fired.
+        "Period 09 2025 Frequency Monthly",
+        "Tax Period 09 Week 39 Gross 2500.00",
+        # Hourly rates print to 3-5 dp; _CURRENCY_RE only matches exactly
+        # 2, so these digits used to survive masking unexplained.
+        "Std Hours 37.50 Rate 15.3846",
+        "Overtime 12.5 Hours @ 23.0769",
+        "Rate of Pay 9.5000 per hour",
+        # Multi-column numeric tables, as ADP prints them.
+        "NI Cat A Earnings 2500.00 1048.00 1452.00 116.16",
+    ],
+)
+def test_gate_accepts_legitimate_payslip_numbers(payload):
+    assert_safe_to_send(payload)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Uniform digit groups - what PII looks like when printed in
+        # groups. Caught by the split-group half of check 2, since
+        # whitespace is no longer an intra-number separator.
+        "Code 123 456 789 National Insurance 0.00",
+        "Ref 1234 5678 9012 National Insurance 0.00",
+        # Contiguous run - caught by the single-token half.
+        "Some Internal Reference 123456789 National Insurance 0.00",
+        "Unknown 987654321012 National Insurance 0.00",
+    ],
+)
+def test_gate_still_refuses_unexplained_digits(payload):
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(payload)
+
+
+# --------------------------------------------------------------------------
 # Tax year derivation
 # --------------------------------------------------------------------------
 
