@@ -1,10 +1,12 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
 import { analysePayslip, AnalyseError } from "@/lib/Api";
+import { onlyJobFromAnswer, taxYearRangeLabel } from "@/lib/onlyJob";
+import type { OtherJobAnswer } from "@/lib/onlyJob";
 
 const STORAGE_KEY = "slyp:latest";
 
@@ -26,7 +28,14 @@ export default function UploadPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sweepTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const [onlyJob, setOnlyJob] = useState<boolean | null>(null);
+  // The ANSWER is what the UI holds; only_job is derived from it at send
+  // time via onlyJobFromAnswer(). Storing the answer rather than the
+  // derived boolean is what keeps "Not sure" distinguishable from an
+  // unanswered question in the UI (both send nothing, but only one of
+  // them shows as selected), and keeps the inverted mapping in exactly
+  // one place - see lib/onlyJob.ts.
+  const [otherJob, setOtherJob] = useState<OtherJobAnswer | null>(null);
+  const taxYearRange = useMemo(() => taxYearRangeLabel(new Date()), []);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [sweepIndex, setSweepIndex] = useState(0);
@@ -63,7 +72,7 @@ export default function UploadPage() {
     startSweep();
 
     try {
-      const result = await analysePayslip(file, onlyJob);
+      const result = await analysePayslip(file, onlyJobFromAnswer(otherJob));
       localStorage.setItem(STORAGE_KEY, JSON.stringify(result));
       router.push("/");
       // Deliberately no `finally` reset of isUploading here on the
@@ -116,23 +125,32 @@ export default function UploadPage() {
           {!isUploading ? (
             <div className="flex flex-col flex-1">
               <div className="mb-4">
-                <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-1.5">
-                  Is this your only job?
+                <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-0.5">
+                  Have you had any other job this tax year?
                 </div>
+                <div className="text-[10px] text-[var(--sage)] opacity-60 mb-1.5">
+                  This tax year runs {taxYearRange}.
+                </div>
+                {/* Three options, one row, equal width - "Not sure" is a
+                    real answer, not a skip. It is the only one that omits
+                    only_job from the request, which keeps every finding
+                    that depends on it conditional rather than asserting
+                    a second job. */}
                 <div className="flex gap-2">
                   {(
                     [
-                      { label: "Yes", value: true },
-                      { label: "No", value: false },
-                      { label: "Not sure", value: null },
+                      { label: "Yes", value: "yes" },
+                      { label: "No", value: "no" },
+                      { label: "Not sure", value: "not_sure" },
                     ] as const
                   ).map((opt) => (
                     <button
-                      key={opt.label}
+                      key={opt.value}
                       type="button"
-                      onClick={() => setOnlyJob(opt.value)}
+                      aria-pressed={otherJob === opt.value}
+                      onClick={() => setOtherJob(opt.value)}
                       className={`flex-1 py-2.5 rounded-xl text-xs font-medium border transition-colors cursor-pointer ${
-                        onlyJob === opt.value
+                        otherJob === opt.value
                           ? "bg-[#FFAE34] text-[#0d1410] border-[#FFAE34]"
                           : "bg-[#141A17] border-[#232D27] text-[var(--sage)] hover:border-[#FFAE34]/40"
                       }`}
@@ -142,9 +160,10 @@ export default function UploadPage() {
                   ))}
                 </div>
                 <p className="text-[10px] text-[var(--sage)] opacity-70 mt-1.5 leading-relaxed">
-                  Some checks depend on this - for example, a BR tax code is
-                  often normal for a second job but worth flagging on a
-                  first one.
+                  Some checks depend on this - a BR tax code is often normal
+                  for a second job but worth flagging on a first one, and an
+                  emergency code can only have overcharged you if this has
+                  been your only employment this year.
                 </p>
               </div>
 
