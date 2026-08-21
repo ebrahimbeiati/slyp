@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1376,3 +1377,98 @@ def test_extract_payslip_source_filename_defaults_to_none():
         result = extract_payslip(pdf_bytes)
 
     assert result.source.filename is None
+
+
+# --------------------------------------------------------------------------
+# OpenAI retry path: the second request is not a second chance to leak
+# --------------------------------------------------------------------------
+
+
+def test_openai_retry_resends_the_same_redacted_payload():
+    """
+    The provider rejects function tools unless reasoning_effort is set to
+    'none', so the first request 400s and a second is sent. Redaction,
+    the allowlist and the gate all run ONCE, in extract_payslip(), before
+    either request exists - so what has to hold is that the retry sends
+    the identical already-sanitised string and adds nothing to it.
+
+    Pinned because "retry the request" is exactly the kind of code that
+    later grows a "with a bit more context this time".
+    """
+    import slyp.extraction as extraction
+
+    text = "\n".join(
+        [
+            "Employee Name: Jo Bloggs",
+            "NI Number AB 12 34 56 C National Insurance 0.00",
+            "Pay Date: 28/08/2026",
+            "Total Gross Pay 1,000.00 Net Pay 900.00",
+        ]
+    )
+
+    sent: list[dict] = []
+
+    class _FakeCompletions:
+        def create(self, **params):
+            sent.append(params)
+            if "reasoning_effort" not in params:
+                raise extraction.openai.BadRequestError(
+                    "Function tools with reasoning_effort are not supported",
+                    response=_fake_http_response(),
+                    body=None,
+                )
+            return _fake_openai_response()
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = type("chat", (), {"completions": _FakeCompletions()})()
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+
+    with patch.object(extraction, "_MODEL_PROVIDER", "openai"), patch.object(
+        extraction, "_OPENAI_NEEDS_REASONING_EFFORT_NONE", False
+    ), patch.object(extraction.openai, "OpenAI", _FakeClient):
+        extraction.extract_payslip(pdf_bytes)
+        assert len(sent) == 2, "expected one rejected request and one retry"
+
+        # The answer doesn't change between calls, so the doomed first
+        # attempt must not be repeated for the rest of the process.
+        extraction.extract_payslip(pdf_bytes)
+        assert len(sent) == 3, "second upload should not repeat the 400"
+        assert sent[2]["reasoning_effort"] == "none"
+
+    first_user = sent[0]["messages"][1]["content"]
+    retry_user = sent[1]["messages"][1]["content"]
+
+    # Identical, and sanitised - not the raw document.
+    assert first_user == retry_user
+    for payload in (first_user, retry_user):
+        assert "Jo Bloggs" not in payload
+        assert "AB 12 34 56 C" not in payload
+        assert "[NI]" in payload
+
+    # The retry differs by exactly one parameter.
+    assert set(sent[1]) - set(sent[0]) == {"reasoning_effort"}
+    assert sent[1]["reasoning_effort"] == "none"
+
+
+def _fake_http_response():
+    """Enough of an httpx response for openai.BadRequestError to build."""
+    return SimpleNamespace(
+        request=SimpleNamespace(),
+        status_code=400,
+        headers={},
+    )
+
+
+def _fake_openai_response():
+    """Minimal stand-in for an OpenAI chat completion carrying our tool call."""
+    import json as _json
+
+    extract = _sample_model_extract()
+    arguments = _json.dumps(_json.loads(extract.model_dump_json()))
+    function = type("fn", (), {"name": "record_payslip_extract", "arguments": arguments})()
+    tool_call = type("tc", (), {"function": function})()
+    message = type("msg", (), {"tool_calls": [tool_call]})()
+    choice = type("choice", (), {"message": message})()
+    return type("response", (), {"choices": [choice]})()

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -810,6 +811,13 @@ else:
             "SLYP_MODEL_PROVIDER=openai."
         )
 
+logger = logging.getLogger(__name__)
+
+# Learned on the first call and reused for the rest of the process - see
+# the retry in _call_openai_model(). Per-process, so each uvicorn worker
+# pays the discovery round trip once.
+_OPENAI_NEEDS_REASONING_EFFORT_NONE = False
+
 _TOOL_NAME = "record_payslip_extract"
 
 # Below this, a field is not trusted even if the model didn't flag it
@@ -900,17 +908,37 @@ def _call_openai_model(filtered_text: str) -> _ModelExtract:
             **extra_params,
         )
 
+    global _OPENAI_NEEDS_REASONING_EFFORT_NONE
+
     try:
-        response = _create()
+        response = _create(
+            **({"reasoning_effort": "none"} if _OPENAI_NEEDS_REASONING_EFFORT_NONE else {})
+        )
     except openai.BadRequestError as exc:
         # Some reasoning-capable models reject a tool call unless
-        # reasoning_effort is explicitly turned off for it (confirmed
-        # live against gpt-5.6-terra: "Function tools with
-        # reasoning_effort are not supported ... set reasoning_effort to
-        # 'none'"). Retry once with it added rather than sending it
-        # unconditionally - a model that doesn't recognise the parameter
-        # at all would otherwise break on every call instead of none.
-        if "reasoning_effort" in str(exc):
+        # reasoning_effort is explicitly turned off for it. Confirmed
+        # live against gpt-5.6-sol, which answers:
+        #
+        #   "Function tools with reasoning_effort are not supported for
+        #    gpt-5.6-sol in /v1/chat/completions. To use function tools,
+        #    use /v1/responses or set reasoning_effort to 'none'."
+        #
+        # Nothing in the request is malformed - the parameter it names,
+        # reasoning_effort, is one we never sent. The model applies its
+        # own default, and function tools are unsupported alongside it.
+        #
+        # Still not sent unconditionally: a model that doesn't recognise
+        # the parameter at all would then fail every call instead of
+        # none. But the answer doesn't change between calls, so it's
+        # remembered for the life of the process - otherwise every single
+        # upload pays a doomed round trip first (~2s, and it was showing
+        # up as a 400 in the logs on every request).
+        if "reasoning_effort" in str(exc) and not _OPENAI_NEEDS_REASONING_EFFORT_NONE:
+            _OPENAI_NEEDS_REASONING_EFFORT_NONE = True
+            logger.info(
+                "openai: model requires reasoning_effort='none' for function "
+                "tools; retrying and remembering for this process"
+            )
             response = _create(reasoning_effort="none")
         else:
             raise
