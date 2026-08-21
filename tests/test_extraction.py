@@ -209,6 +209,79 @@ def test_multi_line_address_is_dropped_by_the_allowlist():
 
 
 # --------------------------------------------------------------------------
+# redact() - the date / account-number collision
+#
+# _ACCOUNT_NUMBER_RE (broadened for F6 to tolerate "/" as a separator)
+# matches a DD/MM/YYYY date exactly: 8 digits, slash-separated. A live
+# run showed "Pay Date 15/12/2025" silently becoming "Pay Date [BANK]"
+# before the model ever saw a date - not an allowlist or model-vocabulary
+# problem, a genuine redaction bug. Every case below also carries a real
+# account number on the same line, to prove the fix distinguishes the two
+# rather than just accepting anything shaped like 8 digits with
+# separators.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pay_date_text",
+    [
+        "15/12/2025",  # DD/MM/YYYY
+        "15-12-2025",  # DD-MM-YYYY
+        "5/3/25",  # D/M/YY - too few digits to hit either bank pattern at all
+        "2025-12-15",  # YYYY-MM-DD
+    ],
+)
+def test_date_survives_redaction_with_an_adjacent_account_number(pay_date_text):
+    text = f"Pay Date {pay_date_text} Account 12345678"
+    redacted, _ = redact(text)
+    assert pay_date_text in redacted, f"date {pay_date_text!r} was redacted: {redacted!r}"
+    assert "12345678" not in redacted
+    assert "[BANK]" in redacted
+
+
+@pytest.mark.parametrize(
+    "account_text",
+    [
+        "12345678",  # no separators
+        "1234-5678",  # dash
+        "1234 5678",  # space
+        "1234/5678",  # slash
+        "12-34-56-78",  # multiple dashes
+    ],
+)
+def test_account_number_still_redacted_in_every_separator_form(account_text):
+    text = f"Pay Date 15/12/2025 Account {account_text}"
+    redacted, _ = redact(text)
+    assert account_text not in redacted
+    assert "15/12/2025" in redacted
+    assert "[BANK]" in redacted
+
+
+def test_sort_code_with_slashes_bypass_not_reopened_by_the_date_exemption():
+    """F6 regression guard: a 6-digit sort-code-with-slashes bypass must
+    never be exempted just because it superficially resembles a date-
+    shaped sequence - it structurally can't have a 4-digit year group,
+    but this pins the behaviour down explicitly rather than relying on
+    that reasoning holding forever."""
+    redacted, _ = redact("Sort Code 12/34/56 Account 12345678")
+    assert "12/34/56" not in redacted
+    assert redacted.count("[BANK]") == 2
+
+
+@pytest.mark.parametrize(
+    "implausible_text",
+    [
+        "45/67/2025",  # month 67 - not a real date, must still redact
+        "99/99/2025",  # neither day nor month valid
+    ],
+)
+def test_implausible_date_shaped_sequence_still_redacted_as_account_number(implausible_text):
+    redacted, _ = redact(f"Reference {implausible_text}")
+    assert implausible_text not in redacted
+    assert "[BANK]" in redacted
+
+
+# --------------------------------------------------------------------------
 # financial_lines_only() - the allowlist
 # --------------------------------------------------------------------------
 

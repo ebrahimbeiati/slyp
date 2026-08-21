@@ -45,6 +45,23 @@ CASES = [
     ),
 ]
 
+# Separate from CASES above: these check that a legitimate payslip value
+# SURVIVES redaction (not that PII gets destroyed) - the opposite
+# property, so it doesn't fit the True/"gate" model above. Root cause of
+# the live failure this closes: _ACCOUNT_NUMBER_RE (broadened for F6 to
+# tolerate "/" as a separator) matches a DD/MM/YYYY date exactly (8
+# digits, slash-separated) - "Pay Date 15/12/2025" became
+# "Pay Date [BANK]" before the model ever saw a date. Every entry here
+# also carries a genuine account number on the SAME line, to prove the
+# fix doesn't just stop redacting everything 8-digits-with-separators
+# shaped - only the ones that are ALSO valid dates.
+DATE_SURVIVAL_CASES = [
+    ("DD/MM/YYYY + account number", "Pay Date 15/12/2025 Account 12345678"),
+    ("DD-MM-YYYY + account number", "Pay Date 15-12-2025 Account 12345678"),
+    ("YYYY-MM-DD + account number", "Pay Date 2025-12-15 Account 12345678"),
+]
+
+
 def run():
     failures = []
     for label, text, expect in CASES:
@@ -67,6 +84,21 @@ def run():
             failures.append(f"{label}: expected clean redaction, but gate STILL had to fire (means redact() left PII behind and only the final gate caught it, or a false positive)")
         elif expect == "gate" and not gate_raised:
             failures.append(f"{label}: expected the gate to refuse this payload (redact() has no pattern for it), but nothing caught it - PII would have been sent")
+
+    for label, text in DATE_SURVIVAL_CASES:
+        redacted, rmap = redact(text)
+        print(f"\n=== {label} (survival case) ===")
+        print(f"  original : {text!r}")
+        print(f"  redacted : {redacted!r}")
+
+        date_part = text.split("Account")[0].split("Pay Date")[1].strip()
+        account_part = text.split("Account")[1].strip()
+        if date_part not in redacted:
+            failures.append(f"{label}: date {date_part!r} was destroyed by redaction - {redacted!r}")
+        if account_part in redacted:
+            failures.append(f"{label}: account number {account_part!r} survived redaction unexpectedly - {redacted!r}")
+        if "[BANK]" not in redacted:
+            failures.append(f"{label}: expected the account number to still be redacted as [BANK] - {redacted!r}")
 
     print("\n\n=== SUMMARY ===")
     if failures:

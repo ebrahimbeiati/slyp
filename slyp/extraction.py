@@ -161,20 +161,37 @@ _SORT_CODE_RE = re.compile(r"\b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b")
 # period.pay_date and everything derived from it for the single most
 # common real-world date format. _looks_like_an_unambiguous_date() below
 # exempts a match from account-number redaction only when it's shaped
-# AND semantically valid as DD/MM/YYYY or DD-MM-YYYY (day 1-31, month
-# 1-12, a full 4-digit year) - see redact() for why this can't safely
-# extend to the 6-digit sort-code pattern too.
+# AND semantically valid as a date - day/month-first (DD/MM/YYYY,
+# DD-MM-YYYY) or year-first (YYYY-MM-DD, YYYY/MM/DD) - with a full
+# 4-digit year in a plausible calendar range. Requiring 4 digits (not
+# 2-4) is what keeps this from reopening F6: a 6-digit sort-code-with-
+# slashes bypass ("12/34/56") never has a 4-digit group, so the
+# exemption is structurally unreachable for it. See redact() for why
+# this can't safely extend to the 6-digit sort-code pattern too.
 _ACCOUNT_NUMBER_RE = re.compile(r"\b\d(?:[-\s/]?\d){7}\b")
 
-_UNAMBIGUOUS_DATE_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+_DATE_LIKE_DAY_FIRST_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+_DATE_LIKE_YEAR_FIRST_RE = re.compile(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$")
+
+
+def _is_plausible_date(day: int, month: int, year: int) -> bool:
+    return 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2099
 
 
 def _looks_like_an_unambiguous_date(span: str) -> bool:
-    match = _UNAMBIGUOUS_DATE_RE.match(span)
-    if not match:
-        return False
-    day, month, _year = (int(group) for group in match.groups())
-    return 1 <= day <= 31 and 1 <= month <= 12
+    day_first = _DATE_LIKE_DAY_FIRST_RE.match(span)
+    if day_first:
+        day, month, year = (int(group) for group in day_first.groups())
+        if _is_plausible_date(day, month, year):
+            return True
+
+    year_first = _DATE_LIKE_YEAR_FIRST_RE.match(span)
+    if year_first:
+        year, month, day = (int(group) for group in year_first.groups())
+        if _is_plausible_date(day, month, year):
+            return True
+
+    return False
 
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
