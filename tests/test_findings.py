@@ -217,12 +217,53 @@ def test_emergency_basis_estimate_shown_when_only_job_true():
     assert finding.estimate.amount_gbp == Decimal("81.65")
 
 
-@pytest.mark.parametrize("only_job", [False, None])
-def test_emergency_basis_estimate_withheld_unless_only_job_true(only_job):
-    extract, comparison = _w1_scenario(only_job=only_job)
-    findings = generate_findings(extract, UserContext(only_job=only_job), comparison)
+def test_emergency_basis_estimate_withheld_when_it_is_not_the_only_job():
+    """
+    Told it is not their only job: the allowance is likely allocated to
+    the other employment, so the comparison is not applicable and no
+    figure is shown - not a hedged one, none.
+    """
+    extract, comparison = _w1_scenario(only_job=False)
+    findings = generate_findings(extract, UserContext(only_job=False), comparison)
     finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
     assert finding.estimate is None
+    assert "not your only job" in finding.explanation
+
+
+def test_emergency_basis_estimate_is_conditional_when_not_told():
+    """
+    Not told: state the figure with its assumption attached, never as
+    money owed. The condition rides on the Estimate's own label so every
+    consumer of the API carries it with the number.
+    """
+    extract, comparison = _w1_scenario(only_job=None)
+    findings = generate_findings(extract, UserContext(only_job=None), comparison)
+    finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
+    assert finding.estimate is not None
+    assert finding.estimate.amount_gbp == Decimal("81.65")
+    assert finding.estimate.label.startswith("Possible overpayment, if")
+    assert "only employment this tax year" in finding.estimate.label
+    # conditional, not a claim that it is owed
+    assert "If this has been your only employment" in finding.explanation
+    assert "owed" not in finding.explanation.lower()
+    assert "refund" not in finding.explanation.lower()
+
+
+def test_emergency_basis_arithmetic_is_identical_across_all_three_branches():
+    """
+    The figure comes from the payslip's own YTD totals. only_job decides
+    whether it applies and how firmly to state it - never what it is.
+    """
+    amounts = {}
+    for only_job in (True, None):
+        extract, comparison = _w1_scenario(only_job=only_job)
+        findings = generate_findings(extract, UserContext(only_job=only_job), comparison)
+        finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+        amounts[only_job] = finding.estimate.amount_gbp
+
+    assert amounts[True] == amounts[None] == Decimal("81.65")
 
 
 def test_emergency_basis_estimate_withheld_when_income_tax_ytd_unreadable():
@@ -241,6 +282,143 @@ def test_emergency_basis_estimate_never_exceeds_actual_tax_deducted():
     findings = generate_findings(extract, UserContext(only_job=True), comparison)
     finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
     assert finding.estimate.amount_gbp <= extract.deductions.income_tax_ytd
+
+
+def _m1_demo_scenario(periods_paid):
+    """
+    The two demo fixtures in verify/fixtures/, as pure data: 1257L M1,
+    monthly, PERIOD 5, £2,500 a period, £290.50 tax a period.
+
+    `periods_paid` is the only difference between them - 5 for someone
+    paid since period 1, 3 for someone who started in period 3. It is
+    what decides whether the emergency code has cost anything, and the
+    engine's figure is checked against the hand-calculation in
+    verify/fixtures/check_estimate.py.
+    """
+    from dataclasses import replace
+    from slyp.calculations import cumulative_tax_due_to_date, parse_tax_code
+
+    gross_ytd = Decimal("2500.00") * periods_paid
+    tax_ytd = Decimal("290.50") * periods_paid
+
+    extract = _extract(
+        tax_code="1257L M1",
+        frequency="monthly",
+        period_number=5,
+        gross_this_period="2500.00",
+        gross_ytd=str(gross_ytd),
+        income_tax="290.50",
+        income_tax_ytd=str(tax_ytd),
+        national_insurance="116.16",
+        pension_employee="125.00",
+        net_pay="1968.34",
+    )
+    breakdown = calculate_from_values(
+        gross_this_period="2500.00",
+        gross_ytd=str(gross_ytd),
+        tax_code="1257L M1",
+        period_number=5,
+        frequency="monthly",
+    )
+    tax_code = parse_tax_code("1257L M1")
+    comparison = replace(
+        comparison_from_breakdown(breakdown, extract),
+        personal_allowance_annual=tax_code.free_pay_annual,
+        cumulative_equivalent_tax_ytd=cumulative_tax_due_to_date(
+            gross_ytd, 5, "monthly", replace(tax_code, cumulative=True)
+        ),
+    )
+    return extract, comparison
+
+
+def test_emergency_basis_estimate_on_the_midyear_start_demo_fixture():
+    """
+    The demo's headline number. Someone who started in period 3 has been
+    given three months of allowance by M1 where a cumulative code would
+    give five: £2,095 of unused allowance at 20% = £419.00. Verified
+    end-to-end through extract_payslip -> analyse_payslip and through
+    POST /analyse, both of which returned this same figure.
+    """
+    extract, comparison = _m1_demo_scenario(periods_paid=3)
+    findings = generate_findings(extract, UserContext(only_job=True), comparison)
+    finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
+    assert finding.estimate is not None
+    assert finding.estimate.amount_gbp == Decimal("419.00")
+
+
+@pytest.mark.parametrize(
+    "only_job,expect_amount,expect_conditional",
+    [
+        (True, Decimal("419.00"), False),
+        (None, Decimal("419.00"), True),
+        (False, None, False),
+    ],
+)
+def test_demo_fixture_three_branches(only_job, expect_amount, expect_conditional):
+    """All three branches against the demo fixture's £419.00."""
+    extract, comparison = _m1_demo_scenario(periods_paid=3)
+    findings = generate_findings(extract, UserContext(only_job=only_job), comparison)
+    finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
+    if expect_amount is None:
+        assert finding.estimate is None
+    else:
+        assert finding.estimate.amount_gbp == expect_amount
+        assert finding.estimate.is_estimate is True
+        assert ("if" in finding.estimate.label.lower()) is expect_conditional
+
+
+def test_emergency_basis_estimate_assumes_no_previous_employer_this_year():
+    """
+    The known limit of the question, pinned so nobody widens the copy
+    without noticing it.
+
+    Someone who started here in period 3 having come FROM another job has
+    the same payslip as someone who was not working for periods 1-2 - the
+    YTD column covers this employment only. The first person has already
+    had part of the allowance used by their previous employer and is not
+    owed anything; the second genuinely is. The estimate cannot tell them
+    apart, and answering "yes, this is my only job" is truthful for both.
+
+    Worked: previous employer paid £5,000 over periods 1-2 on a cumulative
+    1257L, deducting £581.00. Adding this job's £871.50 gives £1,452.50 of
+    tax on £12,500 of pay - exactly what a cumulative code is due at
+    period 5. True overpayment: nil. This rule would still say £419.00.
+    """
+    from dataclasses import replace
+    from slyp.calculations import cumulative_tax_due_to_date, parse_tax_code
+
+    cumulative = replace(parse_tax_code("1257L M1"), cumulative=True)
+    previous_employer_tax = Decimal("581.00")
+    this_job_tax = Decimal("871.50")
+    combined_due = cumulative_tax_due_to_date(
+        Decimal("12500.00"), 5, "monthly", cumulative
+    )
+
+    assert previous_employer_tax + this_job_tax == combined_due  # nothing overpaid
+
+    extract, comparison = _m1_demo_scenario(periods_paid=3)
+    findings = generate_findings(extract, UserContext(only_job=True), comparison)
+    finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
+    assert finding.estimate.amount_gbp == Decimal("419.00")
+
+
+def test_no_estimate_when_the_emergency_code_has_cost_nothing():
+    """
+    Level pay all year on M1 costs exactly nothing: one month's allowance
+    granted five times is the same £5,237.50 a cumulative code grants by
+    period 5. The estimate is withheld by the `overpayment <= 0` guard,
+    which is correct - there is no overpayment to report, and this is why
+    a payslip that looks like the obvious demo case produces no figure.
+    """
+    extract, comparison = _m1_demo_scenario(periods_paid=5)
+    findings = generate_findings(extract, UserContext(only_job=True), comparison)
+    finding = next(f for f in findings if f.id == "tax_code_emergency_basis")
+
+    assert comparison.cumulative_equivalent_tax_ytd == extract.deductions.income_tax_ytd
+    assert finding.estimate is None
 
 
 def test_no_emergency_basis_finding_for_a_cumulative_code():

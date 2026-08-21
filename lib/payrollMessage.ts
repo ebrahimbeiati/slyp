@@ -66,6 +66,25 @@ export function buildPayrollMessage(result: AnalysisResult): string {
     }
   }
 
+  // Any finding carrying an Estimate, whatever its severity - the
+  // emergency-basis finding is "advisory", so filtering on "action"
+  // above dropped its pound figure from this message entirely.
+  //
+  // The label is printed verbatim and never rewritten here. That is what
+  // carries the branch: the backend writes "Possible overpayment so far
+  // this tax year" when the user has confirmed this is their only job,
+  // and "Possible overpayment, if this has been your only employment
+  // this tax year" when they have not been asked or did not say. Shorten
+  // either one and this message would assert something the analysis
+  // deliberately did not.
+  const estimates = result.findings.filter((f) => f.estimate !== null);
+  if (estimates.length > 0) {
+    parts.push("");
+    for (const finding of estimates) {
+      parts.push(`${finding.estimate!.label}: ${gbp(finding.estimate!.amount_gbp)}`);
+    }
+  }
+
   if (extract.unreadable_fields.length > 0) {
     parts.push(
       "",

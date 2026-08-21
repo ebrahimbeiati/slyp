@@ -1573,60 +1573,186 @@ def _check_tax_code(
 
     if _is_emergency_tax_code(code):
         findings.append(
-            Finding(
-                id="tax_code_emergency_basis",
-                severity="advisory",
-                title="This payslip is using a non-cumulative tax code",
-                explanation=(
-                    f"The payslip shows tax code {raw_code}. The W1, M1 or "
-                    "X suffix means tax is being calculated on a "
-                    "non-cumulative basis. This can happen when a tax code "
-                    "has recently changed or HMRC has not yet provided a "
-                    "cumulative code."
-                ),
-                next_step=(
-                    "Check your latest tax code with HMRC, particularly if "
-                    "you have recently changed jobs."
-                ),
-                source_fields=["tax_code.value"],
-                estimate=_emergency_code_overpayment_estimate(
-                    extract=extract,
-                    comparison=comparison,
-                    user_context=user_context,
-                ),
+            _emergency_basis_finding(
+                raw_code=raw_code,
+                extract=extract,
+                comparison=comparison,
+                user_context=user_context,
             )
         )
 
     return findings
 
 
-def _emergency_code_overpayment_estimate(
+# The shared first half of the emergency-basis explanation. Every branch
+# below states this much; they differ only in what they then say about
+# the figure.
+_EMERGENCY_BASIS_PREAMBLE = (
+    "The payslip shows tax code {raw_code}. The W1, M1 or X suffix means "
+    "tax is being calculated on a non-cumulative basis. This can happen "
+    "when a tax code has recently changed or HMRC has not yet provided a "
+    "cumulative code."
+)
+
+
+def _emergency_basis_finding(
+    raw_code: str,
     extract: PayslipExtract,
     comparison: CalculationComparison,
     user_context: UserContext,
-) -> Optional[Estimate]:
+) -> Finding:
+    """
+    The non-cumulative (W1/M1/X) finding, in three branches on
+    user_context.only_job — the same three-way split _br_tax_code_finding()
+    uses, and for the same reason: this payslip cannot see the rest of the
+    user's tax year, so what the figure MEANS depends on an answer only
+    they can give.
+
+    What differs from BR: this rule can compute a pound figure, so the
+    unanswered branch states one CONDITIONALLY rather than staying silent
+    about it. The condition travels on the Estimate's own label, not just
+    in prose, so every consumer of the API (the UI, the copy-to-payroll
+    message) carries the caveat with the number instead of re-deriving it.
+
+    The arithmetic is identical in all three branches - it comes from the
+    payslip's own year-to-date figures, and nothing the user says changes
+    it. only_job decides whether that arithmetic is APPLICABLE, and how
+    firmly it can be stated.
+
+    KNOWN LIMIT of the question itself, applies to the True branch too:
+    the figure requires no OTHER EMPLOYMENT THIS TAX YEAR, which is not
+    the same as no other job right now. Someone who changed jobs in July -
+    the most common reason to be on a W1/M1 code at all - can truthfully
+    answer "yes, this is my only job" while their previous employer has
+    already used part of the allowance this comparison assumes is unused.
+    The payslip cannot see that employment, so the estimate would be
+    overstated. Worked example in the tests. Fixing this properly means
+    asking about the tax year, not about right now.
+    """
+
+    preamble = _EMERGENCY_BASIS_PREAMBLE.format(raw_code=raw_code)
+    amount = _emergency_code_overpayment_amount(extract, comparison)
+
+    # ------------------------------------------------------------------
+    # Not their only job: the comparison is not applicable at all.
+    # ------------------------------------------------------------------
+
+    if user_context.only_job is False:
+        return Finding(
+            id="tax_code_emergency_basis",
+            severity="advisory",
+            title="This payslip is using a non-cumulative tax code",
+            explanation=(
+                f"{preamble} Because this is not your only job, your "
+                "personal allowance is likely to be allocated against your "
+                "other employment. A comparison with a cumulative code "
+                "using this payslip's figures alone would not be "
+                "meaningful, so we are not estimating one."
+            ),
+            next_step=(
+                "Check your latest tax code with HMRC if you think the "
+                "code does not reflect your circumstances."
+            ),
+            source_fields=["tax_code.value"],
+        )
+
+    # ------------------------------------------------------------------
+    # Their only job: state the figure directly.
+    # ------------------------------------------------------------------
+
+    if user_context.only_job is True:
+        return Finding(
+            id="tax_code_emergency_basis",
+            severity="advisory",
+            title="This payslip is using a non-cumulative tax code",
+            explanation=preamble,
+            next_step=(
+                "Check your latest tax code with HMRC, particularly if "
+                "you have recently changed jobs."
+            ),
+            source_fields=["tax_code.value"],
+            estimate=(
+                Estimate(
+                    label="Possible overpayment so far this tax year",
+                    amount_gbp=amount,
+                )
+                if amount is not None
+                else None
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Not told: state the figure with its assumption attached. Never as
+    # money owed.
+    # ------------------------------------------------------------------
+
+    if amount is None:
+        return Finding(
+            id="tax_code_emergency_basis",
+            severity="advisory",
+            title="This payslip is using a non-cumulative tax code",
+            explanation=preamble,
+            next_step=(
+                "Check your latest tax code with HMRC, particularly if "
+                "you have recently changed jobs."
+            ),
+            source_fields=["tax_code.value"],
+        )
+
+    return Finding(
+        id="tax_code_emergency_basis",
+        severity="advisory",
+        title="This payslip is using a non-cumulative tax code",
+        explanation=(
+            f"{preamble} If this has been your only employment this tax "
+            "year, this code may have deducted more tax by now than a "
+            "cumulative code would have. If you have had other employment "
+            "this tax year, this payslip cannot see it, and the figure "
+            "below would not apply."
+        ),
+        next_step=(
+            "Worth checking with HMRC — they can see your whole tax year, "
+            "including any other employment."
+        ),
+        source_fields=["tax_code.value"],
+        estimate=Estimate(
+            label=(
+                "Possible overpayment, if this has been your only "
+                "employment this tax year"
+            ),
+            amount_gbp=amount,
+        ),
+    )
+
+
+def _emergency_code_overpayment_amount(
+    extract: PayslipExtract,
+    comparison: CalculationComparison,
+) -> Optional[Decimal]:
     """
     How much more this non-cumulative code has deducted so far this tax
     year than a cumulative code would have, on the same figures.
 
-    Three guards. Any one of them withholds the estimate entirely rather
-    than showing a hedged or partial figure:
+    Pure arithmetic on the payslip's own year-to-date totals. It takes no
+    user_context: nothing the user tells us changes this number, only
+    whether it applies and how firmly it can be stated — see
+    _emergency_basis_finding(), which owns that decision.
 
-      1. Only job: the contract has no field for "previous employment YTD"
-         or "first job of the tax year" separately from the payslip's own
-         YTD totals, so user_context.only_job is the closest safe signal
-         we have. Anything other than an explicit True (False, or
-         unanswered) trips this gate — a second job is exactly the
-         situation where this comparison stops meaning anything.
-      2. Required fields readable: the actual YTD tax and the figures the
+    Two guards. Either one withholds the figure entirely rather than
+    producing a hedged or partial one:
+
+      1. Required fields readable: the actual YTD tax and the figures the
          cumulative-equivalent comparison depends on must all be present.
-      3. Clamp: the estimate can never exceed the tax actually deducted
-         YTD. If the arithmetic somehow produced more, refuse to show a
-         figure at all rather than show a wrong one.
-    """
+      2. Clamp: the figure can never exceed the tax actually deducted YTD.
+         If the arithmetic somehow produced more, return nothing rather
+         than something wrong.
 
-    if user_context.only_job is not True:
-        return None
+    A zero or negative result is not an overpayment and returns None. That
+    is the common case for level pay on an M1 code all year, where the
+    emergency basis genuinely costs nothing: one month's allowance granted
+    for each month paid equals the cumulative allowance for each month
+    elapsed. See tests/test_findings.py.
+    """
 
     required = [
         "deductions.income_tax_ytd",
@@ -1652,12 +1778,7 @@ def _emergency_code_overpayment_estimate(
         return None
 
     # Clamp: never more than what was actually deducted.
-    overpayment = min(overpayment, actual_ytd)
-
-    return Estimate(
-        label="Possible overpayment so far this tax year",
-        amount_gbp=overpayment,
-    )
+    return min(overpayment, actual_ytd)
 
 
 def _br_tax_code_finding(
