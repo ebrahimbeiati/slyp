@@ -189,7 +189,100 @@ def income_tax_due(facts: PayPeriodFacts) -> Decimal:
     Raise UnsupportedPayslip if annualised income is above the allowance
     taper threshold, or if the code region is not "UK".
     """
-    raise NotImplementedError
+    periods = periods_in_year(facts.frequency)
+    zero = Decimal("0")
+
+    # MVP only supports England / Northern Ireland tax bands
+    if facts.tax_code.region != "UK":
+        raise UnsupportedPayslip(
+            "Only England/Northern Ireland tax codes are supported"
+        )
+
+    projected_income = annualise(
+        facts.gross_this_period,
+        facts.gross_ytd,
+        facts.period_number,
+        facts.frequency,
+    )
+
+    if projected_income > RATES["allowance_taper_threshold"]:
+        raise UnsupportedPayslip(
+            "Income above the Personal Allowance taper threshold is outside the MVP"
+        )
+
+    # Flat-rate tax codes
+    if facts.tax_code.kind == "BR":
+        return to_money(
+            max(facts.gross_this_period * RATES["basic_rate"], zero)
+        )
+
+    if facts.tax_code.kind == "D0":
+        return to_money(
+            max(facts.gross_this_period * RATES["higher_rate"], zero)
+        )
+
+    if facts.tax_code.kind == "D1":
+        return to_money(
+            max(facts.gross_this_period * RATES["additional_rate"], zero)
+        )
+
+    def tax_for(gross: Decimal, period: int) -> Decimal:
+        if period <= 0:
+            return zero
+
+        fraction = Decimal(period) / Decimal(periods)
+
+        allowance = facts.tax_code.free_pay_annual * fraction
+        taxable = max(gross - allowance, zero)
+
+        basic_band = RATES["basic_rate_limit"] * fraction
+
+        basic_part = min(taxable, basic_band)
+        higher_part = max(taxable - basic_band, zero)
+
+        return (
+            basic_part * RATES["basic_rate"]
+            + higher_part * RATES["higher_rate"]
+        )
+
+    # W1 / M1 / X: this payslip is treated independently
+    if not facts.tax_code.cumulative:
+        fraction = Decimal("1") / Decimal(periods)
+
+        allowance = facts.tax_code.free_pay_annual / Decimal(periods)
+        taxable = max(facts.gross_this_period - allowance, zero)
+
+        basic_band = RATES["basic_rate_limit"] * fraction
+
+        basic_part = min(taxable, basic_band)
+        higher_part = max(taxable - basic_band, zero)
+
+        due = (
+            basic_part * RATES["basic_rate"]
+            + higher_part * RATES["higher_rate"]
+        )
+
+        return to_money(max(due, zero))
+
+    # Normal cumulative PAYE:
+    # tax due so far - tax due before this period = this period's tax
+    tax_due_ytd = tax_for(
+        facts.gross_ytd,
+        facts.period_number,
+    )
+
+    previous_gross_ytd = (
+        facts.gross_ytd - facts.gross_this_period
+    )
+
+    tax_due_previous = tax_for(
+        previous_gross_ytd,
+        facts.period_number - 1,
+    )
+
+    due_this_period = tax_due_ytd - tax_due_previous
+
+    return to_money(max(due_this_period, zero))
 
 
 # --------------------------------------------------------------------------

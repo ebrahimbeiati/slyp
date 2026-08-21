@@ -135,8 +135,8 @@ def test_no_tax_when_under_the_allowance():
 
 
 def test_basic_rate_cumulative():
-    # £2,000 in month 1 on 1257L. TODO: expected figure.
-    assert income_tax_due(_facts("2000", "2000", "1257L")) == Decimal("TODO")
+    # £2,000 in month 1 on 1257L.
+    assert income_tax_due(_facts("2000", "2000", "1257L")) == Decimal("190.50")
 
 
 def test_br_code_taxes_every_pound():
