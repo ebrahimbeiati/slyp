@@ -300,7 +300,11 @@ _TAX_CODE_LINE_RE = re.compile(
 _KNOWN_LABEL_RE = re.compile(
     r"(?i)\b("
     r"tax code|gross|net pay|national insurance|nic|paye|income tax|"
-    r"pension|student loan|year to date|ytd|hours|rate|pay period|pay date"
+    r"pension|student loan|postgraduate loan|pgl|"
+    r"year to date|ytd|hours|rate|"
+    r"pay period|pay date|tax period|tax month|tax week|period number|"
+    r"frequency|pay type|pay basis|"
+    r"ni category|ni table|table letter"
     r")\b"
 )
 # Deliberately excludes generic section headers like "Deductions" and
@@ -308,6 +312,16 @@ _KNOWN_LABEL_RE = re.compile(
 # would otherwise survive the filter on the word "Payments" alone - the
 # whole point of the allowlist is that a bare header with no figure
 # attached gets dropped, PII or not.
+#
+# Audited 2026-08 against every field _ModelExtract can report (not just
+# the one gap that was reported): frequency/pay type/pay basis and
+# tax period/tax month/tax week/period number were all missing entirely -
+# a payslip stating its period as "Tax Period Month 9" or its basis as
+# "Pay Frequency Monthly" on a line with no currency figure had that
+# context silently dropped before the model ever saw it. Same problem
+# for ni_category ("NI Table Letter A" contains neither "national
+# insurance" nor "nic" as a substring) and student_loan_plan
+# ("Postgraduate Loan" doesn't contain "student loan").
 
 
 def financial_lines_only(text: str) -> str:
