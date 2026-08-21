@@ -479,6 +479,11 @@ def test_extract_payslip_raises_not_a_payslip_when_model_says_so():
         (date(2026, 3, 31), "monthly", 12),
         # matches what the real payslip printed - see slyp-phase3-prompt.md
         (date(2026, 2, 13), "weekly", 45),
+        # weekly, either side of the 6 April boundary - the monthly cases
+        # above cover this, but weekly's day-counting arithmetic is
+        # different code and wasn't independently exercised here.
+        (date(2026, 4, 6), "weekly", 1),
+        (date(2026, 4, 5), "weekly", 53),
     ],
 )
 def test_derive_period_number(pay_date, frequency, expected):
