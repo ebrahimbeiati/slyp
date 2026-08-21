@@ -19,6 +19,7 @@ from slyp.extraction import (
     extract_payslip,
     extract_text,
     financial_lines_only,
+    infer_frequency_from_label,
     redact,
 )
 
@@ -98,6 +99,14 @@ Employer NIC 24.98
 Week 16th March (20 hours) & Week 23rd March (17.60 hours)
 Net Pay 583.55
 """
+
+# SAMPLE_TEXT prints "Pay Type Monthly", so infer_frequency_from_label()
+# reads a frequency straight off it - correctly, it's printed there. The
+# tests below that need frequency to be genuinely UNKNOWABLE have to use
+# a payslip that never states it, or they'd be asserting against an
+# inference that legitimately succeeded rather than against the
+# never-guess property they exist to protect.
+SAMPLE_TEXT_NO_FREQUENCY = SAMPLE_TEXT.replace("Pay Type Monthly", "Pay Type")
 
 
 # --------------------------------------------------------------------------
@@ -516,6 +525,104 @@ def test_catch_all_does_not_eat_money_or_dates(line, must_survive):
 
 
 # --------------------------------------------------------------------------
+# Frequency read from a printed period label
+#
+# Plenty of payslips never print "Monthly" as a word - they print
+# "Month 9". The prompt tells the model to return null rather than guess,
+# so it correctly returns nothing, and without a frequency period_number
+# can't be derived. That cascades: no period_number means
+# _facts_from_extract() refuses, which surfaces to the user as "We could
+# not complete every calculation". Reading "Month" beside a number is
+# extraction, not invention - but it has to refuse anything ambiguous.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Month 9", "monthly"),
+        ("Tax Month 09", "monthly"),
+        ("Month No. 9", "monthly"),
+        ("Pay Frequency Monthly", "monthly"),
+        ("Week 39", "weekly"),
+        ("Tax Week 39", "weekly"),
+        ("Weekly", "weekly"),
+    ],
+)
+def test_frequency_read_from_a_printed_label(text, expected):
+    assert infer_frequency_from_label(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Names no unit - picking one would be the invented value the
+        # whole confidence gate exists to prevent.
+        "Period 9",
+        # A date label, not a period number - must not read as weekly.
+        "Week Ending 15/12/2025",
+        # Contradictory evidence.
+        "Month 9 Week 39",
+        # Frequencies the engine has no rates for. The bare word "weekly"
+        # inside these must not read as plain weekly - that would
+        # calculate a 4-weekly payslip on weekly thresholds.
+        "4 Weekly",
+        "Fortnightly",
+        "Bi-Weekly",
+        "Two-weekly Pay",
+        "Quarterly",
+        # Nothing to read at all.
+        "Pay Date 15/12/2025",
+        "Annual Salary 30000",
+    ],
+)
+def test_frequency_inference_refuses_anything_ambiguous(text):
+    assert infer_frequency_from_label(text) is None
+
+
+def test_printed_month_label_unblocks_period_number_and_the_calculation():
+    """
+    The whole cascade, end to end - this is the bug the user saw as two
+    separate messages ("We could not complete every calculation" and
+    "COULDN'T READ CONFIDENTLY: period.period_number"). They are one
+    bug: the payslip prints a pay date and "Tax Month 9" but never the
+    word "Monthly", so the model returns no frequency, so period_number
+    can't be derived, so _facts_from_extract() refuses and the whole
+    calculation is skipped.
+    """
+    text = (
+        "Pay Date 15/12/2025 Tax Month 9\n"
+        "Tax Code 1257L Income Tax 412.60\n"
+        "National Insurance 198.16\n"
+        "Total Gross Pay 2750.00\n"
+        "Taxable Gross Pay 24750.00\n"
+        "Net Pay 2139.24\n"
+    )
+
+    model_extract = _ModelExtract()
+    model_extract.period.pay_date = date(2025, 12, 15)
+    model_extract.period.frequency = None  # correctly returns nothing
+    model_extract.period.period_number = None
+    model_extract.tax_code.value = "1257L"
+    model_extract.pay.gross_this_period = Decimal("2750.00")
+    model_extract.pay.gross_ytd = Decimal("24750.00")
+    model_extract.deductions.income_tax = Decimal("412.60")
+    model_extract.deductions.national_insurance = Decimal("198.16")
+    model_extract.deductions.ni_category = "A"
+    model_extract.net_pay = Decimal("2139.24")
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.frequency == "monthly"
+    assert result.period.period_number == 9  # 15 Dec 2025 -> month 9
+    assert "period.period_number" not in result.unreadable_fields
+    # The frequency is label-read, not model-read - say so downstream.
+    assert any("period.frequency" in warning for warning in result.warnings)
+
+
+# --------------------------------------------------------------------------
 # Tax year derivation
 # --------------------------------------------------------------------------
 
@@ -734,7 +841,7 @@ def test_extract_payslip_never_guesses_a_frequency_to_derive_period_number():
     model_extract.period.period_number = 9
     model_extract.confidence["period.period_number"] = 1.0
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_FREQUENCY.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
@@ -820,7 +927,7 @@ def test_extract_payslip_refuses_printed_period_label_when_frequency_unconfirmed
     model_extract.period.period_number = 9
     model_extract.confidence["period.period_number"] = 0.9
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_FREQUENCY.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 

@@ -676,6 +676,13 @@ Rules:
   employee one only - never the employer figure.
 - "Year to Date" / "YTD" figures are cumulative for the tax year so far. \
   Keep them separate from this pay period's own figures.
+- period.frequency: a printed period label is enough to read this from - \
+  "Month 9" / "Tax Month 9" means monthly, "Week 39" / "Tax Week 39" \
+  means weekly. You do not need the literal word "Monthly" on the page. \
+  Do NOT infer it from the pay date alone, and return null if the \
+  payslip says only "Period 9" without naming the unit, or names a \
+  frequency that is neither monthly nor weekly (fortnightly, 4-weekly, \
+  quarterly).
 - Report a confidence score from 0 to 1 for every field you fill in, \
   keyed by dotted path (e.g. "pay.gross_this_period"). If you are not \
   confident, return null for that field rather than guessing - a \
@@ -916,6 +923,60 @@ _PERIOD_NUMBER_RANGE: dict[str, range] = {
 def _period_number_plausible(period_number: int, frequency: Optional[Frequency]) -> bool:
     valid_range = _PERIOD_NUMBER_RANGE.get(frequency or "")
     return valid_range is not None and period_number in valid_range
+
+
+# Frequency read from a printed period label. Plenty of payslips never
+# print the word "Monthly" anywhere - they print "Month 9" or "Tax Month
+# 9" - and the prompt tells the model to return null rather than guess,
+# so it correctly returns nothing. Without a frequency, period_number
+# can't be derived, and without period_number the whole calculation is
+# skipped: that surfaces as "We could not complete every calculation".
+#
+# Reading the word "Month" beside a number is extraction, the same
+# operation already trusted for the tax code - not the model inventing a
+# value. Done in code rather than left to the model so it's
+# deterministic and testable without an API call.
+#
+# Requires a DIGIT after the word, so "Week Ending 15/12/2025" (a date
+# label, no period number) doesn't read as weekly.
+_MONTHLY_LABEL_RE = re.compile(
+    r"(?i)\bmonthly\b|\b(?:tax\s+)?month\s*(?:no\.?|number|:)?\s*\d{1,2}\b"
+)
+_WEEKLY_LABEL_RE = re.compile(
+    r"(?i)\bweekly\b|\b(?:tax\s+)?week\s*(?:no\.?|number|:)?\s*\d{1,2}\b"
+)
+
+# Frequencies the engine has no rates or period maths for. If any of
+# these appear, refuse to infer at all rather than let the bare word
+# "weekly" inside "4-weekly" or "bi-weekly" read as plain weekly - that
+# would silently calculate a 4-weekly payslip on weekly thresholds.
+_UNSUPPORTED_FREQUENCY_RE = re.compile(
+    r"(?i)\b(?:fortnight(?:ly)?|bi[-\s]?weekly|(?:2|two|4|four)[-\s]?weekly|"
+    r"quarterly|annual(?:ly)?|yearly|daily)\b"
+)
+
+
+def infer_frequency_from_label(text: str) -> Optional[Frequency]:
+    """
+    Frequency from an explicitly printed period label, or None.
+
+    Returns None - never a guess - when the evidence is absent,
+    contradictory (both a month and a week label), or names a frequency
+    the engine doesn't support. "Period 9" on its own is deliberately
+    not enough: it doesn't say which unit, and picking one would be
+    exactly the invented-value failure this pipeline exists to avoid.
+    """
+    if _UNSUPPORTED_FREQUENCY_RE.search(text):
+        return None
+
+    monthly = _MONTHLY_LABEL_RE.search(text) is not None
+    weekly = _WEEKLY_LABEL_RE.search(text) is not None
+
+    if monthly and not weekly:
+        return "monthly"
+    if weekly and not monthly:
+        return "weekly"
+    return None
 
 
 # Best-effort validation of the tax code shapes types.TaxCodeKind
@@ -1177,12 +1238,26 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     # genuinely derived from a known frequency and a known pay date.
     period_number = model_extract.period.period_number
     confidence = dict(model_extract.confidence)
-    frequency_known = (
-        model_extract.period.frequency is not None
-        and "period.frequency" not in unreadable
-    )
+    frequency = model_extract.period.frequency
+
+    # Only when the model returned NOTHING for frequency - not when it
+    # returned a value it flagged unreadable, which is a different
+    # situation (it saw something and doubted it, rather than finding
+    # nothing to read). See infer_frequency_from_label().
+    if frequency is None:
+        inferred_frequency = infer_frequency_from_label(filtered_text)
+        if inferred_frequency is not None:
+            frequency = inferred_frequency
+            unreadable.discard("period.frequency")
+            path_warnings.append(
+                f"period.frequency: read from a printed period label "
+                f"({inferred_frequency}) - the payslip does not state the "
+                f"frequency as a word."
+            )
+
+    frequency_known = frequency is not None and "period.frequency" not in unreadable
     derived_period_number = (
-        derive_period_number(model_extract.period.pay_date, model_extract.period.frequency)
+        derive_period_number(model_extract.period.pay_date, frequency)
         if frequency_known
         else None
     )
@@ -1206,7 +1281,7 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         and model_extract.period.pay_date is None
         and period_number is not None
         and "period.period_number" not in unreadable
-        and _period_number_plausible(period_number, model_extract.period.frequency)
+        and _period_number_plausible(period_number, frequency)
     ):
         # No pay date to derive from, but the payslip prints an explicit
         # period label (e.g. "Month 9") that the model read confidently,
@@ -1250,6 +1325,7 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     )
     extract_dict["confidence"] = confidence
     extract_dict["period"]["period_number"] = period_number
+    extract_dict["period"]["frequency"] = frequency
     extract_dict["period"]["tax_year"] = tax_year
     # employer_name never reaches the model - the allowlist drops that
     # line outright (no currency, date or known label on it) - so it's
