@@ -6,9 +6,8 @@ import { useRouter } from "next/navigation";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
 import { analysePayslip, AnalyseError } from "@/lib/Api";
 import { onlyJobFromAnswer, taxYearRangeLabel } from "@/lib/onlyJob";
+import { encodeStoredResult, STORAGE_KEY } from "@/lib/storedResult";
 import type { OtherJobAnswer } from "@/lib/onlyJob";
-
-const STORAGE_KEY = "slyp:latest";
 
 const PROGRESS_STEPS = [
   "Uploading",
@@ -73,7 +72,7 @@ export default function UploadPage() {
 
     try {
       const result = await analysePayslip(file, onlyJobFromAnswer(otherJob));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(result));
+      localStorage.setItem(STORAGE_KEY, encodeStoredResult(result));
       router.push("/");
       // Deliberately no `finally` reset of isUploading here on the
       // success path - the page is navigating away, and re-enabling the

@@ -5,8 +5,7 @@ import Link from "next/link";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
 import type { AnalysisResult, Finding, PayslipExtract, Score, Severity } from "@/app/Types/Types";
 import { buildPayrollMessage } from "@/lib/payrollMessage";
-
-const STORAGE_KEY = "slyp:latest";
+import { decodeStoredResult, STORAGE_KEY } from "@/lib/storedResult";
 
 /** Format a Decimal-as-string field for display. Never used to derive a
  * new figure - only to add thousands separators / a £ prefix to a number
@@ -147,14 +146,24 @@ export default function HomePage() {
   const [showHomeWarning, setShowHomeWarning] = useState(false);
   const [premiumFeature, setPremiumFeature] = useState<string | null>(null);
   const [copyLabel, setCopyLabel] = useState("Copy for payroll");
+  // Set when we found a saved result this build cannot trust. Shown
+  // instead of the empty state, so a discarded result is visible rather
+  // than looking like "you never uploaded anything".
+  const [discarded, setDiscarded] = useState(false);
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    try {
-      setResult(JSON.parse(raw) as AnalysisResult);
-    } catch (err) {
-      console.error("Failed to read saved analysis:", err);
+    const loaded = decodeStoredResult(localStorage.getItem(STORAGE_KEY));
+
+    if (loaded.kind === "ok") {
+      setResult(loaded.result);
+      return;
+    }
+
+    if (loaded.kind === "outdated" || loaded.kind === "unreadable") {
+      // Remove it now. It can never be rendered by this build, and
+      // leaving it would mean re-deciding this on every page load.
+      localStorage.removeItem(STORAGE_KEY);
+      setDiscarded(true);
     }
   }, []);
 
@@ -163,6 +172,7 @@ export default function HomePage() {
   const wipeAndReset = () => {
     localStorage.removeItem(STORAGE_KEY);
     setResult(null);
+    setDiscarded(false);
     setShowHomeWarning(false);
   };
 
@@ -193,6 +203,23 @@ export default function HomePage() {
                     </div>
                   </div>
                 </div>
+
+                {/* A discarded result is said out loud. Silently showing
+                    the empty state would read as "you never uploaded
+                    anything", when what actually happened is that we
+                    threw away a result we could no longer trust. */}
+                {discarded && (
+                  <div className="w-full bg-[#2a1f0e] border border-[#FFAE34]/40 rounded-2xl px-4 py-3 mb-5 text-left">
+                    <div className="text-[#FFAE34] text-[10px] font-bold uppercase tracking-wider mb-1">
+                      Saved result cleared
+                    </div>
+                    <p className="text-[var(--sage)] text-[11px] leading-relaxed">
+                      That result was from an earlier version of Slyp, so we
+                      cleared it rather than show you figures this version
+                      didn&apos;t work out. Please upload your payslip again.
+                    </p>
+                  </div>
+                )}
 
                 <div className="w-full bg-[#34423d] border border-[#515a57] rounded-3xl p-5 mb-5 flex flex-col items-start text-left shadow-md">
                   <div className="w-9 h-9 rounded-xl bg-[#1A2A24] border border-[#2D453E] flex items-center justify-center mb-4">

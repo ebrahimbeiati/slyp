@@ -24,6 +24,19 @@ does:
       grant five months of allowance against three months of pay, M1
       grants three, and the gap is real money: £419.00.
 
+  br_second_job.pdf
+      BR, £476/month, £95.20 tax, £0 NI. Under the monthly primary
+      threshold, so the NI check has £0.00 expected against £0.00 actual
+      and must report as not applicable rather than as a pass.
+
+  under_all_thresholds.pdf
+      1257L, £583.55/month. Under the personal allowance AND the primary
+      threshold, so BOTH deduction checks are vacuous. This is the
+      payslip that used to report "4/4 checks clear" having verified
+      nothing.
+
+All four are exercised together by verify/run_regression.py.
+
 Run:  python verify/fixtures/make_fixtures.py
 """
 from __future__ import annotations
@@ -113,6 +126,28 @@ def _payslip_lines(
     ]
 
 
+def _simple_lines(*, tax_code, gross, tax, ni, net, gross_ytd, tax_ytd, ni_ytd):
+    """A shorter payslip than the emergency pair - no pension line. Used
+    by the two threshold fixtures, where what matters is which checks can
+    run at all, not the deduction mix."""
+    return [
+        "Employer: Northwind Trading Ltd",
+        "Employee Name: A Sample",
+        "Pay Date: 28/08/2026",
+        "Tax Period: 5     Payment Period Monthly",
+        f"Tax Code: {tax_code}     NI Table Letter A",
+        "",
+        f"Basic Pay {gross}              Income Tax {tax}",
+        f"                                National Insurance {ni}",
+        "",
+        f"Total Gross Pay {gross}        Net Pay {net}",
+        "",
+        "Year to date",
+        f"Gross Pay YTD {gross_ytd}      Income Tax YTD {tax_ytd}",
+        f"                                National Insurance YTD {ni_ytd}",
+    ]
+
+
 FIXTURES = {
     # Brief's spec: paid every period since period 1. 5 x 2,500 = 12,500.
     "emergency_m1_level_pay.pdf": _payslip_lines(
@@ -127,6 +162,28 @@ FIXTURES = {
         tax_ytd="871.50",
         ni_ytd="348.48",
         pension_ytd="375.00",
+    ),
+    # BR on a second job: income tax is real (£95.20), NI is not.
+    "br_second_job.pdf": _simple_lines(
+        tax_code="BR",
+        gross="476.00",
+        tax="95.20",
+        ni="0.00",
+        net="380.80",
+        gross_ytd="2,380.00",
+        tax_ytd="476.00",
+        ni_ytd="0.00",
+    ),
+    # Under everything: neither deduction check has anything to compare.
+    "under_all_thresholds.pdf": _simple_lines(
+        tax_code="1257L",
+        gross="583.55",
+        tax="0.00",
+        ni="0.00",
+        net="583.55",
+        gross_ytd="854.07",
+        tax_ytd="0.00",
+        ni_ytd="0.00",
     ),
 }
 
