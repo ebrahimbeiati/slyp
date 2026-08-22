@@ -286,3 +286,165 @@ def test_period_number_out_of_range():
 def test_ytd_must_include_this_period():
     with pytest.raises(ValueError):
         _facts("1000", "500", "1257L")
+
+
+# --------------------------------------------------------------------------
+# 7. £100,000 Personal Allowance taper  —  FR-04
+# --------------------------------------------------------------------------
+#
+# The engine does not model the taper (allowance withdrawn £1 for every £2
+# above £100,000). It must therefore REFUSE past the threshold rather than
+# apply an allowance the taxpayer does not have.
+#
+# The guard used to live in annual_income_tax(), which had zero callers, so
+# it protected nothing. These tests pin it to the live path.
+
+
+def test_the_150k_repro_from_the_final_report_refuses():
+    """FR-04, verify/FINAL_REPORT.md.
+
+    A CORRECT £150,000 payslip - £12,500/month, month 12, 1257L, taxed
+    exactly as HMRC would with a fully tapered (zero) allowance - used to
+    come back with a finding claiming £678.37 of income tax had been
+    under-deducted, because the engine granted the full £12,570 allowance.
+
+    Named after the repro so it cannot be quietly retired.
+    """
+    facts = _facts("12500.00", "150000.00", "1257L", period=12)
+
+    with pytest.raises(UnsupportedPayslip) as excinfo:
+        income_tax_due(facts)
+
+    # The message must name the actual reason, not just "unsupported".
+    assert "100,000" in str(excinfo.value)
+    assert "Personal Allowance" in str(excinfo.value)
+
+
+def test_just_under_the_taper_threshold_still_calculates():
+    """£99,996/yr (£8,333/month) must be answered normally - the guard has
+    to refuse high earners without refusing ordinary payslips."""
+    facts = _facts("8333.00", "99996.00", "1257L", period=12)
+
+    tax = income_tax_due(facts)
+
+    assert tax > Decimal("0")
+
+
+def test_just_over_the_taper_threshold_refuses():
+    """£100,008/yr - £12 over - must refuse. Pins the boundary itself, not
+    just a comfortably-large number."""
+    facts = _facts("8334.00", "100008.00", "1257L", period=12)
+
+    with pytest.raises(UnsupportedPayslip):
+        income_tax_due(facts)
+
+
+def test_exactly_at_the_threshold_still_calculates():
+    """£100,000 exactly is NOT above the threshold - the taper starts
+    above it, so this must not refuse.
+
+    Final period, so the projection is the year-to-date figure itself:
+    annualise() adds this period's gross for the periods REMAINING, and at
+    period 12 there are none.
+    """
+    facts = _facts("8333.33", "100000.00", "1257L", period=12)
+
+    assert calculations.annualise(
+        Decimal("8333.33"), Decimal("100000.00"), 12, "monthly"
+    ) == Decimal("100000.00")
+    assert income_tax_due(facts) > Decimal("0")
+
+
+def test_taper_guard_applies_on_the_cumulative_path():
+    """The path the FR-04 repro took: a plain 1257L code."""
+    facts = _facts("12500.00", "150000.00", "1257L", period=12)
+
+    assert facts.tax_code.cumulative is True
+    with pytest.raises(UnsupportedPayslip):
+        income_tax_due(facts)
+
+
+def test_taper_guard_applies_on_the_non_cumulative_path():
+    """The other half. non_cumulative_income_tax_due() returned £2,290.50
+    for this case with no refusal at all before the fix - it is reached by
+    dispatch from cumulative_income_tax_due(), so a guard placed only on
+    the cumulative branch would have missed it."""
+    facts = _facts("12500.00", "150000.00", "1257L M1", period=12)
+
+    assert facts.tax_code.cumulative is False
+    with pytest.raises(UnsupportedPayslip):
+        income_tax_due(facts)
+
+
+def test_taper_guard_uses_annualised_pay_not_year_to_date():
+    """Basis check. At month 3 a £150,000 earner is only £37,500 in, so a
+    year-to-date test would let them through for most of the tax year -
+    exactly the wrong-figure window this guard closes."""
+    facts = _facts("12500.00", "37500.00", "1257L", period=3)
+
+    assert facts.gross_ytd < Decimal("100000")  # YTD alone would allow it
+    with pytest.raises(UnsupportedPayslip):
+        income_tax_due(facts)
+
+
+def test_taper_guard_does_not_refuse_a_zero_allowance_code():
+    """BR, D0, D1 and 0T grant no allowance, so there is nothing to taper
+    and the banded arithmetic is already correct at any income. Refusing
+    them would refuse a calculation the engine gets right."""
+    for code in ("BR", "D0", "D1", "0T"):
+        facts = _facts("12500.00", "150000.00", code, period=12)
+        assert income_tax_due(facts) > Decimal("0"), code
+
+
+def test_zero_allowance_code_is_correct_at_high_income():
+    """The claim the previous test rests on, checked rather than asserted.
+    0T on £150,000: 20% of 37,700 + 40% of 87,440 + 45% of 24,860."""
+    facts = _facts("150000.00", "150000.00", "0T", period=12)
+
+    assert income_tax_due(facts) == Decimal("53703.00")
+
+
+def test_nt_is_answered_not_refused_at_high_income():
+    """NT is exempt outright, so the allowance is irrelevant and a high
+    earner on NT must get an answer rather than a refusal."""
+    facts = _facts("12500.00", "150000.00", "NT", period=12)
+
+    assert income_tax_due(facts) == Decimal("0")
+
+
+def test_the_taper_guard_is_reachable_from_income_tax_due():
+    """FR-04's actual defect was not a missing check - it was a check on a
+    function nothing called. This asserts reachability from the live entry
+    point, so the guard cannot drift back onto a dead path.
+
+    calculate_pay_breakdown() is what analysis.analyse_payslip() calls, and
+    it reaches the guard only via income_tax_due().
+    """
+    facts = _facts("12500.00", "150000.00", "1257L", period=12)
+
+    with pytest.raises(UnsupportedPayslip):
+        calculations.income_tax_due(facts)
+
+    with pytest.raises(UnsupportedPayslip):
+        calculations.calculate_pay_breakdown(facts)
+
+
+def test_the_dead_annual_tax_functions_are_gone():
+    """The other half of FR-04: a live guard and a dead guard must not sit
+    side by side. annual_income_tax() held the only £100k refusal in the
+    file and had zero callers; taxable_income() was called only by it; and
+    personal_allowance_for_income() computed a tapered allowance the engine
+    has no business computing while it refuses the taper.
+
+    If any of these comes back, the duplicate-guard hazard comes back with
+    it.
+    """
+    for name in (
+        "annual_income_tax",
+        "taxable_income",
+        "personal_allowance_for_income",
+    ):
+        assert not hasattr(calculations, name), (
+            f"{name}() is back - see FR-04. If it is genuinely needed again, "
+            f"make sure it does not reintroduce a second £100k guard."
+        )

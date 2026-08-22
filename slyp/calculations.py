@@ -847,177 +847,32 @@ def parse_tax_code(
 
 
 # ============================================================================
-# PERSONAL ALLOWANCE
+# PERSONAL ALLOWANCE / ANNUAL TAX  —  deliberately absent
 # ============================================================================
-
-
-def personal_allowance_for_income(
-    annual_income: Decimal,
-) -> Decimal:
-    """
-    Calculate Personal Allowance.
-
-    £12,570 normally.
-
-    Above £100,000, allowance is reduced by £1 for every £2 of
-    adjusted net income above £100,000.
-
-    At £125,140 the allowance reaches zero.
-
-    The MVP deliberately rejects income above £100,000 elsewhere in the
-    engine because the payslip contract says the allowance taper is outside
-    MVP scope. This helper is kept explicit so the rule is not hidden.
-    """
-
-    annual_income = non_negative(annual_income)
-
-    if annual_income <= PERSONAL_ALLOWANCE_TAPER_START:
-        return PERSONAL_ALLOWANCE
-
-    excess = annual_income - PERSONAL_ALLOWANCE_TAPER_START
-
-    reduction = excess / Decimal("2")
-
-    allowance = PERSONAL_ALLOWANCE - reduction
-
-    return max(
-        ZERO,
-        allowance,
-    )
-
-
-# ============================================================================
-# TAXABLE INCOME
-# ============================================================================
-
-
-def taxable_income(
-    annual_gross: Decimal,
-    tax_code: TaxCode,
-) -> Decimal:
-    """
-    Calculate taxable annual income after the allowance represented by
-    the tax code.
-
-    For normal tax codes:
-        taxable = gross - allowance
-
-    For K codes:
-        negative allowance increases taxable income.
-    """
-
-    annual_gross = non_negative(annual_gross)
-
-    allowance = tax_code.free_pay_annual
-
-    taxable = annual_gross - allowance
-
-    return max(
-        ZERO,
-        taxable,
-    )
-
-
-# ============================================================================
-# ANNUAL INCOME TAX
-# ============================================================================
-
-
-def annual_income_tax(
-    annual_gross: Decimal,
-    tax_code: TaxCode,
-) -> Decimal:
-    """
-    Calculate annual UK income tax for England/Wales/Northern Ireland.
-
-    Supported:
-        standard
-        BR
-        D0
-        D1
-        0T
-        K
-
-    The tax code determines the available allowance.
-
-    Standard tax bands:
-        20% basic
-        40% higher
-        45% additional
-    """
-
-    annual_gross = non_negative(annual_gross)
-
-    if annual_gross > PERSONAL_ALLOWANCE_TAPER_START:
-        raise UnsupportedPayslip(
-            "Income above £100,000 is outside the MVP because "
-            "Personal Allowance tapering is not supported."
-        )
-
-    if tax_code.kind == "NT":
-        return ZERO
-
-    # ------------------------------------------------------------
-    # BR
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "BR":
-        return money(annual_gross * BASIC_RATE)
-
-    # ------------------------------------------------------------
-    # D0
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "D0":
-        return money(annual_gross * HIGHER_RATE)
-
-    # ------------------------------------------------------------
-    # D1
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "D1":
-        return money(annual_gross * ADDITIONAL_RATE)
-
-    # ------------------------------------------------------------
-    # 0T and standard/K codes
-    # ------------------------------------------------------------
-
-    taxable = taxable_income(
-        annual_gross,
-        tax_code,
-    )
-
-    if taxable <= ZERO:
-        return ZERO
-
-    # Basic rate.
-    basic_amount = min(
-        taxable,
-        BASIC_RATE_LIMIT,
-    )
-
-    tax = basic_amount * BASIC_RATE
-
-    # Higher rate.
-    higher_amount = min(
-        max(
-            ZERO,
-            taxable - BASIC_RATE_LIMIT,
-        ),
-        ADDITIONAL_RATE_THRESHOLD - BASIC_RATE_LIMIT,
-    )
-
-    tax += higher_amount * HIGHER_RATE
-
-    # Additional rate.
-    additional_amount = max(
-        ZERO,
-        taxable - ADDITIONAL_RATE_THRESHOLD,
-    )
-
-    tax += additional_amount * ADDITIONAL_RATE
-
-    return money(tax)
+#
+# personal_allowance_for_income(), taxable_income() and annual_income_tax()
+# used to live here. All three are gone, on purpose.
+#
+# annual_income_tax() was the only function in the file that refused income
+# above £100,000 — and it had zero callers, so it refused nothing. That is
+# how a correct £150,000 payslip came back claiming £678.37 of income tax
+# had been under-deducted: the live path (income_tax_due) had no such check,
+# and the guard everyone believed in sat on a function nothing called.
+# taxable_income() was called only by annual_income_tax(), and
+# personal_allowance_for_income() was called by nothing at all.
+#
+# The refusal now lives in assert_allowance_not_tapered(), reached from
+# income_tax_due() — see there. It is not duplicated here, because a second
+# copy on a dead path is exactly the failure being fixed.
+#
+# personal_allowance_for_income() in particular is not coming back until the
+# engine genuinely supports the taper: a live function that computes a
+# tapered allowance, in a codebase whose stated rule is to REFUSE rather
+# than taper, is an invitation to wire it in and start producing the exact
+# figures this engine promises not to produce.
+#
+# PERSONAL_ALLOWANCE_TAPER_START is retained above — it is now the
+# threshold the live guard tests against.
 
 
 # ============================================================================
@@ -1031,15 +886,8 @@ def cumulative_income_tax_due(
     """
         Calculate the income tax that should be deducted THIS pay period.
 
-        This is the important distinction between:
-
-            annual_income_tax()
-
-    and:
-
-            cumulative_income_tax_due()
-
-    A cumulative PAYE payslip does not simply calculate:
+    The important distinction is between a whole YEAR's tax and THIS
+    PERIOD's. A cumulative PAYE payslip does not simply calculate:
 
         annual tax / 12
 
@@ -1232,6 +1080,76 @@ def non_cumulative_income_tax_due(
 # ============================================================================
 
 
+def assert_allowance_not_tapered(
+    facts: PayPeriodFacts,
+) -> None:
+    """
+    Refuse a payslip whose full-year pay looks set to exceed £100,000,
+    where the Personal Allowance is withdrawn by £1 for every £2 above
+    the threshold. This engine does not model that withdrawal, so past
+    the threshold it would apply an allowance the taxpayer does not have
+    and report the difference as an under-deduction — a confidently wrong
+    pound figure, which is the one thing this engine must not produce.
+
+    WHY THIS LIVES HERE. The same rule used to sit in annual_income_tax(),
+    a function with zero callers, so it protected nothing: a correct
+    £150,000 payslip came back with a finding claiming £678.37 of income
+    tax had been under-deducted. income_tax_due() is the single entry
+    point every caller actually reaches (see its docstring), so the guard
+    belongs on it, and annual_income_tax() has been deleted rather than
+    left beside it as a second, dead copy.
+
+    BASIS: the ANNUALISED projection, not year-to-date and not this
+    period's gross alone.
+
+      - Year-to-date alone under-detects for most of the year. A £150,000
+        earner is only £75,000 in by month 6, so months 1-8 would sail
+        through and be computed with a full allowance — precisely the
+        wrong-figure failure this guard exists to stop.
+      - This period's gross x periods-in-year over-detects for anyone who
+        started mid-year, and ignores pay already banked.
+      - annualise() is the projection the engine already uses as a gate
+        for the mirror-image question (is full-year pay set to land UNDER
+        the Personal Allowance — see analysis.analyse_payslip). Using the
+        same basis for both ends of the allowance keeps one definition of
+        "what this person is on course to earn".
+
+    annualise() over-projects on a one-off bonus period (it repeats this
+    period's gross across the periods remaining). That direction is the
+    safe one: it can refuse a payslip that would have calculated fine,
+    which costs a finding, and never accepts one that would calculate
+    wrongly, which would cost a wrong number. A missing finding is fine,
+    a wrong one is not.
+
+    SCOPE: only codes that actually grant an allowance. BR, D0, D1 and 0T
+    all carry free_pay_annual == 0, so there is no allowance to taper and
+    the banded arithmetic is already correct at any income — 0T on
+    £150,000 returns £53,703.00, exactly right. Refusing those would
+    refuse a calculation the engine gets right. K codes carry a negative
+    allowance and are already refused in parse_tax_code(), so they never
+    arrive here.
+    """
+
+    if facts.tax_code.free_pay_annual <= ZERO:
+        return
+
+    projected_annual = annualise(
+        facts.gross_this_period,
+        facts.gross_ytd,
+        facts.period_number,
+        facts.frequency,
+    )
+
+    if projected_annual > PERSONAL_ALLOWANCE_TAPER_START:
+        raise UnsupportedPayslip(
+            "This payslip is on course to earn more than £100,000 over the "
+            "tax year. Above £100,000 the Personal Allowance is gradually "
+            "taken away, and we do not yet work that out — so rather than "
+            "show you a tax figure that assumes an allowance you may not "
+            "have, we have not estimated one for this payslip."
+        )
+
+
 def income_tax_due(
     facts: PayPeriodFacts,
 ) -> Decimal:
@@ -1245,14 +1163,26 @@ def income_tax_due(
 
     Raises UnsupportedPayslip — never approximates — for anything outside
     MVP scope: Scottish/Welsh tax codes, K codes, an unparseable tax code,
-    an unsupported NI category, or an out-of-range period number. Callers
-    must treat that as "we cannot tell", not as zero or a hedged figure.
+    an unsupported NI category, an out-of-range period number, or pay on
+    course to exceed the £100,000 Personal Allowance taper threshold.
+    Callers must treat that as "we cannot tell", not as zero or a hedged
+    figure.
+
+    Being the single entry point is what makes the taper guard below
+    cover BOTH bases: cumulative_income_tax_due() dispatches to
+    non_cumulative_income_tax_due() for a W1/M1/X code, so neither can be
+    reached from the request path without passing through here first.
     """
 
     validate_pay_period_facts(facts)
 
     if facts.tax_code.kind == "NT":
+        # NT is exempt outright — no tax at any income — so the allowance,
+        # tapered or not, is irrelevant. Checked before the taper guard so
+        # a high-earning NT payslip is answered rather than refused.
         return ZERO
+
+    assert_allowance_not_tapered(facts)
 
     return cumulative_income_tax_due(facts)
 
