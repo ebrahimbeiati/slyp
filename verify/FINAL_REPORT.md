@@ -221,11 +221,24 @@ they get a pipeline that:
 - Uses a second `build_verdict` with a different signature (`findings.build_verdict(findings)`
   vs `analysis.build_verdict(findings, extract)`).
 
-So the codebase currently contains two response builders, two scorers and two verdict
-builders. One set has this week's fixes; the other does not, and is the one the docstring
-points a newcomer at. **My recommendation is to delete `build_analysis_result()`,
-`calculate_score()` and `findings.build_verdict()`** — but that is a real change to a
-2,708-line file five days out, so I have not touched it. Your call.
+So the codebase contained two response builders, two scorers and two verdict builders. One
+set had this week's fixes; the other did not, and was the one the docstring pointed a
+newcomer at.
+
+**DELETED on request** (commit `7e6165b`): `build_analysis_result()`, `calculate_score()`,
+`findings.build_verdict()` and its private `_finding_count_headline()` helper — 167 lines.
+Confirmed beforehand that the cluster was closed: `findings.build_verdict` was called only
+from `build_analysis_result`, `calculate_score` only from `build_analysis_result`, and
+`build_analysis_result` from nowhere. `analysis.build_verdict(findings, extract)` — the live
+one, different signature — is untouched and still resolves locally in `analysis.py`.
+A note at each deletion site records why, so they do not grow back.
+
+Re-verified after: all modules import, **283 tests pass**, the live four-fixture regression
+is **5/5**, and a re-run of this audit shows **no guard stranded by the deletion** (still 13
+guard-bearing functions, all reachable bar the `__post_init__` false positive). Two new dead
+private helpers appeared — `findings._is_not_a_payslip` and
+`findings._has_critical_unreadable_fields`, previously called only by the deleted builder.
+Neither holds a refusal. Left in place; flag if you want them gone too.
 
 ### Other orphans found (none holds a refusal)
 
@@ -235,7 +248,7 @@ points a newcomer at. **My recommendation is to delete `build_analysis_result()`
 | `analyse` | `analysis.py` | Harmless thin wrapper delegating to `analyse_payslip`; no divergent logic |
 | `any_unreadable` | `analysis.py` | One-line helper, unused |
 | `calculate_expected_net`, `calculate_from_values`, `explain_calculation` | `calculations.py` | Unused. `calculate_from_values` and `explain_calculation` do route through `income_tax_due`, so they inherit the new guard rather than bypassing it |
-| `run_self_checks` | `calculations.py` | **Already broken at `HEAD`, independently of any change here.** `python -m slyp.calculations` dies with `UnsupportedPayslip: K tax codes are outside the MVP: K475` — the self-checks expect `K475` to parse, but `parse_tax_code` refuses K codes. Verified pre-existing by stashing my changes and re-running. Either fix the expectation or delete the script; right now it is a green-looking entry point that always fails |
+| `run_self_checks` | `calculations.py` | **Already broken at `HEAD`, independently of any change here — and deliberately left that way.** `python -m slyp.calculations` dies with `UnsupportedPayslip: K tax codes are outside the MVP: K475` — the self-checks expect `K475` to parse, but `parse_tax_code` refuses K codes. Verified pre-existing by stashing all changes and re-running. It is not on the request path, nothing calls it, and `pytest` is the real suite (283 passing), so fixing it five days out buys nothing. **Known and accepted, not missed.** Either correct the expectation or delete the script after the 28th; until then, do not run it expecting a green tick |
 | `_looks_like_an_unambiguous_date`, `_sub` | `extraction.py` | False positives — passed as references (`skip_if=`, `pattern.sub()`), not called by name. Both live |
 | `grants_allowance`, `is_emergency_basis`, `net`, `total_deductions` | `types.py` | All `@property`, so accessed as attributes rather than called. Genuinely unreferenced, but harmless |
 
