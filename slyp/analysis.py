@@ -207,6 +207,33 @@ def analyse_payslip(
             cumulative_equivalent_tax_ytd=cumulative_equivalent_tax_ytd,
         )
 
+    except UnsupportedPayslip as exc:
+        # A typed refusal from the engine ("we know this case and we will
+        # not guess at it") is a different fact from a calculation that
+        # merely could not run, and it carries a reason worth reading.
+        # Folding it into calculation_error below would reduce it to the
+        # generic "We could not complete every calculation", which names
+        # nothing the user can act on - and the £100k Personal Allowance
+        # taper refusal (calculations.assert_allowance_not_tapered) has to
+        # reach the user as itself, not as a shrug.
+        #
+        # Same shape as the tax-year and tax-code refusals in steps 2 and
+        # 3 above, deliberately: every "outside what we support" answer
+        # leaves by the same door, with status="unsupported" and its own
+        # reason in failure_reason.
+        return AnalysisResult(
+            status="unsupported",
+            failure_reason=str(exc),
+            extract=extract,
+            verdict=Verdict(
+                headline="This payslip needs a manual check",
+                severity="action",
+            ),
+            findings=[],
+            projections=[],
+            score=None,
+        )
+
     except Exception as exc:
         calculation_error = str(exc)
 

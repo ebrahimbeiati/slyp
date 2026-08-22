@@ -339,3 +339,91 @@ def test_score_without_a_comparison_treats_every_calculated_check_as_not_run():
 
     assert score.checks_run == 2  # reconciliation + tax code
     assert len(score.not_applicable) == 2
+
+
+# --------------------------------------------------------------------------
+# £100,000 Personal Allowance taper, end to end  —  FR-04
+# --------------------------------------------------------------------------
+
+
+def _high_earner_extract(tax_code="1257L"):
+    """A CORRECT £150,000 payslip: £12,500/month at month 12, taxed exactly
+    as HMRC would with a fully tapered (zero) allowance.
+
+        20% of 37,700         =  7,540.00
+      + 40% of (125,140-37,700) = 34,976.00
+      + 45% of (150,000-125,140) = 11,187.00
+                                 ----------
+                                  53,703.00 for the year  ->  4,475.25/month
+
+    NI: 8% of (4,189-1,048) + 2% of (12,500-4,189) = 417.50.
+    """
+    gross = Decimal("12500.00")
+    income_tax = Decimal("4475.25")
+    national_insurance = Decimal("417.50")
+
+    return PayslipExtract(
+        source=Source(filename="t.pdf", pages=1, scanned_at=datetime.now(timezone.utc)),
+        period=Period(period_number=12, frequency="monthly", tax_year="2026/27"),
+        tax_code=TaxCodeRead(value=tax_code),
+        pay=Pay(gross_this_period=gross, gross_ytd=Decimal("150000.00")),
+        deductions=Deductions(
+            income_tax=income_tax,
+            national_insurance=national_insurance,
+            ni_category="A",
+        ),
+        net_pay=gross - income_tax - national_insurance,
+        reconciles=True,
+    )
+
+
+def test_the_150k_repro_returns_unsupported_not_a_finding():
+    """FR-04, verify/FINAL_REPORT.md.
+
+    This exact payslip used to return status="ok" with a verdict of "2
+    things to check", a score of 75, and an
+    income_tax_differs_from_calculation finding claiming £678.37 had been
+    under-deducted - on a payslip that is correct to the penny.
+
+    Named after the repro so it cannot be quietly retired.
+    """
+    result = analyse_payslip(_high_earner_extract())
+
+    assert result.status == "unsupported"
+    assert result.findings == []
+    assert result.score is None
+
+    # The user must be told the actual reason, not "we could not complete
+    # every calculation".
+    assert result.failure_reason is not None
+    assert "100,000" in result.failure_reason
+    assert "Personal Allowance" in result.failure_reason
+
+    # The specific wrong claim must be gone.
+    assert not any(
+        f.id == "income_tax_differs_from_calculation" for f in result.findings
+    )
+    assert "678.37" not in (result.failure_reason or "")
+
+
+def test_the_150k_repro_no_longer_produces_any_pound_figure():
+    """Rule 2, stated as a property rather than a finding id: a refusal
+    must not carry a number the user could act on."""
+    result = analyse_payslip(_high_earner_extract())
+
+    assert all(f.estimate is None for f in result.findings)
+
+
+def test_a_high_earner_on_a_zero_allowance_code_is_still_analysed():
+    """BR grants no allowance, so there is nothing to taper - refusing it
+    would refuse a payslip the engine handles correctly."""
+    result = analyse_payslip(_high_earner_extract(tax_code="BR"))
+
+    assert result.status == "ok"
+
+
+def test_an_ordinary_payslip_is_unaffected_by_the_taper_guard():
+    """The guard must not have narrowed what the engine will answer."""
+    result = analyse_payslip(_extract())
+
+    assert result.status == "ok"
