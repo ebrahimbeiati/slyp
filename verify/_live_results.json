@@ -1,0 +1,356 @@
+{
+ "emergency_only_job": {
+  "status": "ok",
+  "failure_reason": null,
+  "extract": {
+   "source": {
+    "filename": "p.pdf",
+    "pages": 1,
+    "scanned_at": "2026-08-22T18:06:33.221560Z"
+   },
+   "employer_name": "Northwind Trading Ltd",
+   "period": {
+    "pay_date": "2026-08-28",
+    "period_number": 5,
+    "frequency": "monthly",
+    "tax_year": "2026/27"
+   },
+   "tax_code": {
+    "value": "1257L M1"
+   },
+   "pay": {
+    "hourly_rate": null,
+    "hours": null,
+    "gross_this_period": "2500.00",
+    "gross_ytd": "7500.00"
+   },
+   "deductions": {
+    "income_tax": "290.50",
+    "income_tax_ytd": "871.50",
+    "national_insurance": "116.16",
+    "national_insurance_ytd": "348.48",
+    "ni_category": "A",
+    "pension_employee": "125.00",
+    "pension_employer": null,
+    "pension_percent": null,
+    "student_loan": null,
+    "student_loan_plan": null,
+    "other": []
+   },
+   "net_pay": "1968.34",
+   "confidence": {
+    "period.pay_date": 1.0,
+    "period.period_number": 1.0,
+    "period.frequency": 1.0,
+    "tax_code.value": 1.0,
+    "pay.gross_this_period": 1.0,
+    "pay.gross_ytd": 1.0,
+    "deductions.income_tax": 1.0,
+    "deductions.income_tax_ytd": 1.0,
+    "deductions.national_insurance": 1.0,
+    "deductions.national_insurance_ytd": 1.0,
+    "deductions.ni_category": 1.0,
+    "deductions.pension_employee": 1.0,
+    "net_pay": 1.0
+   },
+   "unreadable_fields": [],
+   "warnings": [
+    "Tax code is printed with the M1 marker.",
+    "Employee Pension YTD 375.00 is printed, but the schema has no employee pension YTD field.",
+    "could not resolve field path 'is_payslip' to a known field - dropped"
+   ],
+   "reconciles": true
+  },
+  "verdict": {
+   "headline": "1 thing worth checking",
+   "severity": "advisory"
+  },
+  "findings": [
+   {
+    "id": "tax_code_emergency_basis",
+    "severity": "advisory",
+    "title": "This payslip is using a non-cumulative tax code",
+    "explanation": "The payslip shows tax code 1257L M1. The W1, M1 or X suffix means tax is being calculated on a non-cumulative basis. This can happen when a tax code has recently changed or HMRC has not yet provided a cumulative code.",
+    "estimate": {
+     "label": "Possible overpayment so far this tax year",
+     "amount_gbp": "419.00",
+     "is_estimate": true
+    },
+    "next_step": "Check your latest tax code with HMRC, particularly if you have recently changed jobs.",
+    "projection_key": null,
+    "source_fields": [
+     "tax_code.value"
+    ]
+   }
+  ],
+  "projections": [],
+  "score": {
+   "value": 100,
+   "checks_passed": 4,
+   "checks_run": 4,
+   "movers": [],
+   "not_applicable": []
+  },
+  "is_example_data": false
+ },
+ "emergency_not_told": {
+  "status": "ok",
+  "failure_reason": null,
+  "extract": {
+   "source": {
+    "filename": "p.pdf",
+    "pages": 1,
+    "scanned_at": "2026-08-22T18:06:37.101140Z"
+   },
+   "employer_name": "Northwind Trading Ltd",
+   "period": {
+    "pay_date": "2026-08-28",
+    "period_number": 5,
+    "frequency": "monthly",
+    "tax_year": "2026/27"
+   },
+   "tax_code": {
+    "value": "1257L M1"
+   },
+   "pay": {
+    "hourly_rate": null,
+    "hours": null,
+    "gross_this_period": "2500.00",
+    "gross_ytd": "7500.00"
+   },
+   "deductions": {
+    "income_tax": "290.50",
+    "income_tax_ytd": "871.50",
+    "national_insurance": "116.16",
+    "national_insurance_ytd": "348.48",
+    "ni_category": "A",
+    "pension_employee": "125.00",
+    "pension_employer": null,
+    "pension_percent": null,
+    "student_loan": null,
+    "student_loan_plan": null,
+    "other": []
+   },
+   "net_pay": "1968.34",
+   "confidence": {
+    "period.pay_date": 1.0,
+    "period.period_number": 1.0,
+    "period.frequency": 1.0,
+    "tax_code.value": 1.0,
+    "pay.gross_this_period": 1.0,
+    "pay.gross_ytd": 1.0,
+    "deductions.income_tax": 1.0,
+    "deductions.income_tax_ytd": 1.0,
+    "deductions.national_insurance": 1.0,
+    "deductions.national_insurance_ytd": 1.0,
+    "deductions.ni_category": 1.0,
+    "deductions.pension_employee": 1.0,
+    "net_pay": 1.0
+   },
+   "unreadable_fields": [],
+   "warnings": [
+    "Tax code is printed as 1257L M1.",
+    "could not resolve field path 'is_payslip' to a known field - dropped"
+   ],
+   "reconciles": true
+  },
+  "verdict": {
+   "headline": "1 thing worth checking",
+   "severity": "advisory"
+  },
+  "findings": [
+   {
+    "id": "tax_code_emergency_basis",
+    "severity": "advisory",
+    "title": "This payslip is using a non-cumulative tax code",
+    "explanation": "The payslip shows tax code 1257L M1. The W1, M1 or X suffix means tax is being calculated on a non-cumulative basis. This can happen when a tax code has recently changed or HMRC has not yet provided a cumulative code. If this has been your only employment this tax year, this code may have deducted more tax by now than a cumulative code would have. If you have had other employment this tax year, this payslip cannot see it, and the figure below would not apply.",
+    "estimate": {
+     "label": "Possible overpayment, if this has been your only employment this tax year",
+     "amount_gbp": "419.00",
+     "is_estimate": true
+    },
+    "next_step": "Worth checking with HMRC \u2014 they can see your whole tax year, including any other employment.",
+    "projection_key": null,
+    "source_fields": [
+     "tax_code.value"
+    ]
+   }
+  ],
+  "projections": [],
+  "score": {
+   "value": 100,
+   "checks_passed": 4,
+   "checks_run": 4,
+   "movers": [],
+   "not_applicable": []
+  },
+  "is_example_data": false
+ },
+ "br_second_job": {
+  "status": "ok",
+  "failure_reason": null,
+  "extract": {
+   "source": {
+    "filename": "p.pdf",
+    "pages": 1,
+    "scanned_at": "2026-08-22T18:06:40.113591Z"
+   },
+   "employer_name": "Northwind Trading Ltd",
+   "period": {
+    "pay_date": "2026-08-28",
+    "period_number": 5,
+    "frequency": "monthly",
+    "tax_year": "2026/27"
+   },
+   "tax_code": {
+    "value": "BR"
+   },
+   "pay": {
+    "hourly_rate": null,
+    "hours": null,
+    "gross_this_period": "476.00",
+    "gross_ytd": "2380.00"
+   },
+   "deductions": {
+    "income_tax": "95.20",
+    "income_tax_ytd": "476.00",
+    "national_insurance": "0.00",
+    "national_insurance_ytd": "0.00",
+    "ni_category": "A",
+    "pension_employee": null,
+    "pension_employer": null,
+    "pension_percent": null,
+    "student_loan": null,
+    "student_loan_plan": null,
+    "other": []
+   },
+   "net_pay": "380.80",
+   "confidence": {
+    "period.pay_date": 1.0,
+    "period.period_number": 1.0,
+    "period.frequency": 1.0,
+    "tax_code.value": 1.0,
+    "pay.gross_this_period": 1.0,
+    "pay.gross_ytd": 1.0,
+    "deductions.income_tax": 1.0,
+    "deductions.income_tax_ytd": 1.0,
+    "deductions.national_insurance": 1.0,
+    "deductions.national_insurance_ytd": 1.0,
+    "deductions.ni_category": 1.0,
+    "net_pay": 1.0
+   },
+   "unreadable_fields": [],
+   "warnings": [
+    "Tax code BR is printed on the payslip.",
+    "could not resolve field path 'is_payslip' to a known field - dropped"
+   ],
+   "reconciles": true
+  },
+  "verdict": {
+   "headline": "Nothing obvious needs checking",
+   "severity": "clear"
+  },
+  "findings": [
+   {
+    "id": "tax_code_br_multiple_jobs",
+    "severity": "clear",
+    "title": "BR can be expected for a second job",
+    "explanation": "This job uses a BR tax code. That can be appropriate when your personal allowance is being used against income from another job.",
+    "estimate": null,
+    "next_step": null,
+    "projection_key": null,
+    "source_fields": [
+     "tax_code.value"
+    ]
+   }
+  ],
+  "projections": [],
+  "score": {
+   "value": 100,
+   "checks_passed": 3,
+   "checks_run": 3,
+   "movers": [],
+   "not_applicable": [
+    "Earnings were below the National Insurance threshold, so there was no NI to check."
+   ]
+  },
+  "is_example_data": false
+ },
+ "under_thresholds": {
+  "status": "ok",
+  "failure_reason": null,
+  "extract": {
+   "source": {
+    "filename": "p.pdf",
+    "pages": 1,
+    "scanned_at": "2026-08-22T18:06:43.036813Z"
+   },
+   "employer_name": "Northwind Trading Ltd",
+   "period": {
+    "pay_date": "2026-08-28",
+    "period_number": 5,
+    "frequency": "monthly",
+    "tax_year": "2026/27"
+   },
+   "tax_code": {
+    "value": "1257L"
+   },
+   "pay": {
+    "hourly_rate": null,
+    "hours": null,
+    "gross_this_period": "583.55",
+    "gross_ytd": "854.07"
+   },
+   "deductions": {
+    "income_tax": "0.00",
+    "income_tax_ytd": "0.00",
+    "national_insurance": "0.00",
+    "national_insurance_ytd": "0.00",
+    "ni_category": "A",
+    "pension_employee": null,
+    "pension_employer": null,
+    "pension_percent": null,
+    "student_loan": null,
+    "student_loan_plan": null,
+    "other": []
+   },
+   "net_pay": "583.55",
+   "confidence": {
+    "period.pay_date": 1.0,
+    "period.period_number": 1.0,
+    "period.frequency": 1.0,
+    "tax_code.value": 1.0,
+    "pay.gross_this_period": 1.0,
+    "pay.gross_ytd": 1.0,
+    "deductions.income_tax": 1.0,
+    "deductions.income_tax_ytd": 1.0,
+    "deductions.national_insurance": 1.0,
+    "deductions.national_insurance_ytd": 1.0,
+    "deductions.ni_category": 1.0,
+    "net_pay": 1.0
+   },
+   "unreadable_fields": [],
+   "warnings": [
+    "could not resolve field path 'is_payslip' to a known field - dropped"
+   ],
+   "reconciles": true
+  },
+  "verdict": {
+   "headline": "Nothing obvious needs checking",
+   "severity": "clear"
+  },
+  "findings": [],
+  "projections": [],
+  "score": {
+   "value": 100,
+   "checks_passed": 2,
+   "checks_run": 2,
+   "movers": [],
+   "not_applicable": [
+    "No income tax was due or deducted this period, so there was nothing to check against your tax code.",
+    "Earnings were below the National Insurance threshold, so there was no NI to check."
+   ]
+  },
+  "is_example_data": false
+ }
+}
