@@ -1280,59 +1280,17 @@ def generate_findings(
 
 
 # ============================================================================
-# Verdict
+# Verdict  —  deliberately absent
 # ============================================================================
-
-
-def build_verdict(findings: list[Finding]) -> Verdict:
-    """
-    Convert findings into the headline shown at the top of the UI.
-    """
-
-    if not findings:
-        return Verdict(
-            headline="Nothing obvious to check on this payslip",
-            severity="clear",
-        )
-
-    action_count = sum(1 for finding in findings if finding.severity == "action")
-
-    advisory_count = sum(1 for finding in findings if finding.severity == "advisory")
-
-    if action_count:
-        return Verdict(
-            headline=_finding_count_headline(
-                action_count,
-                "thing to check",
-            ),
-            severity="action",
-        )
-
-    if advisory_count:
-        return Verdict(
-            headline=_finding_count_headline(
-                advisory_count,
-                "thing worth checking",
-            ),
-            severity="advisory",
-        )
-
-    return Verdict(
-        headline="Your payslip looks clear",
-        severity="clear",
-    )
-
-
-def _finding_count_headline(
-    count: int,
-    singular: str,
-) -> str:
-    if count == 1:
-        return f"1 {singular} on this payslip"
-
-    plural = singular.replace("thing", "things")
-
-    return f"{count} {plural} on this payslip"
+#
+# build_verdict() and its _finding_count_headline() helper used to live
+# here, reachable only from build_analysis_result() below (also gone).
+# The live verdict builder is analysis.build_verdict(findings, extract) -
+# note the different signature: it takes the extract too.
+#
+# Two verdict builders, two scorers and two response builders coexisted in
+# this repo, one set carrying this week's fixes and the other not. See the
+# note in the "Score / response builder" section below.
 
 
 # ============================================================================
@@ -2408,157 +2366,32 @@ def _check_missing_fields(
 
 
 # ============================================================================
-# Score
+# Score / response builder  —  deliberately absent
 # ============================================================================
-
-
-def calculate_score(
-    findings: list[Finding],
-) -> tuple[int, int, int, list[str]]:
-    """
-    Produce the simple MOT-style score.
-
-    Returns:
-
-        score,
-        checks_passed,
-        checks_run,
-        movers
-
-    This is intentionally deterministic.
-    """
-
-    checks_run = len(findings)
-
-    if checks_run == 0:
-        return 100, 0, 0, []
-
-    action_count = sum(1 for finding in findings if finding.severity == "action")
-
-    advisory_count = sum(1 for finding in findings if finding.severity == "advisory")
-
-    clear_count = sum(1 for finding in findings if finding.severity == "clear")
-
-    checks_passed = clear_count
-
-    # Advisory findings reduce confidence but are not treated as a failure.
-    penalty = action_count * 25 + advisory_count * 10
-
-    score = max(
-        0,
-        min(
-            100,
-            100 - penalty,
-        ),
-    )
-
-    movers: list[str] = []
-
-    for finding in findings:
-        if finding.severity in {"action", "advisory"}:
-            movers.append(finding.title)
-
-    return (
-        score,
-        checks_passed,
-        checks_run,
-        movers[:5],
-    )
-
-
-# ============================================================================
-# Complete AnalysisResult builder
-# ============================================================================
-
-
-def build_analysis_result(
-    extract: PayslipExtract,
-    user_context: Optional[UserContext] = None,
-    comparison: Optional[CalculationComparison] = None,
-) -> AnalysisResult:
-    """
-    Build the complete response expected by the frontend.
-
-    This is the main function the API route can call after extraction and
-    calculation have completed.
-    """
-
-    if not extract:
-        return AnalysisResult(
-            status="unreadable",
-            failure_reason=(
-                "We could not read this payslip. Please upload a clearer "
-                "PDF or enter the figures manually."
-            ),
-        )
-
-    # ----------------------------------------------------------------------
-    # Hard extraction failure
-    # ----------------------------------------------------------------------
-
-    if _is_not_a_payslip(extract):
-        return AnalysisResult(
-            status="not_a_payslip",
-            failure_reason=(
-                "This document does not contain enough payslip information "
-                "to analyse it."
-            ),
-            extract=extract,
-        )
-
-    # ----------------------------------------------------------------------
-    # Generate findings
-    # ----------------------------------------------------------------------
-
-    findings = generate_findings(
-        extract=extract,
-        user_context=user_context,
-        comparison=comparison,
-    )
-
-    # ----------------------------------------------------------------------
-    # Verdict
-    # ----------------------------------------------------------------------
-
-    verdict = build_verdict(findings)
-
-    # ----------------------------------------------------------------------
-    # Score
-    # ----------------------------------------------------------------------
-
-    score_value, checks_passed, checks_run, movers = calculate_score(findings)
-
-    # ----------------------------------------------------------------------
-    # Determine status
-    # ----------------------------------------------------------------------
-
-    if _has_critical_unreadable_fields(extract):
-        status = "unreadable"
-
-        failure_reason = (
-            "Some essential payslip figures could not be read confidently. "
-            "We have not guessed them."
-        )
-    else:
-        status = "ok"
-        failure_reason = None
-
-    from .contract import Score
-
-    return AnalysisResult(
-        status=status,
-        failure_reason=failure_reason,
-        extract=extract,
-        verdict=verdict,
-        findings=findings,
-        projections=[],
-        score=Score(
-            value=score_value,
-            checks_passed=checks_passed,
-            checks_run=checks_run,
-            movers=movers,
-        ),
-    )
+#
+# calculate_score() and build_analysis_result() used to live here. Both are
+# gone, and this note is here so they do not come back.
+#
+# build_analysis_result() was a COMPLETE parallel response builder with no
+# callers, whose docstring said "This is the main function the API route
+# can call after extraction and calculation have completed." It was not:
+# main.py calls analysis.analyse_payslip(). Anyone who believed that
+# docstring got a pipeline that
+#
+#   - scored with calculate_score(), which returned 100 when there were no
+#     findings at all - exactly the bug commit d391c24 ("Stop counting a
+#     check with nothing to check as a check that passed") fixed on the
+#     live path. analysis.build_score() returns value=None there instead,
+#     because "we checked nothing" is not a perfect score;
+#   - never called validate_tax_year(), so the tax-year guard did not run;
+#   - never called the calculation engine at all - it took `comparison` as
+#     a PARAMETER - so income_tax_due() and the £100k Personal Allowance
+#     taper guard were unreachable.
+#
+# The live path is: main.py -> analysis.analyse_payslip() -> this module's
+# generate_findings(), then analysis.build_verdict() and
+# analysis.build_score(). There is one of each again. Keep it that way: a
+# second copy is where fixes go to not get applied.
 
 
 # ============================================================================
