@@ -144,7 +144,6 @@ export default function HomePage() {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [showHomeWarning, setShowHomeWarning] = useState(false);
-  const [premiumFeature, setPremiumFeature] = useState<string | null>(null);
   const [copyLabel, setCopyLabel] = useState("Copy for payroll");
   // Set when we found a saved result this build cannot trust. Shown
   // instead of the empty state, so a discarded result is visible rather
@@ -449,13 +448,6 @@ export default function HomePage() {
                 <span className="w-1.5 h-1.5 rounded-full bg-[#FFAE34]" />
                 Home
               </button>
-              <button
-                type="button"
-                onClick={() => setPremiumFeature("insights")}
-                className="text-[var(--sage)] text-xs font-bold uppercase tracking-wider cursor-pointer hover:text-[var(--ink)] transition-colors border-0 bg-transparent focus:outline-none mt-2.5"
-              >
-                Insights
-              </button>
             </div>
 
             {/* ── Sheet backdrop ── */}
@@ -496,37 +488,6 @@ export default function HomePage() {
               </div>
             )}
 
-            {/* ── Premium modal ── */}
-            {premiumFeature && (
-              <div className="absolute inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-5 z-50 animate-fadeIn">
-                <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl p-5 flex flex-col text-left font-mono">
-                  <div className="text-[var(--amber)] text-sm font-bold uppercase tracking-wider mb-3">🔒 Premium Feature</div>
-                  <h3 className="text-white text-xs font-bold mb-3">Historical Pay Trend Analytics</h3>
-                  <ul className="text-[var(--sage)] text-[11px] list-none p-0 m-0 flex flex-col gap-2 mb-6 font-normal">
-                    <li>• Historic timeline graphing</li>
-                    <li>• Tax year reconciliations</li>
-                    <li>• Multi-job aggregate tracking</li>
-                    <li>• Tax refund estimator</li>
-                  </ul>
-                  <div className="flex flex-col gap-2">
-                    <button
-                      type="button"
-                      onClick={() => alert("Sandbox: payment processing not active.")}
-                      className="w-full py-2.5 bg-[var(--amber)] text-black font-bold rounded-xl text-[11px] uppercase tracking-wider border-0 cursor-pointer active:scale-95 transition-transform"
-                    >
-                      Upgrade for £2.99/mo
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setPremiumFeature(null)}
-                      className="w-full py-2.5 bg-[var(--surface)] border border-[var(--border)] text-[var(--sage)] hover:text-[var(--ink)] font-semibold rounded-xl text-[11px] uppercase tracking-wider cursor-pointer transition-colors"
-                    >
-                      Back to dashboard
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
       )}
     </PrototypeScaffold>

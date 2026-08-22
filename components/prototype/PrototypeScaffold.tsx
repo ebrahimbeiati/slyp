@@ -58,9 +58,6 @@ export function PrototypeScaffold({ step, nextHref, backHref, children }: Scaffo
             <Link href="/" className={`px-4 py-2 rounded-3xl text-xs font-bold transition-colors bg-[#FFAE34] hover:bg-[#E59A2B] text-black font-bold" : "text-gray-400 hover:text-[var(--ink)]"}`}>
               First payslip
             </Link>
-            <Link href="#" onClick={(e) => { e.preventDefault(); alert("🔒 Premium Tier\n\nMulti-payslip timelines require an upgraded active subscription."); }} className="px-4 py-1.5 rounded-full text-xs font-medium text-gray-500 hover:text-[var(--amber)]">
-              After 4 payslips
-            </Link>
           </div>
           
           {/* Native Inline Mode Toggle Button Trigger */}
