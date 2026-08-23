@@ -293,6 +293,27 @@ export default function HomePage() {
                     (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
                   );
 
+                  // Split by severity at the list level - the cards
+                  // themselves are unchanged.
+                  //
+                  // A CLEAR finding is a reassurance, not something found.
+                  // Rendering both under one "What we found" heading put a
+                  // card directly beneath a verdict reading "Nothing
+                  // obvious needs checking", which contradicts itself at a
+                  // glance. The BR second-job payslip does exactly that:
+                  // its only finding is CLEAR ("BR can be expected for a
+                  // second job").
+                  //
+                  // Each group renders only if it has something in it, so
+                  // neither heading can appear empty, and a result that is
+                  // entirely CLEAR shows "What we confirmed" alone.
+                  const foundFindings = sortedFindings.filter(
+                    (finding) => finding.severity !== "clear",
+                  );
+                  const confirmedFindings = sortedFindings.filter(
+                    (finding) => finding.severity === "clear",
+                  );
+
                   return (
                     <>
                       {/* Header */}
@@ -390,13 +411,27 @@ export default function HomePage() {
                         </div>
                       )}
 
-                      {/* Findings */}
-                      {sortedFindings.length > 0 && (
+                      {/* Findings worth acting on: action and advisory. */}
+                      {foundFindings.length > 0 && (
                         <div className="w-full mb-4">
                           <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
                             What we found
                           </div>
-                          {sortedFindings.map((finding) => (
+                          {foundFindings.map((finding) => (
+                            <FindingCard key={finding.id} finding={finding} />
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Reassurances: CLEAR findings. Rendered after the
+                          section above, and absent entirely when there are
+                          none. */}
+                      {confirmedFindings.length > 0 && (
+                        <div className="w-full mb-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
+                            What we confirmed
+                          </div>
+                          {confirmedFindings.map((finding) => (
                             <FindingCard key={finding.id} finding={finding} />
                           ))}
                         </div>
