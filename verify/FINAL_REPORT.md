@@ -174,6 +174,57 @@ boundary itself) · `..._exactly_at_the_threshold_still_calculates` (£100,000 i
 
 ---
 
+## Deployment: what is ready, and what is still yours to do
+
+FR-01's config half is done; the deploy itself needs your accounts. Target chosen: **Railway
+for the API, Vercel for the frontend.**
+
+### Written and verified
+
+| Artefact | What it does | Verified how |
+|---|---|---|
+| `Dockerfile` | Builds the API only — deps, `main.py`, `slyp/`. Explicit because this repo has `package.json` and `requirements.txt` at the root, and auto-detection picks Node, builds the frontend and never starts the API | Reviewed; **not built** — no Docker on this machine. Flagged below |
+| `.dockerignore` | Keeps `.env`, the frontend, tests and `verify/` out of the image | Reviewed |
+| `railway.json` | Pins the Dockerfile builder; `/health` check with a 300s timeout, generous because FR-06's blocking I/O can stall `/health` for ~2.3s mid-upload | Reviewed |
+| `main.py` startup guard | Refuses to boot without the selected provider's key (FR-03) | **Executed both ways** — no key → `RuntimeError` naming the variable; key present → boots |
+| `next.config.ts` build guard | Throws on a hosted build with no `NEXT_PUBLIC_API_BASE_URL`; rejects a trailing slash (FR-02) | **Executed four ways** — local build passes; `VERCEL=1` without the var fails with the explanation; with it, builds and bakes in the real URL; trailing slash rejected |
+| `BACKEND_HANDOFF.md` | Every variable, the deploy order, a verification script, known issues | The file the brief's item 43 referred to, which did not exist |
+
+Re-verified after all of it: **283 Python tests**, **20 frontend tests**, `tsc` clean, clean
+production build, server starts, and the demo fixture still returns **£419.00, 4/4** end to
+end over HTTP.
+
+### Still yours — I cannot do these
+
+No deployment CLI is installed here (no `vercel`, `railway`, `flyctl`, `docker`, `gh`), and
+these need your accounts:
+
+1. **Railway** → deploy from `ebrahimbeiati/slyp`, branch `demo-ready`; set
+   `SLYP_MODEL_PROVIDER`, `SLYP_EXTRACTION_MODEL`, `OPENAI_API_KEY`, `SLYP_CORS_ORIGINS`;
+   generate a domain.
+2. **Vercel** → same repo and branch; set `NEXT_PUBLIC_API_BASE_URL` to the Railway domain;
+   deploy.
+3. Put the Vercel domain into Railway's `SLYP_CORS_ORIGINS` and **redeploy the API** (it
+   reads that at import time).
+4. Run the verification script in `BACKEND_HANDOFF.md` against both URLs.
+
+Order matters and is circular by nature: API → its domain into the frontend → the frontend's
+domain into CORS → redeploy the API.
+
+### The risk I want named before you start
+
+**The Dockerfile has never been built.** There is no Docker on this machine, so Railway's
+first build is its first real test. It is deliberately minimal and every dependency ships
+manylinux wheels for CPython 3.12, but *do this today, not on the 27th* — a first-build
+failure is calm to fix with five days in hand and not calm to fix with five minutes.
+
+Once both services are up, these currently-UNVERIFIED items become checkable and are worth
+actually running: item 37 (cold start after 30+ min idle), item 44 (CORS, upload size and
+timeout **against production**), item 45 (the full path in a browser against production),
+and item 5 (deployed commit equals `HEAD`).
+
+---
+
 ## Stranded-guard audit — has any other refusal been left on a dead path?
 
 **Nothing fixed here. Reporting only, as asked.**
@@ -292,9 +343,9 @@ The three architectural rules, judged: **Rule 1 proved. Rule 3 proved. Rule 2 di
 
 | ID | Sev | Component | What's wrong | Evidence | Suggested fix |
 |----|-----|-----------|--------------|----------|---------------|
-| **FR-01** | **P0** | Deployment | Nothing is deployed and no deployment configuration exists. No `vercel.json` / Dockerfile / Procfile / `.github` / `BACKEND_HANDOFF.md`. `README.md` is untouched `create-next-app` boilerplate. Every deployed-URL check in Phases 6–7 is therefore UNVERIFIED. | `find` for all deploy configs → 0 hits. `ls BACKEND_HANDOFF.md` → no such file. `grep -niE 'deploy|vercel|render' README.md` → only create-next-app boilerplate. | Decide now whether 28 Aug is a laptop demo or a hosted one. If hosted, deploy and re-run FR-02/FR-03 checks **today**, not on the day. |
-| **FR-02** | **P0**¹ | `lib/Api.ts` + build | `NEXT_PUBLIC_API_BASE_URL` is inlined at **build** time. The production build in `.next/` right now has `http://localhost:8000` baked into a shipped chunk. Deployed as-is, every visitor's browser calls `localhost:8000` — which fails, and on an HTTPS page is additionally blocked as mixed content. Setting the var in a platform's *runtime* env does nothing. | `grep -rlo 'localhost:8000' .next/static/chunks/` → `43g6cwpgel_pj.js`. `lib/Api.ts:8`. | Set `NEXT_PUBLIC_API_BASE_URL` in the build environment and **rebuild**. Verify with `grep -rl 'localhost:8000' .next/static/` returning nothing before shipping. |
-| **FR-03** | **P0**¹ | `slyp/extraction.py`, `main.py` | Two env vars fail **silently and look identical to a healthy server**. (a) `SLYP_MODEL_PROVIDER` unset defaults to `anthropic`/`claude-sonnet-5`; `anthropic.Anthropic()` constructs fine with no key, so the process starts, `/health` returns 200, and the **first upload** dies as a generic 500. (b) `SLYP_CORS_ORIGINS` defaults to `http://localhost:3000`; unset on a real domain, every request is CORS-blocked and the UI says "Couldn't reach the server." | `env -u SLYP_MODEL_PROVIDER python -c 'from slyp import extraction'` → `provider defaults to: anthropic`, anthropic client constructs with no key. CORS preflight from an unlisted origin → `400`, no `access-control-allow-origin`. `extraction.py:789`, `main.py:83`. | Contrast: `SLYP_MODEL_PROVIDER=openai` **without** `SLYP_EXTRACTION_MODEL` correctly fails loudly at import. Do the same for the rest — validate `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` presence and a non-default `SLYP_CORS_ORIGINS` at startup, so a misconfigured deploy refuses to boot instead of dying on stage. |
+| **FR-01** | **P0** → config **DONE**, deploy **PENDING** | Deployment | Nothing was deployed and no deployment configuration existed. No `vercel.json` / Dockerfile / Procfile / `.github` / `BACKEND_HANDOFF.md`. `README.md` is untouched `create-next-app` boilerplate. Every deployed-URL check in Phases 6–7 is therefore UNVERIFIED. | `find` for all deploy configs → 0 hits. `ls BACKEND_HANDOFF.md` → no such file. `grep -niE 'deploy|vercel|render' README.md` → only create-next-app boilerplate. | **Config now written** (Railway + Vercel): `Dockerfile`, `.dockerignore`, `railway.json`, `BACKEND_HANDOFF.md`. **Nothing is deployed yet** — that needs your Railway and Vercel accounts. See *Deployment: what is ready* below. |
+| **FR-02** | ~~P0~~ **FIXED** | `lib/Api.ts` + build | `NEXT_PUBLIC_API_BASE_URL` is inlined at **build** time. The production build in `.next/` right now has `http://localhost:8000` baked into a shipped chunk. Deployed as-is, every visitor's browser calls `localhost:8000` — which fails, and on an HTTPS page is additionally blocked as mixed content. Setting the var in a platform's *runtime* env does nothing. | `grep -rlo 'localhost:8000' .next/static/chunks/` → `43g6cwpgel_pj.js`. `lib/Api.ts:8`. | `next.config.ts` now **throws** on a hosted build (`VERCEL`/`CI` set) when the variable is absent, and rejects a trailing slash. Local builds unaffected. Verified all three ways; with the variable set, the real URL is baked in and `localhost:8000` is gone from the bundle. |
+| **FR-03** | ~~P0~~ **FIXED** | `slyp/extraction.py`, `main.py` | Two env vars fail **silently and look identical to a healthy server**. (a) `SLYP_MODEL_PROVIDER` unset defaults to `anthropic`/`claude-sonnet-5`; `anthropic.Anthropic()` constructs fine with no key, so the process starts, `/health` returns 200, and the **first upload** dies as a generic 500. (b) `SLYP_CORS_ORIGINS` defaults to `http://localhost:3000`; unset on a real domain, every request is CORS-blocked and the UI says "Couldn't reach the server." | `env -u SLYP_MODEL_PROVIDER python -c 'from slyp import extraction'` → `provider defaults to: anthropic`, anthropic client constructs with no key. CORS preflight from an unlisted origin → `400`, no `access-control-allow-origin`. `extraction.py:789`, `main.py:83`. | `main.py` now **refuses to boot** without the selected provider's key, naming the variable, and logs a startup warning when `SLYP_CORS_ORIGINS` is unset. Verified both ways: no key → `RuntimeError`, key present → boots. The check is in `main.py` not `extraction.py` because the test suite imports the latter. |
 | **FR-04** | ~~P1~~ **FIXED** | `slyp/calculations.py` | **The £100k personal-allowance taper gap was open.** `income_tax_due()` — the single live entry point — applies the full £12,570 allowance above £100k instead of refusing. `validate_pay_period_facts()` has no income check. The only refusal lives in `annual_income_tax()`, which has **zero callers anywhere** (dead code). Directly disproves Rule 2. | `verify/final_rule2_checks.py`: `annual_income_tax(150000)` → REFUSED; `income_tax_due(facts)` → **returned £5,153.62**, `non_cumulative_income_tax_due` → £2,290.50, no refusal. End-to-end: a fully correct £150,000 payslip yields "2 things to check", score 75, and an `income_tax_differs_from_calculation` finding claiming **£678.37** under-deducted. | **Fixed on request** — guard moved onto the live entry point, dead copy deleted, 16 tests added. See *FR-04: fix applied* below. |
 | **FR-05** | ~~P1~~ **FIXED** | `app/page.tsx`, `components/prototype/PrototypeScaffold.tsx` | A **fake paywall shipped in the production build**. "Insights" — one of only two bottom-nav buttons on the results screen — opened a "🔒 Premium Feature / Historical Pay Trend Analytics / **Upgrade for £2.99/mo**" modal whose button fired `alert("Sandbox: payment processing not active.")`. The scaffold's "After 4 payslips" tab fired `alert("🔒 Premium Tier … requires an upgraded active subscription")`. | Strings `Premium Tier`, `Premium Feature`, `Multi-payslip timelines require an upgraded active subscription` all found in `.next/static/chunks/`. Served HTML at `http://localhost:3000/` contained `After 4 payslips`. `app/page.tsx:454,500-528`; `PrototypeScaffold.tsx:61`. | **Removed on request** — see *Fix applied* below. Remaining prototype chrome ("← Back / Next →", the `href="#"` dead link on `/upload`, the phone bezel) is **not** part of the paywall and was deliberately left alone; it is now tracked as **FR-19**. |
 | **FR-19** | P2 | `components/prototype/PrototypeScaffold.tsx` | Prototype navigation chrome still renders in the production build: a "← Back / Next →" footer outside the phone bezel, where `Next →` on `/upload` is a dead `href="#"`; a now-single-item "First payslip" segmented control; and the mock phone frame itself. Split out of FR-05, which covered the paywall. | Served HTML contains `First payslip`, `Next →`, `← Back`. `PrototypeScaffold.tsx:50-92`; `app/upload/page.tsx:94` passes `nextHref="#"`. Separately, the `First payslip` link's `className` contains a flattened, broken ternary — the literal text `" : "text-gray-400 hover:text-[var(--ink)]"}` ends up inside the class attribute. | Not a correctness or privacy issue, and not a paywall — but it is prototype scaffolding on a screen judges will look at. Decide deliberately before the 28th rather than shipping it by default. |
@@ -312,8 +363,9 @@ The three architectural rules, judged: **Rule 1 proved. Rule 3 proved. Rule 2 di
 | FR-17 | P2 | `slyp/analysis.py:170-208` | An exception raised *after* `calculate_pay_breakdown()` succeeds (e.g. from `annualise()` or `cumulative_tax_due_to_date()`) is swallowed into `calculation_error`, but because `breakdown is not None` the `calculation_unavailable` finding is **never added**. The user is told nothing. | Code path: `except Exception as exc: calculation_error = str(exc)` at :205, then `if breakdown is not None:` at :210 takes the branch that ignores `calculation_error`. | Degrades safely today (the dependent findings gate themselves off a `None` comparison, so no wrong number is produced) — but it is a silent swallow. Add the `calculation_unavailable` finding whenever `calculation_error` is set, regardless of `breakdown`. |
 | FR-18 | P2 | `slyp/findings.py` `_check_net_pay` | `estimate.amount_gbp` is not quantised to 2dp on the net-pay finding — the API emits `678.3700`. Displays correctly (the UI's `gbp()` clamps to 2dp) but violates the codebase's own Decimal-money discipline. | FR-04 repro: `Difference from calculated net pay = GBP 678.3700`. | Wrap in `money()` like every other figure. |
 
-¹ FR-02 and FR-03 are P0 **conditional on deploying**. If 28 August is a laptop demo run from
-this machine, they are inert — but then FR-01 is the thing to decide, and to decide now.
+FR-02 and FR-03 were P0 conditional on deploying; both are now fixed, so deploying is safe
+to attempt. FR-01 remains open until the services actually exist — see *Deployment: what is
+ready* below.
 
 ---
 
