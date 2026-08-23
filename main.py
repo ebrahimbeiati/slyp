@@ -66,10 +66,54 @@ from slyp.extraction import (
     RedactionFailure,
     UnreadableDocument,
     extract_payslip,
+    required_credential_name,
 )
 
 logger = logging.getLogger("slyp.api")
 logging.basicConfig(level=logging.INFO)
+
+
+# ==========================================================================
+# Startup configuration check
+# ==========================================================================
+#
+# Refuse to boot rather than boot healthy and die on the first upload.
+#
+# The failure this prevents, seen during verification: with
+# SLYP_MODEL_PROVIDER unset, the provider silently defaults to
+# "anthropic", anthropic.Anthropic() constructs happily with no API key at
+# all, the process starts, /health returns 200 - and the first real upload
+# comes back as a generic 500. On a deployed instance that is
+# indistinguishable from a healthy server until someone tries it, which on
+# a demo day means finding out on stage.
+#
+# Deliberately here and not in slyp/extraction.py: that module is imported
+# by the test suite, which has no business holding a real API key. Nothing
+# imports main.py except the server.
+
+_CREDENTIAL_VAR = required_credential_name()
+
+if not os.environ.get(_CREDENTIAL_VAR, "").strip():
+    raise RuntimeError(
+        f"{_CREDENTIAL_VAR} is not set. The extraction provider is "
+        f"'{os.environ.get('SLYP_MODEL_PROVIDER', 'anthropic')}', which needs "
+        f"that variable. Set it in the platform's environment config (or in "
+        f".env for local development) and start again. Refusing to start "
+        f"rather than accept uploads this process cannot actually analyse."
+    )
+
+# Not a hard failure - localhost is the correct value in local development,
+# and there is no reliable way to tell a real deployment from a laptop
+# without inventing another variable to get wrong. Logged loudly instead,
+# because a CORS list still pointing at localhost on a deployed instance
+# blocks every browser request and surfaces in the UI as "Couldn't reach
+# the server" - which reads exactly like a dead backend.
+if os.environ.get("SLYP_CORS_ORIGINS") is None:
+    logger.warning(
+        "SLYP_CORS_ORIGINS is not set; allowing only http://localhost:3000. "
+        "If this is a deployed instance, set it to the frontend's real "
+        "origin or every browser request will be blocked."
+    )
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB - generous for a payslip PDF
 _PDF_MAGIC = b"%PDF-"

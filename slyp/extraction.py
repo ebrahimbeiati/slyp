@@ -811,6 +811,24 @@ else:
             "SLYP_MODEL_PROVIDER=openai."
         )
 
+def required_credential_name() -> str:
+    """
+    The environment variable that must hold an API key for whichever
+    provider SLYP_MODEL_PROVIDER selected.
+
+    Exists so the API layer can refuse to start without one, rather than
+    booting healthy and failing on the first upload. Deliberately derived
+    from the resolved _MODEL_PROVIDER above rather than re-reading the
+    environment, so the two can never disagree about which provider is in
+    play - which is the whole failure mode being guarded against.
+
+    The check itself is NOT made here, at import time: this module is
+    imported by the test suite, which has no reason to hold a real key.
+    main.py owns the refusal. See there.
+    """
+    return "OPENAI_API_KEY" if _MODEL_PROVIDER == "openai" else "ANTHROPIC_API_KEY"
+
+
 logger = logging.getLogger(__name__)
 
 # Learned on the first call and reused for the rest of the process - see
