@@ -225,7 +225,12 @@ export default function HomePage() {
         <div className="basis-screen active relative pb-14 h-full flex flex-col justify-between text-[var(--ink)] font-sans select-none">
             {/* ── Empty state ── */}
             {!hasData ? (
-              <div className="flex flex-col flex-1 animate-fadeIn">
+              /* overflow-y-auto, like the results branch below: the phone
+                 frame is a fixed aspect-[9/19] box with overflow-hidden,
+                 so anything taller than it is clipped outright rather
+                 than scrolled. Opening a glossary card is exactly that
+                 case. */
+              <div className="flex flex-col flex-1 overflow-y-auto custom-scrollbar pr-1 animate-fadeIn">
                 <div className="flex justify-between items-center mb-6 mt-2 shrink-0">
                   <div className="text-left">
                     <div className="text-gray-400 text-xs font-normal tracking-wide">Welcome</div>
@@ -280,7 +285,7 @@ export default function HomePage() {
               </div>
             ) : result!.status !== "ok" ? (
               /* ── Could not analyse this payslip ── */
-              <div className="flex flex-col flex-1 animate-fadeIn">
+              <div className="flex flex-col flex-1 overflow-y-auto custom-scrollbar pr-1 animate-fadeIn">
                 <div className="flex justify-between items-center w-full my-4 shrink-0">
                   <Link href="/upload" className="text-[var(--sage)] text-base font-bold hover:text-[var(--ink)] transition-colors">
                     ‹

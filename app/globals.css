@@ -35,6 +35,29 @@
   --warn: #FF9466;
 }
 
+/* Applied to every scrolling screen inside the phone frame. It was
+   referenced on the results screen but never actually defined, so those
+   screens fell back to the platform's default scrollbar - a wide light
+   bar down the inside edge of a rounded dark frame.
+
+   Kept visible rather than hidden on purpose: the frame is a fixed-height
+   box, so on a long result the only cue that there is more below is the
+   bar itself. */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sage) transparent;
+}
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: var(--sage);
+  border-radius: 3px;
+}
+
 @layer base {
   body {
     @apply bg-[var(--bg-deep)] text-[var(--ink)] antialiased transition-colors duration-300;
