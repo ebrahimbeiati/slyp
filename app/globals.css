@@ -8,16 +8,31 @@
   --sage: #475569;
   --amber: #EA580C;
   --border: rgba(0, 0, 0, 0.08);
+  --mint: #047857;
+  --warn: #C2410C;
 }
 
+/* Dark is the default (see PrototypeScaffold) and therefore what a
+   projector will show. --ink and --sage were #00FF66 and a 60%-alpha
+   green: bright terminal green on dark green, which is the hardest thing
+   in this palette to read at distance. Restored to the off-white and
+   muted sage the design prototype specifies, which the surface colours
+   below were chosen against in the first place - those three were
+   already byte-identical to it.
+
+   --mint and --warn are new: severity colours that were previously
+   hardcoded as hex literals at each use site. #FF9466 is exactly what
+   SEVERITY_STYLES already used for an action finding. */
 .dark {
   --bg-deep: #0E1613;
   --surface: #17221D;
   --surface-2: #1D2A24;
-  --ink: #00FF66;
-  --sage: rgba(0, 255, 102, 0.6);
+  --ink: #F3F6F2;
+  --sage: #8CA097;
   --amber: #FFB648;
-  --border: rgba(0, 255, 102, 0.15);
+  --border: rgba(243, 246, 242, 0.08);
+  --mint: #6EE7A8;
+  --warn: #FF9466;
 }
 
 @layer base {
