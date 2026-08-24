@@ -185,10 +185,24 @@ export default function UploadPage() {
                     Upload PDF payslip
                   </div>
                   <div className="text-[var(--ink)] text-[10px] text-center px-2 leading-relaxed opacity-60">
-                    Select a digital PDF. Nothing personal leaves this device
-                    unredacted, and the file itself is never stored.
+                    PDF only, up to 10MB. A digital payslip, not a photo or a
+                    scan.
                   </div>
                 </button>
+
+                {/* Says what actually happens, which the previous wording
+                    did not: "nothing personal leaves this device
+                    unredacted" described an on-device pipeline this
+                    product does not have. The PDF is uploaded and read on
+                    the server; redaction happens there, before the model
+                    call. The accurate version is the stronger claim
+                    anyway, and it is the one that survives a judge opening
+                    the network tab. */}
+                <p className="text-[var(--sage)] text-[10px] leading-relaxed mt-3 px-1">
+                  🔒 Your name, address, NI number and bank details are removed
+                  on our server before any of it reaches the AI. The file is
+                  never saved, and the result stays on this device.
+                </p>
               </div>
             </div>
           ) : (
