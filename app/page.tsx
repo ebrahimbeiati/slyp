@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
+import { AccordionCard } from "@/components/AccordionCard";
 import type { AnalysisResult, Finding, PayslipExtract, Score, Severity } from "@/app/Types/Types";
 import { buildPayrollMessage } from "@/lib/payrollMessage";
 import { decodeStoredResult, STORAGE_KEY } from "@/lib/storedResult";
@@ -55,30 +56,60 @@ function GatedMoney({
   return <>{gbp(value)}</>;
 }
 
-function FindingCard({ finding }: { finding: Finding }) {
+/**
+ * One finding, collapsible.
+ *
+ * What stays visible when collapsed is chosen deliberately: the severity
+ * chip, the title, and the estimate. The estimate especially - it is the
+ * single number this product exists to surface, and putting the only
+ * pound figure on the screen behind a tap would be a strange thing to do
+ * to it. The explanation and the next step are the detail, and those are
+ * what the tap reveals.
+ *
+ * Severity styling, wording and ordering are unchanged from the flat
+ * version; this only adds the fold.
+ */
+function FindingCard({
+  finding,
+  defaultOpen = false,
+}: {
+  finding: Finding;
+  defaultOpen?: boolean;
+}) {
   const style = SEVERITY_STYLES[finding.severity];
   return (
-    <div className={`w-full bg-[var(--surface-2)] border ${style.border} rounded-2xl p-4 mb-3`}>
-      <div className="flex items-start gap-3">
-        <div
-          className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${style.badge}`}
-        >
-          {finding.severity}
+    <AccordionCard
+      borderClass={style.border}
+      defaultOpen={defaultOpen}
+      header={
+        <div className="flex items-start gap-3">
+          <div
+            className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${style.badge}`}
+          >
+            {finding.severity}
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-[var(--ink)] text-xs font-bold leading-tight">
+              {finding.title}
+            </h3>
+            {finding.estimate && (
+              <div className="mt-1.5 text-[11px] font-bold text-[var(--ink)]">
+                {finding.estimate.label}: {gbp(finding.estimate.amount_gbp)}
+              </div>
+            )}
+          </div>
         </div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-[var(--ink)] text-xs font-bold leading-tight mb-1">{finding.title}</h3>
-          <p className="text-[var(--sage)] text-[10px] leading-relaxed">{finding.explanation}</p>
-          {finding.estimate && (
-            <div className="mt-2 text-[11px] font-bold text-[var(--ink)]">
-              {finding.estimate.label}: {gbp(finding.estimate.amount_gbp)}
-            </div>
-          )}
-          {finding.next_step && (
-            <p className="text-[var(--sage)] text-[10px] mt-2 opacity-80">→ {finding.next_step}</p>
-          )}
-        </div>
-      </div>
-    </div>
+      }
+    >
+      <p className="text-[var(--sage)] text-[10px] leading-relaxed">
+        {finding.explanation}
+      </p>
+      {finding.next_step && (
+        <p className="text-[var(--sage)] text-[10px] mt-2 opacity-80">
+          → {finding.next_step}
+        </p>
+      )}
+    </AccordionCard>
   );
 }
 
@@ -417,8 +448,12 @@ export default function HomePage() {
                           <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
                             What we found
                           </div>
-                          {foundFindings.map((finding) => (
-                            <FindingCard key={finding.id} finding={finding} />
+                          {foundFindings.map((finding, index) => (
+                            <FindingCard
+                              key={finding.id}
+                              finding={finding}
+                              defaultOpen={index === 0}
+                            />
                           ))}
                         </div>
                       )}
@@ -431,8 +466,12 @@ export default function HomePage() {
                           <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
                             What we confirmed
                           </div>
-                          {confirmedFindings.map((finding) => (
-                            <FindingCard key={finding.id} finding={finding} />
+                          {confirmedFindings.map((finding, index) => (
+                            <FindingCard
+                              key={finding.id}
+                              finding={finding}
+                              defaultOpen={index === 0}
+                            />
                           ))}
                         </div>
                       )}
