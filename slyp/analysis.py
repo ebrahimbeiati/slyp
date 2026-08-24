@@ -724,46 +724,12 @@ def is_unreadable(
     return field_name in extract.unreadable_fields
 
 
-def any_unreadable(
-    extract: PayslipExtract,
-    field_names: list[str],
-) -> bool:
-
-    return any(field_name in extract.unreadable_fields for field_name in field_names)
-
-
 # ============================================================================
 # Optional convenience API
 # ============================================================================
 
 
-def analyse(
-    extract: PayslipExtract,
-    only_job: Optional[bool] = None,
-) -> AnalysisResult:
-    """
-    Small convenience wrapper for the API layer.
-
-    Example:
-
-        result = analyse(
-            extract,
-            only_job=True,
-        )
-    """
-
-    context = UserContext(
-        only_job=only_job,
-    )
-
-    return analyse_payslip(
-        extract=extract,
-        user_context=context,
-    )
-
-
 __all__ = [
-    "analyse",
     "analyse_payslip",
     "validate_extract",
     "build_verdict",

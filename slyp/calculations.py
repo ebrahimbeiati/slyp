@@ -1372,37 +1372,6 @@ def calculate_pay_breakdown(
 # ============================================================================
 
 
-def calculate_expected_net(
-    facts: PayPeriodFacts,
-    pension_employee: Decimal = ZERO,
-) -> Decimal:
-    """
-    Calculate expected net pay.
-
-    Pension is supplied separately because the engine cannot safely infer
-    pension treatment from gross pay alone.
-    """
-
-    breakdown = calculate_pay_breakdown(facts)
-
-    pension = money(pension_employee)
-
-    net = (
-        breakdown.gross
-        - breakdown.income_tax
-        - breakdown.national_insurance
-        - breakdown.student_loan
-        - pension
-    )
-
-    return money(
-        max(
-            ZERO,
-            net,
-        )
-    )
-
-
 # ============================================================================
 # RECONCILIATION
 # ============================================================================
@@ -1542,39 +1511,6 @@ def calculate_from_values(
 # ============================================================================
 # DEBUG / DEVELOPMENT HELPERS
 # ============================================================================
-
-
-def explain_calculation(
-    facts: PayPeriodFacts,
-) -> dict[str, Decimal | str]:
-    """
-    Return a machine-readable calculation summary.
-
-    Useful for development and tests.
-
-    Do NOT expose this directly to users as financial advice.
-    """
-
-    breakdown = calculate_pay_breakdown(facts)
-
-    return {
-        "tax_year": TAX_YEAR,
-        "frequency": facts.frequency,
-        "period_number": facts.period_number,
-        "tax_code": facts.tax_code.raw,
-        "gross_this_period": breakdown.gross,
-        "gross_ytd": facts.gross_ytd,
-        "income_tax": breakdown.income_tax,
-        "national_insurance": breakdown.national_insurance,
-        "student_loan": breakdown.student_loan,
-        "pension_employee": breakdown.pension_employee,
-        "net_before_pension": (
-            breakdown.gross
-            - breakdown.income_tax
-            - breakdown.national_insurance
-            - breakdown.student_loan
-        ),
-    }
 
 
 # ============================================================================

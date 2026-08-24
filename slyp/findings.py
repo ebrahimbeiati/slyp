@@ -2415,51 +2415,6 @@ def _any_unreadable(
     return any(field in unreadable for field in fields)
 
 
-def _has_critical_unreadable_fields(
-    extract: PayslipExtract,
-) -> bool:
-    """
-    Fields required for a meaningful payslip analysis.
-    """
-
-    critical = {
-        "pay.gross_this_period",
-        "deductions.income_tax",
-        "deductions.national_insurance",
-        "net_pay",
-        "tax_code.value",
-    }
-
-    unreadable = set(extract.unreadable_fields)
-
-    return bool(critical.intersection(unreadable))
-
-
-def _is_not_a_payslip(
-    extract: PayslipExtract,
-) -> bool:
-    """
-    Conservative check.
-
-    We only say "not a payslip" when essentially none of the core payslip
-    fields are available.
-
-    We do NOT reject a document merely because one field is missing.
-    """
-
-    core_values = [
-        extract.pay.gross_this_period,
-        extract.deductions.income_tax,
-        extract.deductions.national_insurance,
-        extract.net_pay,
-        extract.tax_code.value,
-    ]
-
-    available = sum(1 for value in core_values if value is not None)
-
-    return available == 0
-
-
 # ============================================================================
 # Convenience adapter
 # ============================================================================
