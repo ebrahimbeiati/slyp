@@ -177,3 +177,6 @@ vite.config.ts.timestamp-*
 .vite/
 
 
+
+# tsc output from verify/tsconfig.preview.json (see verify/final_payroll_preview.test.tsx)
+verify/.tsbuild/

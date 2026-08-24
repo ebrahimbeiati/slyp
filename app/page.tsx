@@ -5,6 +5,7 @@ import Link from "next/link";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
 import { AccordionCard } from "@/components/AccordionCard";
 import { Glossary } from "@/components/Glossary";
+import { PayrollPreview } from "@/components/PayrollPreview";
 import type { AnalysisResult, Finding, PayslipExtract, Score, Severity } from "@/app/Types/Types";
 import { buildPayrollMessage } from "@/lib/payrollMessage";
 import { decodeStoredResult, STORAGE_KEY } from "@/lib/storedResult";
@@ -176,7 +177,11 @@ export default function HomePage() {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [showHomeWarning, setShowHomeWarning] = useState(false);
-  const [copyLabel, setCopyLabel] = useState("Copy for payroll");
+  // The payroll message is shown before it is copied, so the user can read
+  // what they are about to send. Only whether the panel is open lives here
+  // - the message itself is derived from `result` at render time, so
+  // opening and closing the panel cannot change what is underneath.
+  const [previewOpen, setPreviewOpen] = useState(false);
   // Set when we found a saved result this build cannot trust. Shown
   // instead of the empty state, so a discarded result is visible rather
   // than looking like "you never uploaded anything".
@@ -207,21 +212,11 @@ export default function HomePage() {
     setShowHomeWarning(false);
   };
 
-  const handleCopyToPayroll = async () => {
-    if (!result) return;
-    const message = buildPayrollMessage(result);
-    try {
-      await navigator.clipboard.writeText(message);
-      setCopyLabel("Copied");
-    } catch {
-      setCopyLabel("Couldn't copy");
-    }
-    setTimeout(() => setCopyLabel("Copy for payroll"), 2000);
-  };
 
   return (
     <PrototypeScaffold step={hasData ? 1 : 0} nextHref="/upload">
       {() => (
+        <>
         <div className="basis-screen active relative pb-14 h-full flex flex-col justify-between text-[var(--ink)] font-sans select-none">
             {/* ── Empty state ── */}
             {!hasData ? (
@@ -507,13 +502,15 @@ export default function HomePage() {
                         </div>
                       )}
 
-                      {/* Copy to payroll */}
+                      {/* Opens the preview. Deliberately does not copy:
+                          the message goes to the user's employer, so they
+                          get to read it first. */}
                       <button
                         type="button"
-                        onClick={handleCopyToPayroll}
+                        onClick={() => setPreviewOpen(true)}
                         className="w-full py-3 mb-4 bg-[var(--surface-2)] border border-[var(--border)] text-[var(--ink)] text-xs font-bold rounded-xl uppercase tracking-wider hover:border-[#FFAE34]/40 transition-colors cursor-pointer"
                       >
-                        {copyLabel}
+                        Message for payroll
                       </button>
                     </>
                   );
@@ -574,6 +571,19 @@ export default function HomePage() {
             )}
 
           </div>
+
+        {/* Portalled to document.body, so it escapes the phone frame -
+            which is max-w-sm and overflow-hidden - and is laid out
+            against the viewport instead. Written last and rendered as a
+            sibling of the screen, so opening and closing it cannot
+            remount or reorder anything underneath. */}
+        {previewOpen && result && result.status === "ok" && (
+          <PayrollPreview
+            message={buildPayrollMessage(result)}
+            onClose={() => setPreviewOpen(false)}
+          />
+        )}
+        </>
       )}
     </PrototypeScaffold>
   );
