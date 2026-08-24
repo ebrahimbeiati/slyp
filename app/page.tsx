@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PrototypeScaffold } from "@/components/prototype/PrototypeScaffold";
 import { AccordionCard } from "@/components/AccordionCard";
+import { Glossary } from "@/components/Glossary";
 import type { AnalysisResult, Finding, PayslipExtract, Score, Severity } from "@/app/Types/Types";
 import { buildPayrollMessage } from "@/lib/payrollMessage";
 import { decodeStoredResult, STORAGE_KEY } from "@/lib/storedResult";
@@ -271,6 +272,11 @@ export default function HomePage() {
                     Scan payslip
                   </Link>
                 </div>
+
+                {/* Something worth reading before the first upload, so
+                    the empty state is not just a button. Static prose -
+                    no figure here is computed or derived from a payslip. */}
+                <Glossary />
               </div>
             ) : result!.status !== "ok" ? (
               /* ── Could not analyse this payslip ── */
