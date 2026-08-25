@@ -167,7 +167,14 @@ export default function UploadPage() {
               </div>
 
               {error && (
-                <div className="w-full bg-[#2a1f0e] border border-[#FFAE34]/40 rounded-xl px-3 py-2.5 text-[11px] text-[#FFAE34] mb-4">
+                /* font-sans, because the scaffold root sets font-mono and
+                   these messages inherit it. Monospace is ~20% wider per
+                   character, which on a 360px phone turned a four-sentence
+                   error into eight lines of amber text. app/page.tsx
+                   already sets font-sans on its screen; this matches it.
+                   Figures stay monospace elsewhere - it is prose that
+                   suffers. */
+                <div className="w-full bg-[#2a1f0e] border border-[#FFAE34]/40 rounded-xl px-3 py-2.5 text-[11px] leading-relaxed font-sans text-[#FFAE34] mb-4">
                   ⚠️ {error}
                 </div>
               )}
