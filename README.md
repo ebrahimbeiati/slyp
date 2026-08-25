@@ -187,8 +187,25 @@ repository.
 
 - **UK only**, and within the UK, England and Northern Ireland rates only.
 - **One tax year**, 2026/27. Anything else is refused rather than approximated.
-- **Text-layer PDFs only.** There is no OCR, so a scanned or photographed
-  payslip is rejected with a message asking for a digital one.
+- **Text-layer PDFs only.** There is no OCR. A PDF with no text layer at all
+  is caught in `_read_pdf` before redaction, the safety gate or the model call,
+  so it costs no model round trip and is rejected in a few milliseconds with a
+  message explaining that we do not read images yet.
+
+  The partial case is not caught. A scan whose letterhead carries a text layer
+  while the payslip body is an image has non-empty text, so it passes that check
+  and is sent to the model, which then reports it cannot find the fields. The
+  signal that would catch it already exists in the pipeline: the proportion of
+  lines the allowlist filter keeps. Measured against the four fixtures, a real
+  payslip keeps 9 or more lines and 73–82% of them, while a letterhead-only
+  scan, OCR garbage and a stray-figure document each keep zero or one. Checking
+  that between the filter and the gate would cost nothing and reuse tested code.
+
+  It has not shipped because the threshold has only ever been measured against
+  synthetic documents. A false positive means refusing a real payslip with a
+  message saying it has no text when it plainly does, which is a much worse
+  outcome than one wasted model call — so this waits for measurements against
+  real payslips rather than fixtures we wrote ourselves.
 - **One payslip at a time.** There is no concept of multiple jobs combined, and
   no history — the contract carries a single analysis, and the browser stores
   only the most recent one.
