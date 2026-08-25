@@ -1766,8 +1766,8 @@ def _check_missing_fields(
                     "we could read confidently. We have not guessed it."
                 ),
                 next_step=(
-                    "Enter the gross pay manually or upload a clearer "
-                    "version of the payslip."
+                    "Check the gross-pay figure on the payslip yourself, "
+                    "or try a clearer copy of it."
                 ),
                 source_fields=["pay.gross_this_period"],
             )
@@ -1788,8 +1788,8 @@ def _check_missing_fields(
                     "from this payslip, so we have not estimated it."
                 ),
                 next_step=(
-                    "Enter the income tax deduction manually or upload a "
-                    "clearer payslip."
+                    "Check the income tax figure on the payslip yourself, or "
+                    "try a clearer copy of it."
                 ),
                 source_fields=["deductions.income_tax"],
             )
@@ -1810,8 +1810,8 @@ def _check_missing_fields(
                     "read confidently. We have not guessed the amount."
                 ),
                 next_step=(
-                    "Enter the National Insurance deduction manually or "
-                    "upload a clearer payslip."
+                    "Check the National Insurance figure on the payslip "
+                    "yourself, or try a clearer copy of it."
                 ),
                 source_fields=["deductions.national_insurance"],
             )
@@ -1832,7 +1832,8 @@ def _check_missing_fields(
                     "the payslip."
                 ),
                 next_step=(
-                    "Enter the net pay manually or upload a clearer " "payslip."
+                    "Check the net-pay figure on the payslip yourself, or try "
+                    "a clearer copy of it."
                 ),
                 source_fields=["net_pay"],
             )
@@ -1854,7 +1855,8 @@ def _check_missing_fields(
                     "guessed it."
                 ),
                 next_step=(
-                    "Enter the tax code manually or upload a clearer " "payslip."
+                    "Check the tax code on the payslip yourself, or try a "
+                    "clearer copy of it."
                 ),
                 source_fields=["tax_code.value"],
             )

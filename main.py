@@ -269,8 +269,11 @@ async def analyse(request: Request) -> AnalysisResult:
             logger.info("analyse failed: password-protected PDF in %.3fs", _elapsed())
             return _clean_error(
                 422,
-                "This PDF is password-protected. Please remove the "
-                "password and try again.",
+                "This PDF is password-protected, so we can't open it. "
+                "Payroll providers often lock them with your date of "
+                "birth or National Insurance number. To remove it, open "
+                "the PDF with the password, then use Print and choose "
+                "\"Save as PDF\" - upload that copy instead.",
             )
         logger.info("analyse failed: corrupt/malformed PDF in %.3fs", _elapsed())
         return _clean_error(
@@ -295,9 +298,11 @@ async def analyse(request: Request) -> AnalysisResult:
         logger.info("analyse failed: no text layer in %.3fs", _elapsed())
         return _clean_error(
             422,
-            "We couldn't read any text from this PDF. If it's a scanned "
-            "image, try a version with selectable text, or enter the "
-            "details manually.",
+            "This PDF has no selectable text - it's a picture of a "
+            "payslip rather than a document, which usually means it's a "
+            "scan or an image export. We can't read images yet, so "
+            "there's nothing here we can check. A PDF downloaded straight "
+            "from your payroll system will normally work.",
         )
 
     except NotAPayslip:
@@ -321,8 +326,10 @@ async def analyse(request: Request) -> AnalysisResult:
         )
         return _clean_error(
             422,
-            "We couldn't safely process this document. Please try a "
-            "different file or enter the details manually.",
+            "We stopped before sending this document on, because we "
+            "couldn't be certain we'd removed everything personal from "
+            "it. Nothing was sent. This can happen with an unusual "
+            "layout - a different payslip may go through.",
         )
 
     except Exception as exc:
