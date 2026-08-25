@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    has_previous_employment_line,
     RedactionFailure,
     RedactionMap,
     _cap_ambiguous_field_confidence,
@@ -1472,3 +1473,46 @@ def _fake_openai_response():
     message = type("msg", (), {"tool_calls": [tool_call]})()
     choice = type("choice", (), {"message": message})()
     return type("response", (), {"choices": [choice]})()
+
+
+# --------------------------------------------------------------------------
+# Previous-employment YTD detection
+# --------------------------------------------------------------------------
+#
+# Decides whether the allowance-used figure may be shown at all, so it is
+# read in code from the document's own labels rather than asked of the
+# model - see analysis.build_allowance_usage().
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Previous Employment 5,000.00",
+        "Previous Employer Pay 5,000.00",
+        "Prev Employment 5,000.00",
+        "Prev. Employer 5,000.00",
+        "Pay from previous employment 5,000.00",
+        "Previous Pay 5,000.00",
+        "Previous Taxable Pay 5,000.00",
+        "P45 Pay 5,000.00",
+        "Brought Forward 5,000.00",
+        "B/Fwd 5,000.00",
+        "Taxable Pay in Previous Employment 5,000.00",
+    ],
+)
+def test_previous_employment_line_is_detected(line):
+    assert has_previous_employment_line(line) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Gross Pay YTD 7,500.00",
+        "Total Gross Pay 2,500.00",
+        "This Employment 7,500.00",
+        "Employment Type Permanent",
+        "Previous address on file",
+    ],
+)
+def test_ordinary_payslip_lines_are_not_mistaken_for_it(line):
+    assert has_previous_employment_line(line) is False

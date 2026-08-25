@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Optional
 
 from .contract import (
+    AllowanceUsage,
     AnalysisResult,
     Finding,
     PayslipExtract,
@@ -16,6 +17,7 @@ from .contract import (
 )
 
 from .calculations import (
+    allowance_used_to_date,
     annualise,
     calculate_pay_breakdown,
     cumulative_tax_due_to_date,
@@ -303,6 +305,21 @@ def analyse_payslip(
     # 8. Build final response
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 8. Personal Allowance used to date
+    # ------------------------------------------------------------------
+    #
+    # Reached only on the "ok" path. Every earlier return - unreadable,
+    # unsupported tax year, unsupported tax code, the £100k taper - leaves
+    # allowance_usage at its None default, which is what those cases
+    # should show.
+
+    allowance_usage = build_allowance_usage(extract, tax_code, context)
+
+    # ------------------------------------------------------------------
+    # 9. Build final response
+    # ------------------------------------------------------------------
+
     return AnalysisResult(
         status="ok",
         failure_reason=None,
@@ -311,6 +328,7 @@ def analyse_payslip(
         findings=findings,
         projections=[],
         score=score,
+        allowance_usage=allowance_usage,
     )
 
 
@@ -456,6 +474,76 @@ def _facts_from_extract(
 # ============================================================================
 # Verdict
 # ============================================================================
+
+
+def build_allowance_usage(
+    extract: PayslipExtract,
+    tax_code,
+    user_context: UserContext,
+) -> Optional[AllowanceUsage]:
+    """
+    The Personal-Allowance-used figure, or None.
+
+    None is the expected answer. Every guard below suppresses it entirely
+    rather than hedging it, because unlike the emergency-code estimate
+    this is not framed as "possible, check with HMRC" - it is a plain
+    statement of fact about the user's own tax position, and it would be
+    acted on. A hedged version of a number someone acts on is worse than
+    no number.
+
+    The guards, in order:
+
+    1. The user has not confirmed this is their only employment this tax
+       year. Year-to-date figures on a payslip cover THIS employment only,
+       so for anyone with a previous employer the figure is understated by
+       whatever they earned there. `only_job is not True` covers both
+       "yes, I had another job" and "not sure" / never asked - there is no
+       conditional branch here on purpose.
+    2. The payslip itself shows a previous-employment YTD line. Direct
+       documentary evidence that the YTD column is not the whole year, and
+       it overrides the user's answer: someone who joined in July may well
+       consider this their only job now.
+    3. The tax code grants no allowance (BR, D0, D1, 0T). Nothing to track.
+    4. Any input failed the confidence gate, or is simply absent.
+
+    Refusals - Scottish and Welsh codes, K codes, the GBP 100k taper, an
+    unsupported tax year - never reach this function: analyse_payslip
+    returns early with status "unsupported" before findings are built, and
+    allowance_usage defaults to None on that path.
+    """
+    if user_context.only_job is not True:
+        return None
+
+    if extract.previous_employment_ytd_present:
+        return None
+
+    if tax_code.free_pay_annual <= ZERO:
+        return None
+
+    for field in ("pay.gross_ytd", "tax_code.value", "period.period_number"):
+        if field in extract.unreadable_fields:
+            return None
+
+    gross_ytd = extract.pay.gross_ytd
+    if gross_ytd is None or extract.period.period_number is None:
+        return None
+
+    used = allowance_used_to_date(gross_ytd, tax_code)
+    allowance = tax_code.free_pay_annual
+
+    # Bounded wording. States what has happened, never what is left to
+    # earn - "you have GBP 5,070 left to earn tax-free" invites a decision
+    # about future hours, which is a projection this figure is not.
+    statement = (
+        f"You've used £{used:,.2f} of your £{allowance:,.2f} tax-free "
+        f"allowance this year."
+    )
+
+    return AllowanceUsage(
+        used_gbp=used,
+        allowance_gbp=allowance,
+        statement=statement,
+    )
 
 
 def build_verdict(
@@ -731,6 +819,7 @@ def is_unreadable(
 
 __all__ = [
     "analyse_payslip",
+    "build_allowance_usage",
     "validate_extract",
     "build_verdict",
     "build_score",

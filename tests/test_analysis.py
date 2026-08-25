@@ -27,6 +27,7 @@ from slyp.contract import (
     PayslipExtract,
     Source,
     TaxCodeRead,
+    UserContext,
 )
 
 TAX_CODE = parse_tax_code("1257L")
@@ -427,3 +428,144 @@ def test_an_ordinary_payslip_is_unaffected_by_the_taper_guard():
     result = analyse_payslip(_extract())
 
     assert result.status == "ok"
+
+
+# --------------------------------------------------------------------------
+# Personal Allowance used to date
+# --------------------------------------------------------------------------
+#
+# Gated harder than anything else in the result. The emergency-code estimate
+# is framed as "possible, check with HMRC"; this is a flat statement about
+# the user's own tax position, and it would be acted on. So it is shown on
+# exactly one branch and suppressed everywhere else, with no hedged variant.
+
+
+def _allowance_extract(
+    *,
+    tax_code="1257L",
+    gross_ytd=Decimal("7500.00"),
+    unreadable=None,
+    previous_employment=False,
+    period_number=5,
+):
+    return PayslipExtract(
+        source=Source(filename="t.pdf", pages=1, scanned_at=datetime.now(timezone.utc)),
+        period=Period(period_number=period_number, frequency="monthly",
+                      tax_year="2026/27"),
+        tax_code=TaxCodeRead(value=tax_code),
+        pay=Pay(gross_this_period=Decimal("2500.00"), gross_ytd=gross_ytd),
+        deductions=Deductions(
+            income_tax=Decimal("290.50"),
+            national_insurance=Decimal("116.16"),
+            ni_category="A",
+        ),
+        net_pay=Decimal("2093.34"),
+        unreadable_fields=unreadable or [],
+        previous_employment_ytd_present=previous_employment,
+    )
+
+
+def test_allowance_used_worked_example_7500_of_12570():
+    """The worked example, pinned by name.
+
+    1257L grants GBP 12,570 for the year. Year-to-date gross on this
+    employment is GBP 7,500, which is below the allowance, so all GBP 7,500
+    of it has been covered by the allowance:
+
+        used = min(7,500.00, 12,570.00) = 7,500.00
+
+    Hand-checked. If the wording or the arithmetic moves, this fails.
+    """
+    result = analyse_payslip(_allowance_extract(), UserContext(only_job=True))
+
+    usage = result.allowance_usage
+    assert usage is not None
+    assert usage.used_gbp == Decimal("7500.00")
+    assert usage.allowance_gbp == Decimal("12570")
+    assert usage.statement == (
+        "You've used £7,500.00 of your £12,570.00 tax-free allowance this year."
+    )
+    # It must not talk about what is left, or about the rest of the year.
+    for forbidden in ("left", "remaining", "by April", "you can still", "before you"):
+        assert forbidden not in usage.statement.lower()
+
+
+def test_allowance_used_is_capped_at_the_allowance():
+    """Earnings above the allowance have used all of it, not more than it."""
+    result = analyse_payslip(
+        _allowance_extract(gross_ytd=Decimal("20000.00")),
+        UserContext(only_job=True),
+    )
+    assert result.allowance_usage is not None
+    assert result.allowance_usage.used_gbp == Decimal("12570")
+
+
+def test_allowance_suppressed_when_there_is_other_employment():
+    """Answered yes to another job. YTD covers this employment only, so the
+    figure would be understated by whatever they earned elsewhere."""
+    result = analyse_payslip(_allowance_extract(), UserContext(only_job=False))
+    assert result.allowance_usage is None
+
+
+def test_allowance_suppressed_when_the_question_was_not_answered():
+    """'Not sure', or never asked. No hedged variant - suppressed outright."""
+    assert analyse_payslip(
+        _allowance_extract(), UserContext(only_job=None)
+    ).allowance_usage is None
+    assert analyse_payslip(_allowance_extract()).allowance_usage is None
+
+
+@pytest.mark.parametrize("tax_code", ["BR", "D0", "D1", "0T"])
+def test_allowance_suppressed_for_codes_granting_no_allowance(tax_code):
+    """Nothing to track: these codes grant no Personal Allowance here."""
+    result = analyse_payslip(
+        _allowance_extract(tax_code=tax_code), UserContext(only_job=True)
+    )
+    assert result.allowance_usage is None
+
+
+@pytest.mark.parametrize(
+    "field", ["pay.gross_ytd", "tax_code.value", "period.period_number"]
+)
+def test_allowance_suppressed_when_an_input_failed_the_confidence_gate(field):
+    result = analyse_payslip(
+        _allowance_extract(unreadable=[field]), UserContext(only_job=True)
+    )
+    assert result.allowance_usage is None
+
+
+def test_allowance_suppressed_when_the_payslip_shows_previous_employment():
+    """Documentary evidence beats the user's answer. Someone who joined in
+    July may well consider this their only job now, but the YTD column
+    still is not the whole tax year."""
+    result = analyse_payslip(
+        _allowance_extract(previous_employment=True), UserContext(only_job=True)
+    )
+    assert result.allowance_usage is None
+
+
+def test_allowance_suppressed_on_a_refused_tax_year():
+    extract = _allowance_extract()
+    extract.period.tax_year = "2025/26"
+    result = analyse_payslip(extract, UserContext(only_job=True))
+    assert result.status == "unsupported"
+    assert result.allowance_usage is None
+
+
+@pytest.mark.parametrize("tax_code", ["S1257L", "C1257L", "K475"])
+def test_allowance_suppressed_on_a_refused_tax_code(tax_code):
+    result = analyse_payslip(
+        _allowance_extract(tax_code=tax_code), UserContext(only_job=True)
+    )
+    assert result.status == "unsupported"
+    assert result.allowance_usage is None
+
+
+def test_allowance_suppressed_above_the_taper_threshold():
+    """The GBP 100k refusal returns before the allowance figure is built."""
+    extract = _allowance_extract(gross_ytd=Decimal("150000.00"))
+    extract.pay.gross_this_period = Decimal("12500.00")
+    extract.period.period_number = 12
+    result = analyse_payslip(extract, UserContext(only_job=True))
+    assert result.status == "unsupported"
+    assert result.allowance_usage is None

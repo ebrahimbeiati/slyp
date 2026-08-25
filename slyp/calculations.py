@@ -1150,6 +1150,35 @@ def assert_allowance_not_tapered(
         )
 
 
+def allowance_used_to_date(
+    gross_ytd: Decimal,
+    tax_code: TaxCode,
+) -> Decimal:
+    """
+    How much of the ANNUAL Personal Allowance this employment's pay has
+    used so far: year-to-date gross, capped at the allowance the code
+    grants. You cannot use more allowance than you have.
+
+    Deliberately the annual view, not the cumulative-to-date grant. Under
+    cumulative PAYE the allowance is released in slices - by month 5 a
+    1257L code has granted 5/12 of GBP 12,570 - and tax is due on anything
+    above that slice. This function answers a different and simpler
+    question: of the year's whole allowance, how much have these earnings
+    consumed. That is the figure that matters at year end, it needs no
+    period number to state, and it cannot drift with the pay pattern.
+
+    Pure arithmetic on two numbers the payslip carries. Says nothing about
+    what happens by April: whether the caller may show it at all is
+    analysis.build_allowance_usage()'s decision, not this function's.
+    """
+    allowance = tax_code.free_pay_annual
+
+    if allowance <= ZERO:
+        return ZERO
+
+    return money(min(non_negative(gross_ytd), allowance))
+
+
 def income_tax_due(
     facts: PayPeriodFacts,
 ) -> Decimal:

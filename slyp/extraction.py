@@ -1194,6 +1194,34 @@ def infer_frequency_from_label(text: str) -> Optional[Frequency]:
 # recognises. A code failing this doesn't raise - it just means
 # tax_code.value goes into unreadable_fields like any other suspect
 # field, per "a missing field is fine, a wrong field is not."
+# A previous-employment year-to-date line: the P45 carry-forward a payroll
+# system prints when someone joined part-way through the tax year. Its
+# presence means this payslip's YTD column is NOT the whole tax year, which
+# is decisive for the allowance-used figure (see
+# analysis.build_allowance_usage) - direct documentary evidence beats
+# whatever the user answered about other employment.
+#
+# Read in code rather than asked of the model, for the same reason
+# reconciles and tax_year are: it decides whether a figure is shown at all,
+# so it must be deterministic. Matched against the REDACTED text before the
+# allowlist filter runs, because a bare "Previous Employment" header
+# carrying no currency amount would be dropped by the allowlist - and the
+# header alone is still evidence.
+_PREVIOUS_EMPLOYMENT_RE = re.compile(
+    r"(?i)\b("
+    r"previous\s+employ(?:ment|er)|prev\.?\s+employ(?:ment|er)|"
+    r"pay\s+from\s+previous|previous\s+pay|previous\s+taxable\s+pay|"
+    r"p45|brought\s+forward|b/?fwd|"
+    r"(?:gross|taxable\s+pay|tax)\s+(?:in\s+)?previous\s+employment"
+    r")\b"
+)
+
+
+def has_previous_employment_line(text: str) -> bool:
+    """True when the payslip shows a previous-employment YTD carry-forward."""
+    return _PREVIOUS_EMPLOYMENT_RE.search(text) is not None
+
+
 _TAX_CODE_RE = re.compile(
     r"^[SC]?\d{1,4}[LMNPTY](?:\s?(?:W1|M1|X))?$"
     r"|^[SC]?(?:BR|D0|D1|0T|NT)(?:\s?(?:W1|M1|X))?$"
@@ -1561,6 +1589,13 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     # employer_name never reaches the model - the allowlist drops that
     # line outright (no currency, date or known label on it) - so it's
     # captured separately during redact() and applied here instead.
+    # From the redacted text, not the filtered payload: a bare "Previous
+    # Employment" header carries no currency amount and the allowlist would
+    # drop it, but the header alone is still evidence that this payslip's
+    # YTD column does not cover the whole tax year.
+    extract_dict["previous_employment_ytd_present"] = has_previous_employment_line(
+        redacted_text
+    )
     extract_dict["employer_name"] = redaction_map.employer_name
     if redaction_map.employer_name is None:
         path_warnings.append("employer name was not confidently identified")

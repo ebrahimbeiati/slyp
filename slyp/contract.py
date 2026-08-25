@@ -149,6 +149,17 @@ class PayslipExtract(BaseModel):
             "not by the model. False means treat every figure as suspect."
         ),
     )
+    previous_employment_ytd_present: bool = Field(
+        False,
+        description=(
+            "The payslip shows a previous-employment year-to-date line — a "
+            "P45 carry-forward from an earlier job this tax year. Detected "
+            "in code from the document's own labels, not asked of the "
+            "model. When true, this employment's YTD figures are not the "
+            "whole year, which suppresses the allowance-used figure "
+            "regardless of what the user answered about other employment."
+        ),
+    )
 
 
 # ==========================================================================
@@ -272,6 +283,49 @@ class Verdict(BaseModel):
     severity: Severity
 
 
+class AllowanceUsage(BaseModel):
+    """
+    How much of the annual Personal Allowance this employment's pay has
+    used so far this tax year.
+
+    Arithmetic on figures the payslip itself carries: year-to-date gross
+    against the allowance the tax code grants. Not a projection, and
+    nothing here says anything about what happens by April.
+
+    Populated ONLY when the user has confirmed they have had no other
+    employment this tax year, and suppressed entirely otherwise — see
+    analysis.build_allowance_usage() for the full set of guards. Year-to-
+    date figures cover this employment only, so for anyone with a previous
+    employer this would be understated by whatever they earned there, and
+    a remaining-allowance number reads as a fact rather than an estimate.
+    That is a stricter bar than the emergency-code overpayment estimate
+    clears, deliberately: that one is framed as "possible, check with
+    HMRC", and this one would be acted on.
+
+    There is deliberately no `remaining_gbp` field. The difference is one
+    subtraction away, but a field with that name is an invitation to
+    render "you have £5,070 left to earn tax-free" — which is a statement
+    about future earnings, i.e. the projection this whole object avoids
+    being. `statement` is the sentence to show.
+    """
+
+    used_gbp: Decimal = Field(
+        description=(
+            "Year-to-date gross, capped at the annual allowance — you "
+            "cannot use more allowance than you have."
+        )
+    )
+    allowance_gbp: Decimal = Field(
+        description="Annual allowance the tax code grants, e.g. 12570 for 1257L."
+    )
+    statement: str = Field(
+        description=(
+            "The bounded sentence to display. Written here rather than in "
+            "the frontend so there is one place the wording can be checked."
+        )
+    )
+
+
 class AnalysisResult(BaseModel):
     status: Literal["ok", "unreadable", "not_a_payslip", "unsupported"] = "ok"
     failure_reason: Optional[str] = Field(
@@ -287,6 +341,14 @@ class AnalysisResult(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     projections: list[Projection] = Field(default_factory=list)
     score: Optional[Score] = None
+    allowance_usage: Optional[AllowanceUsage] = Field(
+        None,
+        description=(
+            "Personal Allowance used to date, or null when any guard "
+            "suppresses it. Null is the default and the common case; the "
+            "frontend renders this field or nothing, and never derives it."
+        ),
+    )
 
     is_example_data: bool = Field(
         False, description="True for /api/mock/scan so the UI can label it"
