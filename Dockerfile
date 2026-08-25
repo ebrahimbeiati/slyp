@@ -36,8 +36,15 @@ EXPOSE 8000
 # Shell form so ${PORT} expands. Railway, Render and Fly all set PORT;
 # the default keeps `docker run -p 8000:8000` working locally.
 #
+# `python -m uvicorn` rather than the bare `uvicorn` console script. Both
+# work in this image - pip puts the script on PATH at /usr/local/bin - but
+# the module form does not depend on PATH at all, and this Dockerfile has
+# never been built, so its first run is on Railway. Removing a whole class
+# of "command not found" failure costs nothing here. Verified locally that
+# the module form honours ${PORT} and binds 0.0.0.0.
+#
 # One worker on purpose: the OpenAI reasoning_effort discovery round trip
 # is remembered per process (see slyp/extraction.py), so every extra worker
 # pays that ~1s penalty again on its own first request. For a single-user
 # demo one worker is also simply enough.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
