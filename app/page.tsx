@@ -430,6 +430,38 @@ export default function HomePage() {
                         </span>
                       </div>
 
+                      {/* ── Personal Allowance used to date ──
+                          Placed here deliberately: directly under the
+                          pay breakdown and ABOVE the verdict. It is
+                          context about this payslip, the same category
+                          as "of £476.00 gross" in the hero, not
+                          something we found - so it belongs with the
+                          figures rather than under "What we found" or
+                          "What we confirmed", and it renders in the same
+                          place whether or not there are any findings.
+
+                          `statement` is printed verbatim. The backend
+                          owns the figure and the wording, and every
+                          decision about whether it may be shown at all
+                          was made in analysis.build_allowance_usage().
+                          Null is the common case and renders nothing at
+                          all here - no placeholder, no reserved space. */}
+                      {result!.allowance_usage && (
+                        <div className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-2xl px-4 py-3.5 mb-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-1.5">
+                            Tax-free allowance
+                          </div>
+                          {/* Sized to be read from the back of a room:
+                              well above the 10-11px secondary text used
+                              elsewhere on this screen, and below the
+                              3xl net pay figure, which stays the one
+                              thing the eye lands on first. */}
+                          <p className="text-[var(--ink)] text-[15px] font-medium leading-snug">
+                            {result!.allowance_usage.statement}
+                          </p>
+                        </div>
+                      )}
+
                       {/* Verdict + score */}
                       {result!.verdict && (
                         <div

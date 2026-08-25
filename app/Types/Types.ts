@@ -77,6 +77,7 @@ export interface PayslipExtract {
   unreadable_fields: string[];
   warnings: string[];
   reconciles: boolean | null;
+  previous_employment_ytd_present: boolean;
 }
 
 export interface Estimate {
@@ -133,6 +134,19 @@ export interface Verdict {
 
 export type AnalysisStatus = "ok" | "unreadable" | "not_a_payslip" | "unsupported";
 
+/**
+ * Personal Allowance used to date. Computed in Python and gated there -
+ * see analysis.build_allowance_usage(). The frontend renders `statement`
+ * or renders nothing; it never derives the figure, and there is no
+ * "remaining" field on purpose, because a number named that gets rendered
+ * as "left to earn tax-free", which is a projection.
+ */
+export interface AllowanceUsage {
+  used_gbp: string;
+  allowance_gbp: string;
+  statement: string;
+}
+
 export interface AnalysisResult {
   status: AnalysisStatus;
   failure_reason: string | null;
@@ -141,5 +155,7 @@ export interface AnalysisResult {
   findings: Finding[];
   projections: Projection[];
   score: Score | null;
+  /** Null whenever any guard suppressed it, which is the common case. */
+  allowance_usage: AllowanceUsage | null;
   is_example_data: boolean;
 }
