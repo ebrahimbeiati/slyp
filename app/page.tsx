@@ -527,8 +527,16 @@ export default function HomePage() {
                           <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
                             Couldn&apos;t read confidently
                           </div>
+                          {/* unreadable_field_labels, never unreadable_fields.
+                              The latter is the internal dotted-path key the
+                              findings layer matches on - "tax_code.value"
+                              reached a real user's screen from this line.
+                              The labels are a computed field on the backend
+                              model, so they cannot drift from the paths and
+                              there is no map to maintain here. */}
                           <p className="text-[var(--sage)] text-[10px] leading-relaxed">
-                            {extract.unreadable_fields.join(", ")} — nothing was guessed for these; any check that
+                            We couldn&apos;t read {extract.unreadable_field_labels.join(", ")} —
+                            nothing was guessed for these; any check that
                             depends on them was skipped rather than estimated.
                           </p>
                         </div>

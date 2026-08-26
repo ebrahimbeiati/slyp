@@ -37,7 +37,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 Frequency = Literal["monthly", "weekly"]
@@ -109,6 +109,62 @@ class Source(BaseModel):
     scanned_at: datetime
 
 
+# ==========================================================================
+# Field labels
+# ==========================================================================
+#
+# The one place a dotted field path becomes words a person can read.
+#
+# Paths are an internal key: the findings layer matches Finding.source_fields
+# against unreadable_fields, and both have to be exact. They are not English,
+# and "tax_code.value" reached a real user's screen because three separate
+# places rendered the key instead of a label.
+#
+# Deliberately in Python rather than the frontend. failure_reason is built
+# server-side (analysis.validate_extract), so a TypeScript copy would have
+# to agree with this one forever, and would not.
+
+FIELD_LABELS: dict[str, str] = {
+    "employer_name": "your employer's name",
+    "period.pay_date": "your pay date",
+    "period.period_number": "the pay period number",
+    "period.frequency": "how often you are paid",
+    "period.tax_year": "the tax year",
+    "tax_code.value": "your tax code",
+    "pay.hourly_rate": "your hourly rate",
+    "pay.hours": "your hours",
+    "pay.gross_this_period": "your gross pay",
+    "pay.gross_ytd": "your gross pay so far this year",
+    "deductions.income_tax": "your income tax",
+    "deductions.income_tax_ytd": "your income tax so far this year",
+    "deductions.national_insurance": "your National Insurance",
+    "deductions.national_insurance_ytd": "your National Insurance so far this year",
+    "deductions.ni_category": "your National Insurance category",
+    "deductions.pension_employee": "your pension contribution",
+    "deductions.pension_employer": "your employer's pension contribution",
+    "deductions.pension_percent": "your pension percentage",
+    "deductions.student_loan": "your student loan deduction",
+    "deductions.student_loan_plan": "your student loan plan",
+    "net_pay": "your net pay",
+}
+
+
+def field_label(path: str) -> str:
+    """A dotted path as words. Falls back to something generic rather than
+    leaking the path, because a path this map has not learned yet is
+    exactly when the leak would happen."""
+    return FIELD_LABELS.get(path, "one of the figures on your payslip")
+
+
+def field_labels(paths: list[str]) -> list[str]:
+    """Labels for a list of paths, in order, without duplicates - two
+    unreadable year-to-date fields should not say the same thing twice."""
+    seen: dict[str, None] = {}
+    for path in paths:
+        seen.setdefault(field_label(path), None)
+    return list(seen)
+
+
 class PayslipExtract(BaseModel):
     """What the payslip actually says. No judgements, no calculations."""
 
@@ -149,6 +205,21 @@ class PayslipExtract(BaseModel):
             "not by the model. False means treat every figure as suspect."
         ),
     )
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unreadable_field_labels(self) -> list[str]:
+        """unreadable_fields as words, for anything that displays them.
+
+        A computed field rather than a stored one, so it is derived from
+        unreadable_fields on every serialisation and cannot drift out of
+        step with it - including on a hand-built PayslipExtract, which is
+        how most of the test suite constructs one.
+
+        The frontend renders THIS. unreadable_fields stays as paths
+        because the findings layer matches on them.
+        """
+        return field_labels(self.unreadable_fields)
+
     previous_employment_ytd_present: bool = Field(
         False,
         description=(

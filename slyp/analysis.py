@@ -8,6 +8,7 @@ from typing import Optional
 
 from .contract import (
     AllowanceUsage,
+    field_labels,
     AnalysisResult,
     Finding,
     PayslipExtract,
@@ -372,9 +373,19 @@ def validate_extract(
     ]
 
     if missing_required:
+        # field_labels(), not the paths. This string is failure_reason, which
+        # the results screen prints verbatim as the headline on a failed
+        # analysis - it is the most user-facing string the backend produces,
+        # and it used to read "...could not be read reliably:
+        # pay.gross_this_period, net_pay, tax_code.value."
+        labels = field_labels(missing_required)
+        if len(labels) == 1:
+            listed = labels[0]
+        else:
+            listed = ", ".join(labels[:-1]) + " and " + labels[-1]
         return (
-            "The following required payslip fields could not be read "
-            "reliably: " + ", ".join(missing_required) + "."
+            f"We could not read {listed} reliably enough to check this "
+            f"payslip, so we have not guessed at them."
         )
 
     gross = extract.pay.gross_this_period

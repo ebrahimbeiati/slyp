@@ -712,7 +712,8 @@ def test_printed_month_label_unblocks_period_number_and_the_calculation():
     assert result.period.period_number == 9  # 15 Dec 2025 -> month 9
     assert "period.period_number" not in result.unreadable_fields
     # The frequency is label-read, not model-read - say so downstream.
-    assert any("period.frequency" in warning for warning in result.warnings)
+    # Human wording, not the dotted path - see contract.FIELD_LABELS.
+    assert any("how often you are paid" in warning.lower() for warning in result.warnings)
 
 
 @pytest.mark.parametrize(
@@ -1015,7 +1016,7 @@ def test_extract_payslip_prefers_derived_period_number_over_model_and_warns():
         result = extract_payslip(pdf_bytes)
 
     assert result.period.period_number == 12
-    assert any("period.period_number" in w for w in result.warnings)
+    assert any("pay period number" in w.lower() for w in result.warnings)
     assert any("1" in w and "12" in w for w in result.warnings)
 
 
@@ -1085,7 +1086,7 @@ def test_extract_payslip_accepts_printed_period_label_when_no_pay_date_and_in_ra
     # value - this is what makes the two provenances distinguishable.
     assert result.confidence["period.period_number"] == 0.9
     assert any(
-        "read directly from a printed period label" in w for w in result.warnings
+        "read from a printed label" in w for w in result.warnings
     )
 
 
@@ -1104,7 +1105,7 @@ def test_extract_payslip_refuses_printed_period_label_out_of_range():
     assert result.period.period_number is None
     assert "period.period_number" in result.unreadable_fields
     assert not any(
-        "read directly from a printed period label" in w for w in result.warnings
+        "read from a printed label" in w for w in result.warnings
     )
 
 
@@ -1140,9 +1141,9 @@ def test_extract_payslip_pay_date_takes_precedence_over_printed_label():
 
     assert result.period.period_number == 12
     assert result.confidence["period.period_number"] == 1.0  # derived, not label-read
-    assert any("period.period_number" in w and "12" in w for w in result.warnings)
+    assert any("pay period number" in w.lower() and "12" in w for w in result.warnings)
     assert not any(
-        "read directly from a printed period label" in w for w in result.warnings
+        "read from a printed label" in w for w in result.warnings
     )
 
 

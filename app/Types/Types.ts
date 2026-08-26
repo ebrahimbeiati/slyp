@@ -78,6 +78,9 @@ export interface PayslipExtract {
   warnings: string[];
   reconciles: boolean | null;
   previous_employment_ytd_present: boolean;
+  /** unreadable_fields as human labels. Computed on the backend so it
+   *  cannot drift from the paths. Render THIS, never unreadable_fields. */
+  unreadable_field_labels: string[];
 }
 
 export interface Estimate {

@@ -11,6 +11,7 @@ present while also listed as unreadable - so _facts_from_extract() has to
 check both explicitly, the same way findings.py's _check_* functions do.
 """
 
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -21,6 +22,9 @@ from slyp.analysis import _facts_from_extract, analyse_payslip, build_score
 from slyp.findings import CalculationComparison
 from slyp.calculations import parse_tax_code
 from slyp.contract import (
+    FIELD_LABELS,
+    field_label,
+    field_labels,
     Deductions,
     Pay,
     Period,
@@ -569,3 +573,104 @@ def test_allowance_suppressed_above_the_taper_threshold():
     result = analyse_payslip(extract, UserContext(only_job=True))
     assert result.status == "unsupported"
     assert result.allowance_usage is None
+
+
+# --------------------------------------------------------------------------
+# No dotted field path may reach a user
+# --------------------------------------------------------------------------
+#
+# "tax_code.value" was rendered to a real user. Paths are an internal key -
+# the findings layer matches Finding.source_fields against unreadable_fields
+# and both have to be exact - but they are not English, and three separate
+# places printed the key instead of a label:
+#
+#   1. app/page.tsx rendered unreadable_fields.join(", ")
+#   2. validate_extract built failure_reason by joining the paths
+#   3. four path_warnings in extract_payslip began with one
+#
+# This asserts the property rather than the three sites, so a fourth place
+# fails here rather than reaching someone's screen.
+
+FIELD_PATH = re.compile(
+    r"\b(?:tax_code|pay|deductions|period|net_pay|employer_name)(?:\.[a-z_]+)+\b"
+)
+
+
+def _user_facing_strings(result):
+    """Every string in an AnalysisResult a person can end up reading."""
+    out = []
+    if result.failure_reason:
+        out.append(("failure_reason", result.failure_reason))
+    if result.verdict:
+        out.append(("verdict.headline", result.verdict.headline))
+    for finding in result.findings:
+        out.append((f"{finding.id}.title", finding.title))
+        out.append((f"{finding.id}.explanation", finding.explanation))
+        if finding.next_step:
+            out.append((f"{finding.id}.next_step", finding.next_step))
+        if finding.estimate:
+            out.append((f"{finding.id}.estimate.label", finding.estimate.label))
+    if result.score:
+        out += [("score.movers", m) for m in result.score.movers]
+        out += [("score.not_applicable", n) for n in result.score.not_applicable]
+    if result.allowance_usage:
+        out.append(("allowance_usage.statement", result.allowance_usage.statement))
+    if result.extract:
+        out += [("extract.warnings", w) for w in result.extract.warnings]
+        out += [
+            ("extract.unreadable_field_labels", label)
+            for label in result.extract.unreadable_field_labels
+        ]
+    return out
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        [],
+        ["tax_code.value"],
+        ["pay.gross_this_period"],
+        ["net_pay"],
+        ["pay.gross_ytd"],
+        ["deductions.income_tax"],
+        ["deductions.national_insurance"],
+        ["deductions.pension_employee"],
+        ["period.frequency"],
+        ["period.period_number"],
+        ["pay.gross_this_period", "net_pay", "tax_code.value"],
+    ],
+)
+def test_no_user_facing_string_contains_a_field_path(unreadable):
+    extract = _allowance_extract()
+    extract.unreadable_fields = unreadable
+    if "tax_code.value" in unreadable:
+        extract.tax_code.value = None
+
+    result = analyse_payslip(extract, UserContext(only_job=True))
+
+    for where, text in _user_facing_strings(result):
+        assert not FIELD_PATH.search(text), (
+            f"{where} leaks a field path: {text!r}"
+        )
+
+
+def test_every_known_field_path_has_a_label():
+    """A path with no entry falls back to something generic, which is safe
+    but useless. Every path extraction can actually report should have real
+    words."""
+    from slyp.extraction import _KNOWN_FIELD_PATHS
+
+    missing = sorted(p for p in _KNOWN_FIELD_PATHS if p not in FIELD_LABELS)
+
+    assert missing == [], f"no label for: {missing}"
+
+
+def test_labels_are_deduplicated_but_order_is_kept():
+    assert field_labels(["net_pay", "tax_code.value", "net_pay"]) == [
+        "your net pay",
+        "your tax code",
+    ]
+
+
+def test_an_unknown_path_falls_back_without_leaking_it():
+    assert "made.up.path" not in field_label("made.up.path")

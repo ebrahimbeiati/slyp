@@ -1535,8 +1535,8 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         if pay_date is not None:
             unreadable.discard("period.pay_date")
             path_warnings.append(
-                f"period.pay_date: read from its printed label ({pay_date}) - "
-                f"the model did not return one."
+                f"Your pay date was read from the label printed on the payslip "
+                f"({pay_date}); the model did not report one itself."
             )
 
     # Only when the model returned NOTHING for frequency - not when it
@@ -1549,9 +1549,9 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
             frequency = inferred_frequency
             unreadable.discard("period.frequency")
             path_warnings.append(
-                f"period.frequency: read from a printed period label "
-                f"({inferred_frequency}) - the payslip does not state the "
-                f"frequency as a word."
+                f"How often you are paid was read from a printed period label "
+                f"({inferred_frequency}); the payslip does not state it as a "
+                f"word."
             )
 
     frequency_known = frequency is not None and "period.frequency" not in unreadable
@@ -1567,9 +1567,9 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         # disagreement here doesn't get a different resolution.
         if period_number is not None and period_number != derived_period_number:
             path_warnings.append(
-                "period.period_number: model reported "
-                f"{period_number}, derived {derived_period_number} from "
-                "the pay date - using the derived value"
+                "The pay period number was worked out from your pay date "
+                f"({derived_period_number}) rather than taken from the payslip, "
+                f"which showed {period_number}."
             )
         period_number = derived_period_number
         confidence["period.period_number"] = 1.0
@@ -1595,9 +1595,9 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         # derived value which is mathematically certain given accurate
         # inputs.
         path_warnings.append(
-            f"period.period_number: read directly from a printed period "
-            f"label ({period_number}) - no pay date was available to "
-            f"derive it independently."
+            f"The pay period number was read from a printed label "
+            f"({period_number}); there was no pay date to work it out from "
+            f"independently."
         )
 
     else:
