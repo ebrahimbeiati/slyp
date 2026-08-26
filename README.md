@@ -221,6 +221,28 @@ repository.
   part of the published shape and is hardcoded to an empty list at every return
   site. The `Projection` and `ProjectionPoint` types exist and nothing fills
   them in.
+- **Five redaction patterns can still match across a line break.** `\s` matches
+  `\n`, so a pattern using it as an internal separator can match the tail of one
+  line and the head of the next — and because `redact()` substitutes over its
+  matches, the newline is consumed too and two rows are welded into one. That is
+  not theoretical: `_SORT_CODE_RE` matched `'46\n20/07'` on a work-record table
+  and collapsed three rows into one, destroying a total and a date.
+
+  Four patterns have been fixed — `_SORT_CODE_RE`, `_NAME_LABEL_RE`,
+  `_ADDRESS_LABEL_RE` and `_DATE_RE`. Five are known and deliberately deferred:
+  `_NI_NUMBER_RE`, `_POSTCODE_RE`, `_PHONE_RE`, `_TITLED_NAME_RE` and
+  `_EMPLOYEE_NO_LABEL_RE`.
+
+  They were deferred because over-matching in those five fails *safe*: each one
+  redacts, so a cross-line match removes more than it needed to. The cost is lost
+  payslip content, not leaked personal data. `_DATE_RE` was fixed despite also
+  being a whitespace case because it fails the other way — it feeds the gate's
+  mask, so a cross-line match could hide digits the gate would otherwise refuse,
+  which is demonstrated in `test_month_name_on_the_next_line_does_not_unmask_grouped_digits`.
+
+  `verify/final_newline_span_audit.py` reproduces the whole list, with a probe
+  per pattern showing whether it spans a newline and whether it substitutes.
+
 - **Self-reported confidence is a signal, not a measurement.** The threshold
   that decides whether a field is trusted is a placeholder, not a value tuned
   against a corpus of real payslips.

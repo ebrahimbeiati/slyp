@@ -6,6 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    _DATE_RE,
+    _mask_known_safe_numbers,
     _SORT_CODE_RE,
     has_previous_employment_line,
     RedactionFailure,
@@ -1705,3 +1707,66 @@ def test_tab_separated_label_and_value_still_redacted():
 
     assert "[NAME]" in redacted
     assert "Mr K Sample" not in redacted
+
+
+# --------------------------------------------------------------------------
+# _DATE_RE must not mask across a line break
+# --------------------------------------------------------------------------
+#
+# Unlike the label and sort-code faults, this one failed in the UNSAFE
+# direction. _DATE_RE has two jobs: financial_lines_only() calls it per
+# line, where a cross-line match is impossible, but
+# _mask_known_safe_numbers() runs it over the whole payload with .sub(" ")
+# to remove digits a payslip legitimately explains, before the gate looks
+# for ones it does not.
+#
+# With [-\s] the month-name alternative could match across a newline and
+# mask away the last group of a group-printed digit sequence, leaving two
+# groups where there had been three - so _SPLIT_DIGIT_GROUPS_RE no longer
+# fired and the gate passed digits it refuses when they sit on one line.
+
+
+@pytest.mark.parametrize(
+    "kept_line",
+    [
+        "Gross 2,500.00 Code 123 4567 89",
+        "Net Pay 1,531.58 Code 1234 567 89",
+    ],
+)
+def test_month_name_on_the_next_line_does_not_unmask_grouped_digits(kept_line):
+    """The leak, pinned by name.
+
+    The digits have to sit on a line the allowlist KEEPS (so it carries a
+    currency amount) and at the END of it, with a month name starting the
+    line below - that is the only shape where the mask could reach across.
+    """
+    text = f"{kept_line}\nMar 2026 Net 1,531.58"
+
+    redacted, _ = redact(text)
+    filtered = financial_lines_only(redacted)
+
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(filtered)
+
+
+def test_date_pattern_does_not_match_across_a_line_break():
+    """The mechanism, asserted on the pattern itself."""
+    for match in _DATE_RE.finditer("Total 89\nMar 2026 Gross 2,500.00"):
+        assert "\n" not in match.group(0), (
+            f"date pattern matched across a line break: {match.group(0)!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    "written_date",
+    ["15 Jan 2026", "15-Jan-2026", "1st Jan 2026", "15 January 2026",
+     "28 Aug 26", "15\tJan\t2026"],
+)
+def test_month_name_dates_are_still_recognised_on_one_line(written_date):
+    """The fix narrows the separator, so every same-line form has to keep
+    working - the allowlist must keep the line, and the gate must still
+    mask the digits as explained rather than flagging them."""
+    line = f"Pay Date {written_date}"
+
+    assert financial_lines_only(line).strip() != ""
+    assert not any(c.isdigit() for c in _mask_known_safe_numbers(line))

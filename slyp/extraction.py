@@ -462,8 +462,29 @@ def redact(text: str) -> tuple[str, RedactionMap]:
 _CURRENCY_RE = re.compile(r"£?\d[\d,]*\.\d{2}\b")
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s?%")
 _MONTH_NAMES = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+# [- \t] rather than [-\s] in the month-name alternative: a date does not
+# span a line break, and here that mattered in the UNSAFE direction.
+#
+# _DATE_RE has two jobs. financial_lines_only() calls it per line, so a
+# cross-line match was impossible there. But _mask_known_safe_numbers()
+# runs it over the WHOLE payload with .sub(" "), to remove digits that a
+# payslip legitimately explains before the gate looks for unexplained ones.
+# With \s it could match across a newline and mask the last group of a
+# group-printed digit sequence:
+#
+#     Code 123 4567 89
+#     Mar 2026 National Insurance 0.00
+#
+# "89\nMar 2026" masked away leaves "Code 123 4567", two groups instead of
+# three, so _SPLIT_DIGIT_GROUPS_RE no longer fires and the gate passes a
+# payload it refuses when the same digits sit on one line. Four such
+# sequences were found by search; each evades redact(), is caught by the
+# gate's second check alone, and is released by a month name on the
+# following line.
+#
+# The two numeric alternatives below use [/-] and were never affected.
 _DATE_RE = re.compile(
-    rf"\b\d{{1,2}}(?:st|nd|rd|th)?[-\s](?:{_MONTH_NAMES})[a-z]*[-\s]\d{{2,4}}\b"
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?[- \t](?:{_MONTH_NAMES})[a-z]*[- \t]\d{{2,4}}\b"
     rf"|\b\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}\b"
     # Year-first / ISO (YYYY-MM-DD). Without this alternative, an ISO
     # pay date has no financial shape this pattern recognises: the
