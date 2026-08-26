@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    _SORT_CODE_RE,
     has_previous_employment_line,
     RedactionFailure,
     RedactionMap,
@@ -1516,3 +1517,75 @@ def test_previous_employment_line_is_detected(line):
 )
 def test_ordinary_payslip_lines_are_not_mistaken_for_it(line):
     assert has_previous_employment_line(line) is False
+
+
+# --------------------------------------------------------------------------
+# DD/MM/YY - the one date shape that collides with the sort-code pattern
+# --------------------------------------------------------------------------
+#
+# DOCUMENTS AN ACCEPTED LOSS. These assertions describe what the pipeline
+# does, not what anyone wants it to do.
+#
+# _SORT_CODE_RE is \b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b - three two-digit groups.
+# A date with two digits in the day, month AND year is exactly that shape,
+# so "15/12/25" is redacted to [BANK] and the date is gone before the model
+# sees it. A four-digit year is what saves DD/MM/YYYY: the trailing \b
+# fails against the year's fourth digit.
+#
+# redact() explains why the sort-code pattern gets no date exemption: a
+# 6-digit date and a real sort-code-with-slashes bypass (F6) are
+# indistinguishable by shape, and exempting one reopens the other. Payslips
+# overwhelmingly print 4-digit years, so losing the uncommon 2-digit case is
+# the accepted trade.
+#
+# This was untested until now. The existing date-survival fixtures are
+# 15/12/2025, 15-12-2025, 5/3/25 and 2025-12-15 - and 5/3/25 slips past the
+# collision only because single-digit day and month are too few digits for
+# the pattern to reach. Nothing covered the two-digit-everything case, which
+# is the only one that actually collides.
+
+
+@pytest.mark.parametrize(
+    "two_digit_year_date",
+    [
+        "15/12/25",  # DD/MM/YY, slashes
+        "15-12-25",  # DD-MM-YY, hyphens
+        "20/07/26",
+        "01/01/26",
+    ],
+)
+def test_two_digit_year_date_is_lost_to_the_sort_code_pattern(two_digit_year_date):
+    """Accepted loss, pinned so it cannot change silently in either
+    direction: if this ever starts passing, the sort-code pattern has been
+    narrowed and F6 needs re-checking."""
+    redacted, _ = redact(f"Pay Date {two_digit_year_date} Gross 2500.00")
+
+    assert two_digit_year_date not in redacted
+    assert "[BANK]" in redacted
+    # The money on the same line must not be collateral.
+    assert "2500.00" in redacted
+
+
+@pytest.mark.parametrize(
+    "four_digit_year_date",
+    ["15/12/2025", "15-12-2025", "20/07/2026", "2025-12-15"],
+)
+def test_four_digit_year_date_is_not_touched_by_the_sort_code_pattern(
+    four_digit_year_date,
+):
+    """The other side of the same boundary, asserted against _SORT_CODE_RE
+    directly rather than through redact(), so it cannot be satisfied by some
+    other pattern happening to spare the date."""
+    assert _SORT_CODE_RE.search(four_digit_year_date) is None
+
+    redacted, _ = redact(f"Pay Date {four_digit_year_date} Gross 2500.00")
+    assert four_digit_year_date in redacted
+
+
+def test_single_digit_day_and_month_dodges_the_collision_by_length():
+    """Why 5/3/25 was never caught by the fixtures above: the sort-code
+    pattern needs two digits in each group, and this has one."""
+    assert _SORT_CODE_RE.search("5/3/25") is None
+
+    redacted, _ = redact("Pay Date 5/3/25 Gross 2500.00")
+    assert "5/3/25" in redacted
