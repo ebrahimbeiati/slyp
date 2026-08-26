@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    _shape_of,
     _DATE_RE,
     _mask_known_safe_numbers,
     _SORT_CODE_RE,
@@ -1771,3 +1772,83 @@ def test_month_name_dates_are_still_recognised_on_one_line(written_date):
 
     assert financial_lines_only(line).strip() != ""
     assert not any(c.isdigit() for c in _mask_known_safe_numbers(line))
+
+
+# --------------------------------------------------------------------------
+# A tax code read and rejected must say so
+# --------------------------------------------------------------------------
+#
+# "We read a code and could not accept it" and "we could not read a code"
+# produced an identical extract: value None, the path in unreadable_fields,
+# no warning. A test user's payslip came back with an unreadable tax code
+# while the model reported it at 0.98 confidence - it had read the code and
+# _TAX_CODE_RE rejected the string - and nothing in the response said so.
+
+
+def _extract_with_model_tax_code(value, confidence=0.99):
+    """Run extract_payslip with the model's tax code forced, so the test
+    exercises the validator rather than the model."""
+    pdf_bytes = _make_pdf_bytes(["Gross Pay 2,500.00", "Net Pay 2,093.34"])
+    model_extract = _ModelExtract()
+    model_extract.tax_code.value = value
+    model_extract.pay.gross_this_period = Decimal("2500.00")
+    model_extract.pay.gross_ytd = Decimal("2500.00")
+    model_extract.net_pay = Decimal("2093.34")
+    model_extract.confidence = {"tax_code.value": confidence}
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        return extract_payslip(pdf_bytes)
+
+
+@pytest.mark.parametrize("rejected", ["M1257L", "1257L Cumul", "1257 L", "1257L (M1)"])
+def test_a_rejected_tax_code_produces_a_warning(rejected):
+    result = _extract_with_model_tax_code(rejected)
+
+    assert result.tax_code.value is None
+    assert "tax_code.value" in result.unreadable_fields
+    assert any(
+        "not in a form this engine recognises" in w for w in result.warnings
+    ), f"no warning for a rejected code: {result.warnings}"
+
+
+@pytest.mark.parametrize("rejected", ["M1257L", "1257L Cumul", "1257 L"])
+def test_the_rejection_warning_never_carries_the_value(rejected):
+    """The warning travels to the frontend and into logs, and extraction is
+    the one place a payslip's contents are still in the clear. The shape is
+    enough to diagnose with."""
+    result = _extract_with_model_tax_code(rejected)
+
+    for warning in result.warnings:
+        assert rejected not in warning, f"warning leaked the value: {warning!r}"
+    assert any(_shape_of(rejected) in w for w in result.warnings)
+
+
+def test_an_accepted_tax_code_produces_no_such_warning():
+    result = _extract_with_model_tax_code("1257L M1")
+
+    assert result.tax_code.value == "1257L M1"
+    assert "tax_code.value" not in result.unreadable_fields
+    assert not any("not in a form this engine recognises" in w for w in result.warnings)
+
+
+def test_a_missing_tax_code_is_distinguishable_from_a_rejected_one():
+    """The whole point: the two cases must no longer look identical."""
+    rejected = _extract_with_model_tax_code("1257L Cumul")
+    missing = _extract_with_model_tax_code(None)
+
+    assert rejected.tax_code.value is missing.tax_code.value is None
+    assert "tax_code.value" in rejected.unreadable_fields
+    assert any("not in a form" in w for w in rejected.warnings)
+    assert not any("not in a form" in w for w in missing.warnings)
+
+
+@pytest.mark.parametrize(
+    ("value", "shape"),
+    [
+        ("M1257L", "A####A"),
+        ("1257L Cumul", "####A Aaaaa"),
+        ("1257 L", "#### A"),
+        ("1257L (M1)", "####A (A#)"),
+    ],
+)
+def test_shape_of_describes_without_disclosing(value, shape):
+    assert _shape_of(value) == shape

@@ -1261,6 +1261,25 @@ _PREVIOUS_EMPLOYMENT_RE = re.compile(
 )
 
 
+def _shape_of(value: str) -> str:
+    """A string as its shape: digits to #, letters to A or a, punctuation
+    and spacing kept.
+
+    Used to describe a value in a warning without carrying the value. The
+    shape is what a maintainer needs - "####A Aaaaa" says a basis word is
+    stuck to the code, "A####A" says a neighbouring column welded to it -
+    and it says nothing about the person the payslip belongs to.
+
+    Truncated, because a warning is not the place for an essay and a very
+    long "value" is itself the diagnosis.
+    """
+    shaped = "".join(
+        "#" if ch.isdigit() else ("A" if ch.isupper() else "a" if ch.islower() else ch)
+        for ch in value[:24]
+    )
+    return shaped + ("..." if len(value) > 24 else "")
+
+
 def has_previous_employment_line(text: str) -> bool:
     """True when the payslip shows a previous-employment YTD carry-forward."""
     return _PREVIOUS_EMPLOYMENT_RE.search(text) is not None
@@ -1483,9 +1502,30 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         if score < _CONFIDENCE_THRESHOLD:
             unreadable.add(dotted_path)
 
+    # A tax code we READ but could not ACCEPT is a different fact from one
+    # we could not read, and until now the extract said the same thing for
+    # both: value None, "tax_code.value" in unreadable_fields, no warning.
+    #
+    # That cost real diagnosis time. A test user's payslip came back with an
+    # unreadable tax code while the model reported it at 0.98 confidence -
+    # it had read the code perfectly and _TAX_CODE_RE rejected the string,
+    # and nothing in the response said so. It took a purpose-built script to
+    # find out, and the next layout that trips this should be readable from
+    # the response instead.
+    #
+    # The warning never carries the value. It is a document the user has not
+    # been shown yet, extraction is the one place PII is still in the clear,
+    # and warnings travel to the frontend and into logs. The SHAPE is enough
+    # to tell the two cases apart and to see which rule to write next:
+    # "###A Aaaaa" is a basis word, "A####A" is a column welded to the code.
     tax_code_value = model_extract.tax_code.value
     if tax_code_value is not None and not _TAX_CODE_RE.match(tax_code_value.strip()):
         unreadable.add("tax_code.value")
+        path_warnings.append(
+            f"A tax code was printed on the payslip but not in a form this "
+            f"engine recognises ({_shape_of(tax_code_value.strip())}), so it "
+            f"has not been used. No tax code was guessed."
+        )
 
     pay, deductions = model_extract.pay, model_extract.deductions
     if (
