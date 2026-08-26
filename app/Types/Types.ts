@@ -150,6 +150,20 @@ export interface AllowanceUsage {
   statement: string;
 }
 
+/**
+ * What a field on the payslip means, stated plainly. Not a Finding: a
+ * Finding says something needs attention, an Explanation says what is
+ * printed. Explanations render on a clean payslip too - that is the point
+ * of them - and are suppressed on the backend whenever a finding already
+ * covers the same ground or the field failed the confidence gate. Render
+ * `body` as written; it is worded to explain and never to advise.
+ */
+export interface Explanation {
+  subject: "tax_code";
+  heading: string;
+  body: string;
+}
+
 export interface AnalysisResult {
   status: AnalysisStatus;
   failure_reason: string | null;
@@ -160,5 +174,7 @@ export interface AnalysisResult {
   score: Score | null;
   /** Null whenever any guard suppressed it, which is the common case. */
   allowance_usage: AllowanceUsage | null;
+  /** Empty whenever every explanation was suppressed. */
+  explanations: Explanation[];
   is_example_data: boolean;
 }

@@ -109,6 +109,49 @@ producing a number that would look authoritative and be wrong.
 - **Unreadable fields.** Anything the extraction step was not confident about is
   discarded rather than used.
 
+## A recurring failure mode
+
+Four times in one week, a new surface has been built that would have bypassed a
+guard an older surface already enforced. They looked like four unrelated bugs.
+They are one shape, and it is worth naming because the next feature will have
+it too.
+
+- **The £100,000 taper check lived on a dead path.** The refusal existed and was
+  tested, but it sat in `annual_income_tax()`, which nothing on the request path
+  called. The live route through `income_tax_due()` had no such check, so the
+  engine would have applied a full Personal Allowance to someone who does not
+  have one.
+- **Tax code normalisation nearly re-banded `D0`.** The rule stripping a welded
+  leading letter excluded `S`, `C` and `K` — the prefixes the engine refuses.
+  `D` is not a prefix, it is the whole code, so `D0` would have become `0` and
+  a higher-rate code would have been read as something else entirely.
+- **The allowance figure had to learn what the findings already knew.** Findings
+  that depend on the Personal Allowance being unused elsewhere are conditional
+  on the other-employment answer. A new panel stating "you have used £X of your
+  allowance" started life stating it unconditionally.
+- **The tax code explanation nearly claimed `BR` was expected.** The findings
+  layer says `BR` can be expected for a second job *only* when the user has said
+  this is not their only job. An explanation block that renders on every payslip
+  has no user context, so the same sentence there would tell someone on `BR` as
+  their only job that it was fine.
+
+The common shape: **a guard is enforced at the point where the old surface
+happens to sit, not at the point where the fact is decided.** The £100k check
+was attached to one function rather than to the allowance; the prefix rule was
+attached to a list of refused letters rather than to what a leading letter
+means; the conditionality was attached to findings rather than to the allowance
+fact; the user-context caveat was attached to the finding rather than to `BR`.
+Each new surface reaches the same fact by a different route and arrives without
+the guard.
+
+The mitigation that has actually worked is not a checklist. It is that every one
+of these was caught by writing out the full table of inputs — every tax code
+shape, every basis, every combination of user context — and reading the output
+row by row before shipping. `D0` was caught that way, and so was `BR`. Three of
+the four were caught after the code was written and before it was pushed; the
+£100k one was caught only by an independent verification pass, which is the one
+that should worry us.
+
 ## Running it locally
 
 Two services: the FastAPI backend and the Next.js frontend.
@@ -217,6 +260,22 @@ repository.
   Someone who changed jobs mid-year can truthfully say this is their only job
   while a previous employer has already used part of the allowance, which would
   make the figure an overstatement. The wording carries that condition.
+- **Tax code explanations and tax code findings say some of the same things.**
+  `AnalysisResult.explanations` describes what the tax code on the payslip does,
+  and renders on every payslip including a clean one. Four findings —
+  `tax_code_d0`, `tax_code_zero_allowance`, `tax_code_nt` and
+  `tax_code_emergency_basis` — cover some of the same ground. The explanation is
+  suppressed whenever one of those findings is present, so nothing appears twice,
+  but the same explanatory sentence now exists in two places in the source.
+
+  The better long-term shape is to strip the explanatory half out of those
+  findings and let each one say only what needs attention, with the explanation
+  block carrying the description in every case. That was deferred rather than
+  done because those findings are the tested, demo-critical path and the change
+  would rewrite copy on it days before a demo, to remove a duplication that no
+  user can currently see. Suppressing costs one `frozenset` and one test per id;
+  replacing costs a rewrite of four findings and their assertions.
+
 - **`AnalysisResult.projections` is a contract field with no producer.** It is
   part of the published shape and is hardcoded to an empty list at every return
   site. The `Projection` and `ProjectionPoint` types exist and nothing fills

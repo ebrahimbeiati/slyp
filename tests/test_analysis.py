@@ -18,7 +18,12 @@ from decimal import Decimal
 import pytest
 
 from slyp import calculations
-from slyp.analysis import _facts_from_extract, analyse_payslip, build_score
+from slyp.analysis import (
+    _facts_from_extract,
+    analyse_payslip,
+    build_score,
+    build_tax_code_explanation,
+)
 from slyp.findings import CalculationComparison
 from slyp.calculations import parse_tax_code
 from slyp.contract import (
@@ -26,6 +31,7 @@ from slyp.contract import (
     field_label,
     field_labels,
     Deductions,
+    Finding,
     Pay,
     Period,
     PayslipExtract,
@@ -674,3 +680,153 @@ def test_labels_are_deduplicated_but_order_is_kept():
 
 def test_an_unknown_path_falls_back_without_leaking_it():
     assert "made.up.path" not in field_label("made.up.path")
+
+
+# --------------------------------------------------------------------------
+# What the tax code means
+# --------------------------------------------------------------------------
+#
+# A clean payslip told the user nothing about what any of it meant - we only
+# spoke when something was wrong. This explains what is printed, on every
+# payslip, including one with no findings at all.
+#
+# Explain, never advise. The line is easy to cross and BR is where it would
+# happen: "no personal allowance is applied here" is what the code does,
+# "which is normal for a second job" is a claim about the reader's
+# circumstances that the findings layer only makes when only_job is False.
+
+
+# Anything asserting a code is right, expected or unremarkable. Some are
+# claims about the user's situation, which this layer knows nothing about;
+# the rest are reassurance, which is advice wearing a description's clothes.
+FORBIDDEN_WORDS = [
+    "normal", "correct", "expected", "fine", "should be", "as it should",
+    "nothing wrong", "no problem", "usual", "typical", "common",
+    "appropriate", "second job", "another job", "looks right", "is right",
+    "don't worry", "no need",
+]
+
+TAX_CODES = ["1257L", "BR", "D0", "D1", "0T", "NT"]
+
+
+def _explain(code, findings=None):
+    extract = _allowance_extract(tax_code=code)
+    return build_tax_code_explanation(extract, parse_tax_code(code), findings or [])
+
+
+@pytest.mark.parametrize("base", TAX_CODES)
+@pytest.mark.parametrize("suffix", ["", " M1"])
+def test_every_reachable_code_and_basis_is_explained(base, suffix):
+    """Twelve combinations - six kinds, cumulative and not. These are the
+    only ones that reach status ok: parse_tax_code raises for Scottish,
+    Welsh, K and unparseable codes, so analyse_payslip returns unsupported
+    before findings are built."""
+    explanation = _explain(base + suffix)
+
+    assert explanation is not None
+    assert explanation.subject == "tax_code"
+    assert base + suffix in explanation.body
+    assert len(explanation.body) > 60
+
+
+@pytest.mark.parametrize("base", TAX_CODES)
+@pytest.mark.parametrize("suffix", ["", " M1"])
+def test_no_explanation_implies_a_code_is_correct_or_normal(base, suffix):
+    explanation = _explain(base + suffix)
+    lowered = explanation.body.lower()
+
+    for word in FORBIDDEN_WORDS:
+        assert word not in lowered, f"{base + suffix}: says {word!r} -> {explanation.body}"
+
+
+def test_the_br_explanation_says_what_br_does_and_nothing_about_whether_it_fits():
+    """Called out on its own because it is the specific trap. The findings
+    layer has user_context and says "BR can be expected for a second job"
+    only when only_job is False. This layer has no user context, so saying
+    it here would state unconditionally what the findings layer gates - and
+    would tell someone on BR as their ONLY job that it was expected."""
+    body = _explain("BR").body.lower()
+
+    assert "basic rate" in body
+    assert "no personal allowance" in body
+    for word in ("second job", "another job", "normal", "expected", "correct"):
+        assert word not in body
+
+
+@pytest.mark.parametrize(
+    ("code", "must_contain"),
+    [
+        ("1257L", ["£12,570", "cumulatively"]),
+        ("1257L M1", ["£12,570", "on its own"]),
+        ("500L", ["£5,000"]),
+        ("BR", ["basic rate"]),
+        ("D0", ["higher rate"]),
+        ("D1", ["additional rate"]),
+        ("0T", ["no personal allowance", "first pound"]),
+        ("NT", ["no income tax"]),
+    ],
+)
+def test_the_wording_says_the_right_thing_for_each_code(code, must_contain):
+    body = _explain(code).body.lower()
+
+    for phrase in must_contain:
+        assert phrase.lower() in body, f"{code}: missing {phrase!r} -> {body}"
+
+
+def test_the_allowance_figure_comes_from_the_parsed_code_not_new_arithmetic():
+    """free_pay_annual was computed by parse_tax_code from the digits on the
+    payslip. This layer reads it; it does not recompute it."""
+    assert f"£{parse_tax_code('1257L').free_pay_annual:,.0f}" in _explain("1257L").body
+    assert f"£{parse_tax_code('500L').free_pay_annual:,.0f}" in _explain("500L").body
+
+
+def test_suppressed_when_the_tax_code_failed_the_confidence_gate():
+    extract = _allowance_extract(tax_code="1257L")
+    extract.unreadable_fields = ["tax_code.value"]
+
+    assert build_tax_code_explanation(extract, parse_tax_code("1257L"), []) is None
+
+
+@pytest.mark.parametrize(
+    "finding_id",
+    ["tax_code_d0", "tax_code_d1", "tax_code_zero_allowance", "tax_code_nt",
+     "tax_code_emergency_basis"],
+)
+def test_suppressed_when_a_finding_already_explains_the_code(finding_id):
+    """Suppress, not replace - the same sentence must not appear twice on
+    one screen, and those findings keep working exactly as they did."""
+    finding = Finding(
+        id=finding_id, severity="advisory", title="t", explanation="e"
+    )
+
+    assert _explain("1257L", findings=[finding]) is None
+
+
+def test_an_unrelated_finding_does_not_suppress_it():
+    finding = Finding(
+        id="payslip_does_not_reconcile", severity="action", title="t", explanation="e"
+    )
+
+    assert _explain("1257L", findings=[finding]) is not None
+
+
+def test_it_renders_on_a_payslip_with_no_findings_at_all():
+    """The point of the feature. A clean payslip previously said nothing
+    about what any of it meant."""
+    result = analyse_payslip(_allowance_extract(), UserContext(only_job=True))
+
+    assert result.findings == []
+    assert len(result.explanations) == 1
+    assert result.explanations[0].subject == "tax_code"
+    assert "1257L" in result.explanations[0].body
+
+
+def test_a_refused_code_produces_no_partial_explanation():
+    """Scottish, Welsh and K codes return unsupported before findings are
+    built, so there is nothing to half-explain."""
+    for code in ("S1257L", "C1257L", "K475"):
+        extract = _allowance_extract(tax_code=code)
+        result = analyse_payslip(extract, UserContext(only_job=True))
+
+        assert result.status == "unsupported"
+        assert result.explanations == []

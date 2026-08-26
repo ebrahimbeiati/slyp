@@ -8,6 +8,7 @@ from typing import Optional
 
 from .contract import (
     AllowanceUsage,
+    Explanation,
     field_labels,
     AnalysisResult,
     Finding,
@@ -318,6 +319,19 @@ def analyse_payslip(
     allowance_usage = build_allowance_usage(extract, tax_code, context)
 
     # ------------------------------------------------------------------
+    # 8b. What the tax code means
+    # ------------------------------------------------------------------
+    #
+    # After findings, because it is suppressed when a finding already
+    # explains the same code.
+
+    explanations = [
+        explanation
+        for explanation in [build_tax_code_explanation(extract, tax_code, findings)]
+        if explanation is not None
+    ]
+
+    # ------------------------------------------------------------------
     # 9. Build final response
     # ------------------------------------------------------------------
 
@@ -329,6 +343,7 @@ def analyse_payslip(
         findings=findings,
         projections=[],
         score=score,
+        explanations=explanations,
         allowance_usage=allowance_usage,
     )
 
@@ -554,6 +569,136 @@ def build_allowance_usage(
         used_gbp=used,
         allowance_gbp=allowance,
         statement=statement,
+    )
+
+
+# A finding that already explains what a code means. Where one of these is
+# present the explanation block is suppressed for that payslip, so the same
+# sentence is not shown twice on one screen.
+#
+# Suppressing rather than replacing, deliberately. These findings ARE
+# explanations wearing a finding's clothes and the better shape is for the
+# explanation block to own the job outright - but that changes existing,
+# tested behaviour, and this landed two days before a demo. Recorded in the
+# README as deferred rather than done quietly.
+#
+# Read from the findings list rather than inferred from the code, so this
+# cannot drift from what the findings layer actually emitted.
+_CODE_EXPLAINING_FINDING_IDS = frozenset({
+    "tax_code_d0",
+    "tax_code_d1",
+    "tax_code_zero_allowance",
+    "tax_code_nt",
+    "tax_code_emergency_basis",
+})
+
+_NON_CUMULATIVE_SUFFIX = (
+    " The W1, M1 or X on the end means each payslip is taxed on its own, "
+    "using one period's share of that allowance, without taking account of "
+    "what you have already been paid this year."
+)
+
+_NON_CUMULATIVE_SUFFIX_NO_ALLOWANCE = (
+    " The W1, M1 or X on the end means each payslip is taxed on its own, "
+    "without taking account of what you have already been paid this year."
+)
+
+
+def _tax_code_body(tax_code) -> Optional[str]:
+    """
+    What this code does, as a sentence. Nothing about whether it is the
+    right code for anyone.
+
+    BR is the one to be careful with. "No personal allowance is applied to
+    this job" is what the code does. "Which is normal for a second job" is
+    a claim about the reader's circumstances, and the findings layer only
+    makes it when user_context.only_job is False - this function has no
+    user context and must not imply one.
+
+    No arithmetic here: free_pay_annual was computed by parse_tax_code from
+    the digits on the payslip.
+    """
+    kind = tax_code.kind
+    allowance = tax_code.free_pay_annual
+
+    if kind == "standard":
+        body = (
+            f"The number in your code sets how much you can be paid before "
+            f"income tax is due: £{allowance:,.0f} across the tax year."
+        )
+        return body + (
+            _NON_CUMULATIVE_SUFFIX
+            if not tax_code.cumulative
+            else " It is applied cumulatively, so each payslip takes account "
+            "of what you have already been paid and taxed this year."
+        )
+
+    if kind == "BR":
+        body = (
+            "BR means every pound of taxable pay from this job is taxed at "
+            "the basic rate, and no personal allowance is applied to it here."
+        )
+    elif kind == "D0":
+        body = (
+            "D0 means every pound of taxable pay from this job is taxed at "
+            "the higher rate, and no personal allowance is applied to it here."
+        )
+    elif kind == "D1":
+        body = (
+            "D1 means every pound of taxable pay from this job is taxed at "
+            "the additional rate, and no personal allowance is applied to it "
+            "here."
+        )
+    elif kind == "0T":
+        body = (
+            "0T means no personal allowance is applied to this job. Pay is "
+            "taxed through the income tax bands starting from the first pound."
+        )
+    elif kind == "NT":
+        body = "NT means no income tax is being deducted from this job."
+    else:
+        return None
+
+    return body + ("" if tax_code.cumulative else _NON_CUMULATIVE_SUFFIX_NO_ALLOWANCE)
+
+
+def build_tax_code_explanation(
+    extract: PayslipExtract,
+    tax_code,
+    findings: list[Finding],
+) -> Optional[Explanation]:
+    """
+    What the tax code on this payslip means, or None.
+
+    Renders on a payslip with no findings at all - that is the point of it.
+    A clean payslip previously said nothing about what any of it meant.
+
+    Suppressed when the code failed the confidence gate, and when a finding
+    already explains the same code.
+
+    Codes the engine refuses - Scottish, Welsh, K, unparseable - never reach
+    here: parse_tax_code raises and analyse_payslip returns status
+    "unsupported" before findings are built, with failure_reason naming the
+    code. So there is no partial explanation to guard against; the refusal
+    already says we do not support that situation.
+    """
+    if "tax_code.value" in extract.unreadable_fields:
+        return None
+
+    if not extract.tax_code.value:
+        return None
+
+    if any(finding.id in _CODE_EXPLAINING_FINDING_IDS for finding in findings):
+        return None
+
+    body = _tax_code_body(tax_code)
+    if body is None:
+        return None
+
+    return Explanation(
+        subject="tax_code",
+        heading="What your tax code means",
+        body=f"Your payslip shows tax code {extract.tax_code.value}. {body}",
     )
 
 
@@ -831,6 +976,7 @@ def is_unreadable(
 __all__ = [
     "analyse_payslip",
     "build_allowance_usage",
+    "build_tax_code_explanation",
     "validate_extract",
     "build_verdict",
     "build_score",

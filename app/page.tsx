@@ -514,6 +514,44 @@ export default function HomePage() {
                         </div>
                       )}
 
+                      {/* What the payslip says, explained. Not findings:
+                          nothing here needs acting on, and it renders on a
+                          payslip with zero findings - which is the point,
+                          because a clean payslip used to say nothing about
+                          what any of it meant.
+
+                          Collapsed by default, unlike the first finding.
+                          Someone with something wrong on their payslip
+                          should not have to scroll past a paragraph about
+                          what their tax code is to reach it.
+
+                          `body` is printed verbatim. Every decision about
+                          whether an explanation may appear - suppressed
+                          when a finding already covers the same code, or
+                          when the field failed the confidence gate - was
+                          made in analysis.build_tax_code_explanation(). */}
+                      {result!.explanations.length > 0 && (
+                        <div className="w-full mb-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--sage)] font-medium mb-2">
+                            What your payslip says
+                          </div>
+                          {result!.explanations.map((explanation) => (
+                            <AccordionCard
+                              key={explanation.subject}
+                              header={
+                                <span className="text-[var(--ink)] text-xs font-bold">
+                                  {explanation.heading}
+                                </span>
+                              }
+                            >
+                              <p className="text-[var(--sage)] text-[11px] leading-relaxed">
+                                {explanation.body}
+                              </p>
+                            </AccordionCard>
+                          ))}
+                        </div>
+                      )}
+
                       {/* What was actually checked. Sits below the
                           findings deliberately: it is detail, not a
                           headline, and pairing it with the verdict up top

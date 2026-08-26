@@ -397,6 +397,33 @@ class AllowanceUsage(BaseModel):
     )
 
 
+class Explanation(BaseModel):
+    """
+    What something printed on the payslip MEANS. Not a judgement about it.
+
+    The distinction is the whole point. A Finding says something about the
+    user's situation and is gated on what we know about it; an Explanation
+    says what a code does, which is true regardless of whose payslip it is
+    and needs no gate beyond "we read the value confidently".
+
+    That line is easy to cross and the BR code is where it would happen:
+    "no personal allowance is applied here" is an explanation, and "which
+    is normal for a second job" is a claim about the user's circumstances
+    that the findings layer only makes when user_context.only_job is False.
+    Nothing in here may say a code is normal, expected or correct.
+
+    `subject` is deliberately narrow. NI category and student loan plan
+    were scoped and left out - the first needs its 14 categories checked
+    against HMRC before we describe any of them, the second is null on
+    every fixture we have and would ship unexercised. The literal widens
+    when they are built, rather than advertising subjects nothing produces.
+    """
+
+    subject: Literal["tax_code"]
+    heading: str = Field(description='Short, e.g. "What your tax code means"')
+    body: str = Field(description="Plain English, no judgement, no advice.")
+
+
 class AnalysisResult(BaseModel):
     status: Literal["ok", "unreadable", "not_a_payslip", "unsupported"] = "ok"
     failure_reason: Optional[str] = Field(
@@ -412,6 +439,15 @@ class AnalysisResult(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     projections: list[Projection] = Field(default_factory=list)
     score: Optional[Score] = None
+    explanations: list[Explanation] = Field(
+        default_factory=list,
+        description=(
+            "What the payslip's own codes mean, in plain English. Empty "
+            "when nothing could be explained confidently, or when a finding "
+            "already explains the same thing - see "
+            "analysis.build_tax_code_explanation()."
+        ),
+    )
     allowance_usage: Optional[AllowanceUsage] = Field(
         None,
         description=(
