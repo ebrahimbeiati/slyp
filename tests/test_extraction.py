@@ -6,6 +6,11 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    _call_openai_model,
+    normalise_number,
+    _normalise_numbers,
+    MalformedExtraction,
+    NotAPayslip,
     _TAX_CODE_RE,
     normalise_tax_code,
     _shape_of,
@@ -1976,3 +1981,165 @@ def test_a_normalised_code_is_accepted_end_to_end():
     assert result.tax_code.value == "1257L"
     assert "tax_code.value" not in result.unreadable_fields
     assert not any("not in a form this engine recognises" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------
+# Numbers as a payslip prints them
+# --------------------------------------------------------------------------
+#
+# The model echoes the document, so it returns "1,867.60" or "£1,867.60"
+# roughly as often as "1867.60", varying run to run on the SAME input.
+# Pydantic rejects a thousands separator, that ValidationError became
+# NotAPayslip, and the user was told "We couldn't recognise this document as
+# a payslip" - because of a comma. Reproduced 4/4 on one synthetic layout.
+#
+# The schema is unchanged. The input is normalised to meet it.
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ("1867.60", "1867.60"),
+        ("1,867.60", "1867.60"),
+        ("£1,867.60", "1867.60"),
+        ("£1867.60", "1867.60"),
+        (" 1867.60 ", "1867.60"),
+        ("  £1,867.60  ", "1867.60"),
+        ("$1,867.60", "1867.60"),
+        ("€1,867.60", "1867.60"),
+        ("1,234,567.89", "1234567.89"),
+        ("476", "476"),
+        ("0.00", "0.00"),
+        # negatives - a refund or an adjustment is printed both ways
+        ("-1,867.60", "-1867.60"),
+        ("£-1,867.60", "-1867.60"),
+        ("-£1,867.60", "-1867.60"),
+        ("(1,867.60)", "-1867.60"),
+        ("(£1,867.60)", "-1867.60"),
+    ],
+)
+def test_every_printed_shape_normalises_to_the_plain_value(printed, expected):
+    assert normalise_number(printed) == expected
+    assert Decimal(normalise_number(printed)) == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        # not numbers at all - must survive untouched so the schema rejects them
+        "1257L", "BR", "A", "abc", "", "£",
+        # numeric-ish but malformed - normalising these would be rescuing
+        # garbage rather than reading a number
+        "12 34 56", "1,86 7.60", "1..2", "5-",
+        "1,2,3", "12,34", "1,23456",
+        "--5", "(-5)", "-(5)", "--£5", "£--5",
+    ],
+)
+def test_garbage_is_returned_untouched_so_validation_still_rejects_it(garbage):
+    assert normalise_number(garbage) == garbage
+
+
+@pytest.mark.parametrize("passthrough", ["1257L", "BR", "A", "2", "PG"])
+def test_non_money_strings_survive_the_recursive_walk(passthrough):
+    """The walk is applied to the whole payload rather than a list of money
+    fields, so a field added later is covered without anyone remembering.
+    That is only safe because a non-numeric string comes through unchanged -
+    tax_code.value, ni_category and student_loan_plan all go through it."""
+    payload = {"tax_code": {"value": passthrough}}
+
+    assert _normalise_numbers(payload)["tax_code"]["value"] == passthrough
+
+
+def test_the_recursive_walk_reaches_nested_lists():
+    """deductions.other is a list of objects with a Decimal amount."""
+    payload = {"deductions": {"other": [{"type": "union", "amount": "£12,345.67"}]}}
+
+    assert _normalise_numbers(payload)["deductions"]["other"][0]["amount"] == "12345.67"
+
+
+def test_a_comma_formatted_model_answer_no_longer_kills_the_extraction():
+    """The bug, end to end through extract_payslip with the model's answer
+    forced to the comma-formatted form that used to fail."""
+    pdf_bytes = _make_pdf_bytes([
+        "Pay Date: 28/08/2026",
+        "Tax Code: 1257L    NI Table Letter A",
+        "Tax Period: 5    Payment Period Monthly",
+        "Basic Pay 1,867.60    Income Tax 164.02",
+        "Total Gross Pay 1,867.60    Net Pay 1,638.01",
+        "Gross Pay YTD 9,338.00    Income Tax YTD 820.10",
+    ])
+    raw = {
+        "is_payslip": True,
+        "period": {"pay_date": "2026-08-28", "period_number": 5, "frequency": "monthly"},
+        "tax_code": {"value": "1257L"},
+        "pay": {"gross_this_period": "1,867.60", "gross_ytd": "£9,338.00"},
+        "deductions": {"income_tax": "164.02", "income_tax_ytd": "820.10"},
+        "net_pay": "1,638.01",
+        "confidence": {"pay.gross_this_period": 1.0},
+    }
+    model_extract = _ModelExtract.model_validate(_normalise_numbers(raw))
+
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.pay.gross_this_period == Decimal("1867.60")
+    assert result.pay.gross_ytd == Decimal("9338.00")
+    assert result.net_pay == Decimal("1638.01")
+    assert "pay.gross_this_period" not in result.unreadable_fields
+
+
+def test_a_parse_failure_is_not_reported_as_not_a_payslip():
+    """MalformedExtraction, not NotAPayslip. "This is not a payslip" is a
+    statement about the user's document; a value we could not parse is a
+    statement about our own round trip.
+
+    Asserted on the provider call, which is where the ValidationError is
+    wrapped - model_validate itself raises pydantic's own error.
+    """
+    import json as _json
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            arguments = _json.dumps(
+                {"is_payslip": True, "pay": {"gross_this_period": "not a number"}}
+            )
+            function = SimpleNamespace(name="record_payslip_extract", arguments=arguments)
+            tool_call = SimpleNamespace(function=function)
+            message = SimpleNamespace(tool_calls=[tool_call])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    with patch("slyp.extraction.openai.OpenAI", return_value=fake_client):
+        with pytest.raises(MalformedExtraction):
+            _call_openai_model("Gross 2500.00")
+
+
+def test_a_comma_would_have_been_a_parse_failure_before_normalisation():
+    """The regression this guards: the same answer with a comma in it now
+    parses, where it used to raise."""
+    import json as _json
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            arguments = _json.dumps(
+                {"is_payslip": True, "pay": {"gross_this_period": "1,867.60"}}
+            )
+            function = SimpleNamespace(name="record_payslip_extract", arguments=arguments)
+            tool_call = SimpleNamespace(function=function)
+            message = SimpleNamespace(tool_calls=[tool_call])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    with patch("slyp.extraction.openai.OpenAI", return_value=fake_client):
+        parsed = _call_openai_model("Gross 1,867.60")
+
+    assert parsed.pay.gross_this_period == Decimal("1867.60")
+
+
+def test_malformed_extraction_is_not_a_subclass_of_not_a_payslip():
+    """They map to different messages in main.py, so one must not be caught
+    by the other's handler."""
+    assert not issubclass(MalformedExtraction, NotAPayslip)
+    assert not issubclass(NotAPayslip, MalformedExtraction)

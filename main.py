@@ -62,6 +62,7 @@ from pdfplumber.utils.exceptions import PdfminerException
 from slyp.analysis import analyse_payslip
 from slyp.contract import AnalysisResult, UserContext
 from slyp.extraction import (
+    MalformedExtraction,
     NotAPayslip,
     RedactionFailure,
     UnreadableDocument,
@@ -303,6 +304,23 @@ async def analyse(request: Request) -> AnalysisResult:
             "scan or an image export. We can't read images yet, so "
             "there's nothing here we can check. A PDF downloaded straight "
             "from your payroll system will normally work.",
+        )
+
+    except MalformedExtraction:
+        # NOT NotAPayslip. The document is a payslip, we read it, and a
+        # value in the answer would not parse - most often a figure that
+        # came back with a thousands separator. Telling someone their
+        # payslip is not a payslip because of a comma is both wrong and
+        # unactionable, and it is what this used to say.
+        #
+        # "Try again" is honest here: the failure depends on how the model
+        # formatted its answer, which varies run to run on the same file.
+        logger.info("analyse failed: could not parse the model output in %.3fs", _elapsed())
+        return _clean_error(
+            422,
+            "We read your payslip but couldn't make sense of one of the "
+            "figures on it, so we stopped rather than guess. Please try "
+            "uploading it again - this one can be intermittent.",
         )
 
     except NotAPayslip:

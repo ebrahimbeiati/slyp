@@ -83,6 +83,24 @@ class NotAPayslip(Exception):
         super().__init__(reason)
 
 
+class MalformedExtraction(Exception):
+    """The document IS a payslip and the model answered, but a value in
+    that answer could not be parsed into the schema.
+
+    Distinct from NotAPayslip on purpose. "This is not a payslip" is a
+    statement about the user's document; this is a statement about our own
+    round trip, and telling someone their payslip is not a payslip because
+    a figure came back with a comma in it is both wrong and unactionable.
+
+    NotAPayslip stays for what it actually means: the model reporting
+    is_payslip=False, or returning no structured output at all.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class RedactionFailure(Exception):
     """assert_safe_to_send found PII in a payload about to be sent. Fails
     closed: raising here must always mean the API call does not happen."""
@@ -742,6 +760,97 @@ def extract_text(pdf_bytes: bytes) -> str:
 # in even if it wanted to guess.
 
 
+# A number as a payslip prints it, which is not a number as Decimal() parses
+# it. The model echoes the document, so it returns "1,867.60" or "£1,867.60"
+# roughly as often as "1867.60" - varying run to run on the same input.
+#
+# Pydantic rejects a thousands separator outright, that ValidationError was
+# turned into NotAPayslip, and main.py rendered it as "We couldn't recognise
+# this document as a payslip". One comma discarded an entire correct
+# extraction and told the user their payslip was not a payslip.
+#
+# Accounting parentheses are included because a refund or a negative
+# adjustment is printed "(123.45)" as often as "-123.45", and income_tax and
+# OtherDeduction.amount can both legitimately be negative.
+_NUMERIC_SHAPE_RE = re.compile(
+    r"""^
+    (?P<neg_before>-)?\s*
+    [£$€]?\s*
+    (?P<neg_after>-)?\s*
+    (?P<digits>\d{1,3}(?:,\d{3})+|\d+)   # 1,234,567 grouped in threes, or plain
+    (?P<fraction>\.\d+)?
+    \s*$""",
+    re.VERBOSE,
+)
+
+
+def normalise_number(value):
+    """
+    A model-supplied value as a plain numeric string, or unchanged.
+
+    Strips thousands separators, one currency symbol and surrounding
+    whitespace, and reads accounting parentheses as a negative.
+
+    Deliberately conservative: anything that does not match a numeric shape
+    end to end is returned EXACTLY as it arrived, so the schema still
+    rejects it. This normalises the input to the existing validation - it
+    does not loosen the validation, and a string that was not a number
+    before is not one afterwards. "1257L" is untouched (letters are not
+    stripped), "12 34 56" is untouched (internal spaces are not), and
+    "abc" is untouched.
+    """
+    if not isinstance(value, str):
+        return value
+
+    text = value.replace(" ", " ").strip()
+    if not text:
+        return value
+
+    bracketed = False
+    if text.startswith("(") and text.endswith(")"):
+        bracketed = True
+        text = text[1:-1].strip()
+
+    match = _NUMERIC_SHAPE_RE.match(text)
+    if match is None:
+        return value
+
+    digits = match.group("digits").replace(",", "")
+    if not digits.isdigit():
+        return value
+
+    # One minus sign, on one side of the currency symbol. "-£5" and "£-5"
+    # are both real; "--5" is not, and tidying it into "-5" would be this
+    # function rescuing garbage rather than normalising a number.
+    signs = [
+        bool(bracketed),
+        bool(match.group("neg_before")),
+        bool(match.group("neg_after")),
+    ]
+    if sum(signs) > 1:
+        return value
+    negative = any(signs)
+
+    return f"{'-' if negative else ''}{digits}{match.group('fraction') or ''}"
+
+
+def _normalise_numbers(payload):
+    """Walk the model's output and normalise every string that is a number.
+
+    Applied to the whole payload rather than to a list of money fields, so
+    a field added to the schema later is covered without anyone
+    remembering to add it here. Safe to apply everywhere because
+    normalise_number() leaves a non-numeric string alone: tax_code.value
+    "1257L", ni_category "A" and student_loan_plan "2" all come through
+    unchanged.
+    """
+    if isinstance(payload, dict):
+        return {key: _normalise_numbers(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_normalise_numbers(item) for item in payload]
+    return normalise_number(payload)
+
+
 class _ModelPeriod(BaseModel):
     """Same shape as contract.Period, minus tax_year. tax_year is always
     derived from pay_date in code (see _tax_year_for) - excluding it here
@@ -933,9 +1042,11 @@ def _call_anthropic_model(filtered_text: str) -> _ModelExtract:
         raise NotAPayslip("model returned no structured output")
 
     try:
-        return _ModelExtract.model_validate(tool_use.input)
+        return _ModelExtract.model_validate(_normalise_numbers(tool_use.input))
     except ValidationError as exc:
-        raise NotAPayslip(f"model output did not match the extraction schema: {exc}") from exc
+        raise MalformedExtraction(
+            f"model output did not match the extraction schema: {exc}"
+        ) from exc
 
 
 def _call_openai_model(filtered_text: str) -> _ModelExtract:
@@ -1014,12 +1125,14 @@ def _call_openai_model(filtered_text: str) -> _ModelExtract:
     try:
         arguments = json.loads(tool_call.function.arguments)
     except json.JSONDecodeError as exc:
-        raise NotAPayslip(f"model output was not valid JSON: {exc}") from exc
+        raise MalformedExtraction(f"model output was not valid JSON: {exc}") from exc
 
     try:
-        return _ModelExtract.model_validate(arguments)
+        return _ModelExtract.model_validate(_normalise_numbers(arguments))
     except ValidationError as exc:
-        raise NotAPayslip(f"model output did not match the extraction schema: {exc}") from exc
+        raise MalformedExtraction(
+            f"model output did not match the extraction schema: {exc}"
+        ) from exc
 
 
 # ==========================================================================
@@ -1784,4 +1897,6 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     try:
         return PayslipExtract(**extract_dict)
     except ValidationError as exc:
-        raise NotAPayslip(f"extract failed contract validation: {exc}") from exc
+        raise MalformedExtraction(
+            f"extract failed contract validation: {exc}"
+        ) from exc
