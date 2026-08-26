@@ -1261,6 +1261,82 @@ _PREVIOUS_EMPLOYMENT_RE = re.compile(
 )
 
 
+# Basis wording a payroll system prints instead of the W1/M1/X suffix HMRC
+# uses. Order matters: the longer forms are tried first so "NONCUM" is not
+# left as "NON" by a shorter rule.
+_BASIS_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\s*\(\s*(W1|M1|X)\s*\)\s*$"), r" \1"),
+    (re.compile(r"(?i)\s*\bNON[\s-]?CUM(?:ULATIVE)?\b\s*$"), " X"),
+    (re.compile(r"(?i)\s*\bCUM(?:UL|ULATIVE)?\b\s*$"), ""),
+    (re.compile(r"(?i)\s*\bWK\s*1\b\s*$"), " W1"),
+    (re.compile(r"(?i)\s*\bMTH\s*1\b\s*$"), " M1"),
+    (re.compile(r"(?i)\s*\bWEEK\s*1\b\s*$"), " W1"),
+    (re.compile(r"(?i)\s*\bMONTH\s*1\b\s*$"), " M1"),
+)
+
+# A single leading letter that belongs to the column BEFORE the code, welded
+# on when pdfplumber collapsed the columns - "NI Rate:M" + "1257L" reaching
+# the model as "M1257L".
+#
+# S, C, K and D are excluded and that exclusion is the whole risk in this
+# function. S and C are the Scottish and Welsh region prefixes and K starts
+# a K code, so stripping any of them would turn a code the engine correctly
+# REFUSES into one it would happily calculate with - a wrong number instead
+# of a refusal, which is the one outcome this codebase is built to avoid.
+#
+# D was added after the first version of this rule turned "D0" into "0".
+# D0 and D1 are valid codes - all higher rate and all additional rate - and
+# they are the only other codes where a letter is followed directly by a
+# digit. Losing the D would have quietly re-banded someone's entire pay.
+# Found by the table below, which is why every valid shape is in it.
+#
+# The cost of excluding a letter is that a genuinely welded D or K is not
+# recovered and the code is refused instead. That is the right way round.
+# There is a test per excluded letter.
+_WELDED_LEADING_LETTER_RE = re.compile(r"^(?![SCKD])[A-Z](?=\d)")
+
+
+def normalise_tax_code(raw: str) -> str:
+    """
+    Tidy a printed tax code into the form _TAX_CODE_RE accepts, without
+    widening what counts as a valid code.
+
+    Every rule removes decoration a payroll system added or a column
+    collapse introduced. None of them invents a code, changes which code is
+    being described, or turns an invalid code into a valid one - a string
+    that is not a tax code before normalisation is not one afterwards,
+    because _TAX_CODE_RE still has to accept the result.
+
+    The alternative was to widen _TAX_CODE_RE itself. That regex is what
+    stops a garbage read becoming a tax code, so it stays exactly as strict
+    as it was and this normalises the input to meet it.
+    """
+    value = raw.strip()
+
+    # Trailing punctuation: "1257L." from a sentence-ended cell.
+    value = re.sub(r"[.,;:]+$", "", value).strip()
+
+    # Basis wording -> the W1/M1/X the engine knows.
+    for pattern, replacement in _BASIS_WORDS:
+        new = pattern.sub(replacement, value)
+        if new != value:
+            value = new.strip()
+            break
+
+    # A column welded to the front. Applied before spaces are collapsed so
+    # "M 1257L" is left alone - a letter with a space after it is a separate
+    # column that merely sits nearby, not one stuck to the code.
+    value = _WELDED_LEADING_LETTER_RE.sub("", value)
+
+    # Internal spaces: "1257 L" -> "1257L", "1257L M1" -> "1257L M1".
+    # Only between a digit and a letter, so the space before a basis suffix
+    # survives - _TAX_CODE_RE accepts it either way, and joining them would
+    # make the value read less like what the payslip printed.
+    value = re.sub(r"(?<=\d)\s+(?=[A-Za-z]\b)", "", value)
+
+    return value.strip()
+
+
 def _shape_of(value: str) -> str:
     """A string as its shape: digits to #, letters to A or a, punctuation
     and spacing kept.
@@ -1518,7 +1594,15 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     # and warnings travel to the frontend and into logs. The SHAPE is enough
     # to tell the two cases apart and to see which rule to write next:
     # "###A Aaaaa" is a basis word, "A####A" is a column welded to the code.
+    # Normalise before validating. Every rule strips decoration a payroll
+    # system added or a column collapse introduced; none of them invents a
+    # code or changes which code is described, and _TAX_CODE_RE is unchanged
+    # so a string that was not a tax code still is not one.
     tax_code_value = model_extract.tax_code.value
+    if tax_code_value is not None:
+        tax_code_value = normalise_tax_code(tax_code_value)
+        model_extract.tax_code.value = tax_code_value or None
+
     if tax_code_value is not None and not _TAX_CODE_RE.match(tax_code_value.strip()):
         unreadable.add("tax_code.value")
         path_warnings.append(

@@ -6,6 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from slyp.extraction import (
+    _TAX_CODE_RE,
+    normalise_tax_code,
     _shape_of,
     _DATE_RE,
     _mask_known_safe_numbers,
@@ -1799,7 +1801,9 @@ def _extract_with_model_tax_code(value, confidence=0.99):
         return extract_payslip(pdf_bytes)
 
 
-@pytest.mark.parametrize("rejected", ["M1257L", "1257L Cumul", "1257 L", "1257L (M1)"])
+# Shapes normalisation deliberately does NOT rescue - see
+# test_normalisation_does_not_rescue_something_that_is_not_a_code.
+@pytest.mark.parametrize("rejected", ["1257LM", "1257L1", "01257L", "M 1257L"])
 def test_a_rejected_tax_code_produces_a_warning(rejected):
     result = _extract_with_model_tax_code(rejected)
 
@@ -1810,7 +1814,7 @@ def test_a_rejected_tax_code_produces_a_warning(rejected):
     ), f"no warning for a rejected code: {result.warnings}"
 
 
-@pytest.mark.parametrize("rejected", ["M1257L", "1257L Cumul", "1257 L"])
+@pytest.mark.parametrize("rejected", ["1257LM", "1257L1", "01257L"])
 def test_the_rejection_warning_never_carries_the_value(rejected):
     """The warning travels to the frontend and into logs, and extraction is
     the one place a payslip's contents are still in the clear. The shape is
@@ -1832,7 +1836,7 @@ def test_an_accepted_tax_code_produces_no_such_warning():
 
 def test_a_missing_tax_code_is_distinguishable_from_a_rejected_one():
     """The whole point: the two cases must no longer look identical."""
-    rejected = _extract_with_model_tax_code("1257L Cumul")
+    rejected = _extract_with_model_tax_code("1257LM")
     missing = _extract_with_model_tax_code(None)
 
     assert rejected.tax_code.value is missing.tax_code.value is None
@@ -1852,3 +1856,123 @@ def test_a_missing_tax_code_is_distinguishable_from_a_rejected_one():
 )
 def test_shape_of_describes_without_disclosing(value, shape):
     assert _shape_of(value) == shape
+
+
+# --------------------------------------------------------------------------
+# Tax code normalisation
+# --------------------------------------------------------------------------
+#
+# _TAX_CODE_RE rejected 18 of 33 plausible printed shapes, and a rejection
+# silently marked the code unreadable. The regex is the guard that stops a
+# garbage read becoming a tax code, so it is unchanged; the input is
+# normalised to meet it instead.
+#
+# Every rule below has a positive case (raw in, expected out) and a
+# negative one proving it does not fire where it should not.
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # trailing punctuation
+        ("1257L.", "1257L"),
+        ("1257L,", "1257L"),
+        ("1257L;", "1257L"),
+        # basis words
+        ("1257L Cumul", "1257L"),
+        ("1257L CUMUL", "1257L"),
+        ("1257L Cumulative", "1257L"),
+        ("1257L NONCUM", "1257L X"),
+        ("1257L NON-CUM", "1257L X"),
+        ("1257L Wk1", "1257L W1"),
+        ("1257L Mth1", "1257L M1"),
+        ("1257L Week1", "1257L W1"),
+        ("1257L Month1", "1257L M1"),
+        ("1257L (M1)", "1257L M1"),
+        ("1257L (W1)", "1257L W1"),
+        # internal space
+        ("1257 L", "1257L"),
+        ("1257 T", "1257T"),
+        # welded leading column
+        ("M1257L", "1257L"),
+        ("A1257L", "1257L"),
+        # combinations
+        ("M1257L Cumul", "1257L"),
+        (" 1257 L. ", "1257L"),
+    ],
+)
+def test_normalisation_positive(raw, expected):
+    assert normalise_tax_code(raw) == expected
+    assert _TAX_CODE_RE.match(normalise_tax_code(raw)), (
+        f"{raw!r} normalised to {normalise_tax_code(raw)!r}, still rejected"
+    )
+
+
+@pytest.mark.parametrize(
+    "already_valid",
+    ["1257L", "1257L M1", "1257L W1", "1257L X", "1257LM1", "BR", "D0", "D1",
+     "0T", "NT", "K475", "S1257L", "C1257L", "S1257L M1", "C475L", "1257T",
+     "1257N", "BR M1", "D0 W1"],
+)
+def test_normalisation_leaves_every_valid_code_alone(already_valid):
+    """The negative case for all of it: a code that already parses must come
+    out byte-identical."""
+    assert normalise_tax_code(already_valid) == already_valid
+
+
+# --- the leading-letter guard: one test per excluded letter ---------------
+#
+# This exclusion is the whole risk in the change. S and C are the Scottish
+# and Welsh prefixes and K starts a K code - all three are codes the engine
+# deliberately REFUSES, so stripping the letter would turn a refusal into a
+# confident wrong calculation. D was added after the first version turned
+# "D0" into "0", which would have silently re-banded someone's whole pay.
+
+
+@pytest.mark.parametrize(
+    ("code", "why"),
+    [
+        ("S1257L", "Scottish prefix - engine refuses Scottish codes"),
+        ("C1257L", "Welsh prefix - engine refuses Welsh codes"),
+        ("K475", "K code - engine refuses K codes"),
+        ("D0", "all higher rate - a valid code, not a welded column"),
+        ("D1", "all additional rate - a valid code"),
+    ],
+)
+def test_the_leading_letter_guard_never_strips_a_meaningful_prefix(code, why):
+    assert normalise_tax_code(code) == code, why
+    assert normalise_tax_code(code)[0] == code[0], why
+
+
+@pytest.mark.parametrize("prefix", ["S", "C", "K", "D"])
+def test_excluded_prefixes_survive_every_other_rule(prefix):
+    """The guard has to hold when the other rules fire too - stripping the
+    basis word must not expose the prefix to the welded-letter rule."""
+    raw = f"{prefix}1257L Cumul"
+
+    assert normalise_tax_code(raw).startswith(prefix)
+
+
+def test_a_letter_separated_by_a_space_is_a_neighbouring_column_not_a_weld():
+    """"M 1257L" is a column that happens to sit nearby. Only a letter stuck
+    directly to the digits is treated as welded, so this is left alone and
+    refused rather than silently repaired into a code."""
+    assert normalise_tax_code("M 1257L") == "M 1257L"
+    assert not _TAX_CODE_RE.match(normalise_tax_code("M 1257L"))
+
+
+@pytest.mark.parametrize(
+    "not_a_code", ["1257LM", "1257L1", "01257L", "1257", "XYZ", "Tax Code", ""]
+)
+def test_normalisation_does_not_rescue_something_that_is_not_a_code(not_a_code):
+    """Normalisation tidies decoration. It must never turn a non-code into a
+    code - that is what widening _TAX_CODE_RE would have risked."""
+    assert not _TAX_CODE_RE.match(normalise_tax_code(not_a_code))
+
+
+def test_a_normalised_code_is_accepted_end_to_end():
+    result = _extract_with_model_tax_code("1257L Cumul")
+
+    assert result.tax_code.value == "1257L"
+    assert "tax_code.value" not in result.unreadable_fields
+    assert not any("not in a form this engine recognises" in w for w in result.warnings)
