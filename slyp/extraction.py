@@ -246,8 +246,20 @@ _EMPLOYEE_NO_LABEL_RE = re.compile(
 # it, e.g. "[NAME] Payments") - this only catches the labelled case.
 # financial_lines_only() is what catches the unlabelled case, by dropping
 # any line with no currency/date/percent/label content.
-_NAME_LABEL_RE = re.compile(r"(?im)^(Employee Name|Name)\s*:?\s*(.+)$")
-_ADDRESS_LABEL_RE = re.compile(r"(?im)^(Address|Home Address)\s*:?\s*(.+)$")
+# [ \t] rather than \s: the value has to be on the SAME LINE as its label.
+#
+# \s matches \n, so "Name" alone on a line let \s* eat the line break and
+# (.+)$ capture the whole of the NEXT line as the name. On a payslip that
+# next line is routinely figures, so a bare "Name" header destroyed a row
+# of pay data and welded it to the label - the same fault as the sort-code
+# pattern, one field over. A label with no value beside it is a header, not
+# a name.
+_NAME_LABEL_RE = re.compile(r"(?im)^(Employee Name|Name)[ \t]*:?[ \t]*(.+)$")
+# Same reasoning as _NAME_LABEL_RE above, and the same fix: the value must
+# sit on the label's own line. "Address" as a bare header - which is how a
+# multi-line address is usually printed - previously swallowed whichever
+# line came next, and only the first of them.
+_ADDRESS_LABEL_RE = re.compile(r"(?im)^(Address|Home Address)[ \t]*:?[ \t]*(.+)$")
 
 # Words that end a name: payslip vocabulary, plus the company suffixes.
 # Only consulted for the token AFTER a courtesy title, so this list

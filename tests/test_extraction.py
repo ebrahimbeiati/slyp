@@ -1646,3 +1646,62 @@ def test_real_sort_codes_are_still_caught_on_one_line(sort_code):
     redacted, _ = redact(f"Sort Code {sort_code} Account 12345678")
     assert sort_code not in redacted
     assert "[BANK]" in redacted
+
+
+# --------------------------------------------------------------------------
+# A label's value must be on the label's own line
+# --------------------------------------------------------------------------
+#
+# _NAME_LABEL_RE and _ADDRESS_LABEL_RE used \s* between the label and the
+# captured value, and \s matches \n. A bare "Name" or "Address" header -
+# which is how both are usually printed when the value sits underneath -
+# let the pattern eat the line break and capture the whole of the NEXT line
+# as the value. On a payslip that next line is routinely figures, so the
+# label swallowed a row of pay data and welded it to itself.
+#
+# Same fault as the sort-code cross-line match, one field over, and pinned
+# the same way: on line count, so a different pattern developing the same
+# fault fails these too.
+
+
+@pytest.mark.parametrize("label", ["Name", "Employee Name", "Address", "Home Address"])
+def test_bare_label_header_does_not_swallow_the_following_line(label):
+    text = f"{label}\nBasic Pay 1,842.00  Income Tax 214.90"
+
+    redacted, _ = redact(text)
+
+    assert len(redacted.splitlines()) == 2, (
+        f"{label!r} header consumed the line break: {redacted!r}"
+    )
+    assert "1,842.00" in redacted
+    assert "214.90" in redacted
+
+
+@pytest.mark.parametrize(
+    ("labelled", "expected_token"),
+    [
+        ("Employee Name: Mr K Sample", "[NAME]"),
+        ("Name: A Sample", "[NAME]"),
+        ("Name   :   Jonathan Ashworth-Pike", "[NAME]"),
+        ("Employee Name Mr K Sample", "[NAME]"),
+        ("Address: 14 Marlborough Crescent", "[ADDRESS]"),
+        ("Home Address:  Flat 2, 14 High St", "[ADDRESS]"),
+        ("Address 14 Marlborough Crescent, Leeds", "[ADDRESS]"),
+    ],
+)
+def test_a_labelled_value_on_the_same_line_is_still_redacted(labelled, expected_token):
+    """The fix narrows the separator, so every same-line spacing that
+    worked before has to keep working - including tabs, extra spaces and
+    no colon at all."""
+    redacted, _ = redact(labelled)
+
+    assert expected_token in redacted
+    assert labelled.split(":")[-1].strip() not in redacted
+
+
+def test_tab_separated_label_and_value_still_redacted():
+    """[ \t] not [ ] - a PDF text layer can put a tab between the two."""
+    redacted, _ = redact("Employee Name:\tMr K Sample")
+
+    assert "[NAME]" in redacted
+    assert "Mr K Sample" not in redacted
