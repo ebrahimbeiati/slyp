@@ -144,7 +144,18 @@ _POSTCODE_RE = re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", re.IGNORECAS
 # happen for NI numbers (which require letters at fixed positions no
 # money figure has). Sort codes aren't printed with periods on a real
 # payslip anyway; the reported gap (F6) was slashes, not periods.
-_SORT_CODE_RE = re.compile(r"\b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b")
+# Separator is a literal space, hyphen or slash - NOT \s, which matches a
+# newline.
+#
+# A sort code never spans a line break, but \s let this pattern match the
+# tail of one line and the head of the next. On a work-record table with
+# date-first rows it matched '46\n20/07' - the pence of one row's total, the
+# line break, and the next row's DD/MM - and because redact() SUBSTITUTES
+# over the match, the newline was consumed along with it. Three rows became
+# one line reading "38.[BANK]/2026  ES602 Repair...", destroying both the
+# total and the date and welding unrelated columns together. The merge was
+# ours, not pdfplumber's: the extracted text still had the line breaks.
+_SORT_CODE_RE = re.compile(r"\b\d{2}[- /]\d{2}[- /]\d{2}\b")
 
 # Account number: 8 digits, each optionally separated from the next by
 # one of the same characters (excluding "." for the same reason as sort

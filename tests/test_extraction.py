@@ -1589,3 +1589,60 @@ def test_single_digit_day_and_month_dodges_the_collision_by_length():
 
     redacted, _ = redact("Pay Date 5/3/25 Gross 2500.00")
     assert "5/3/25" in redacted
+
+
+# --------------------------------------------------------------------------
+# A sort code never spans a line break
+# --------------------------------------------------------------------------
+#
+# _SORT_CODE_RE used [-\s/] as its separator, and \s matches \n. On a
+# work-record table with date-first rows that let it match '46\n20/07' -
+# the pence of one row's total, the line break, and the next row's DD/MM.
+# redact() SUBSTITUTES over its matches, so the newline went with it and
+# three rows collapsed into one line reading "38.[BANK]/2026 ES602
+# Repair...", destroying a total and a date and welding unrelated columns
+# together.
+#
+# The merge was ours, not pdfplumber's - the extracted text still had its
+# line breaks. Separator is now a literal space, hyphen or slash.
+
+
+def test_sort_code_pattern_does_not_span_a_line_break():
+    """The reported failure, pinned by name. If this regresses, a payslip
+    with a numeric table silently loses rows again."""
+    two_rows = "19/07/2026 ES601 Install 2.50 15.3846 38.46\n20/07/2026 ES602 Repair 1.75 15.3846 26.92"
+
+    for match in _SORT_CODE_RE.finditer(two_rows):
+        assert "\n" not in match.group(0), (
+            f"sort-code pattern matched across a line break: {match.group(0)!r}"
+        )
+
+
+def test_redaction_does_not_weld_table_rows_together():
+    """The consequence, asserted on line count rather than on the pattern -
+    a different pattern developing the same fault would fail this too."""
+    rows = "\n".join(
+        f"{day}/07/2026 ES60{i} Install 2.50 15.3846 3{i}.46"
+        for i, day in enumerate((19, 20, 21, 22), start=1)
+    )
+    redacted, _ = redact(rows)
+
+    assert len(redacted.splitlines()) == len(rows.splitlines())
+    assert "[BANK]" not in redacted
+    for day in (19, 20, 21, 22):
+        assert f"{day}/07/2026" in redacted
+
+
+@pytest.mark.parametrize(
+    "sort_code",
+    ["12-34-56", "12 34 56", "12/34/56", "12-34/56", "12 34-56"],
+)
+def test_real_sort_codes_are_still_caught_on_one_line(sort_code):
+    """The fix narrows the separator class, so every genuine separator has
+    to keep working. F6 was a sort code getting through; that must not
+    reopen."""
+    assert _SORT_CODE_RE.search(sort_code) is not None
+
+    redacted, _ = redact(f"Sort Code {sort_code} Account 12345678")
+    assert sort_code not in redacted
+    assert "[BANK]" in redacted

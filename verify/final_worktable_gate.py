@@ -87,9 +87,16 @@ SYNTHETIC = "\n".join([
     "                                National Insurance 95.52",
     "Total Gross Pay 1,842.00        Net Pay 1,531.58",
     "Work Record",
-    "Demo Number   Date        Description        Hours   Rate      Total",
-    "4471021       20/07/2026  ES601UK Install     2.50   15.3846   38.46",
-    "4471/021/26   21/07/2026  ES601UK Repair      1.75   15.3846   26.92",
+    "Date        Description         Hours   Rate      Total",
+    # Date-first rows. This is the shape that reproduced the reported
+    # failure: _SORT_CODE_RE's [-\s/] separator matched '46\n20/07' - the
+    # pence of one row's total, the line break, and the next row's DD/MM -
+    # and redact() consumed the newline along with it, welding the rows.
+    # With the separator narrowed to a literal space, hyphen or slash this
+    # control passes; before the fix it lost a row per match.
+    "19/07/2026  ES601UK Install      2.50   15.3846   38.46",
+    "20/07/2026  ES601UK Repair       1.75   15.3846   26.92",
+    "21/07/2026  ES601UK Survey       2.00   15.3846   30.77",
 ])
 
 if ARGS:
