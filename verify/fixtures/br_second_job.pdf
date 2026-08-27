@@ -1,0 +1,32 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 600 800] /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 648 >>
+stream
+BT /F1 11 Tf 20 780 Td (Employer: Northwind Trading Ltd) Tj 0 -14 Td (Employee Name: A Sample) Tj 0 -14 Td (Pay Date: 28/08/2026) Tj 0 -14 Td (Tax Period: 5     Payment Period Monthly) Tj 0 -14 Td (Tax Code: BR     NI Table Letter A) Tj 0 -14 Td () Tj 0 -14 Td (Basic Pay 476.00              Income Tax 95.20) Tj 0 -14 Td (                                National Insurance 0.00) Tj 0 -14 Td () Tj 0 -14 Td (Total Gross Pay 476.00        Net Pay 380.80) Tj 0 -14 Td () Tj 0 -14 Td (Year to date) Tj 0 -14 Td (Gross Pay YTD 2,380.00      Income Tax YTD 476.00) Tj 0 -14 Td (                                National Insurance YTD 0.00) Tj 0 -14 Td ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1010
+%%EOF

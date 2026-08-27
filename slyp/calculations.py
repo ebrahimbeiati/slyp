@@ -399,6 +399,38 @@ WHOLE_POUND = Decimal("1")
 
 TAX_YEAR = "2026/27"
 
+# Tax years the rates/thresholds in this module are correct for. A
+# payslip whose derived tax year isn't in this set must be refused, not
+# calculated with the wrong year's rates - keep this beside the rates
+# constants below so it's updated in the same change when a new tax
+# year is added.
+SUPPORTED_TAX_YEARS: frozenset[str] = frozenset({TAX_YEAR})
+
+# ONE YEAR ONLY, deliberately. There is no per-year rate selection in
+# this module - every constant below is a single 2026/27 value - so a
+# second entry in SUPPORTED_TAX_YEARS would silently run an older payslip
+# through this year's numbers. Supporting another year means making the
+# constants below year-aware FIRST, in the same change.
+#
+# What running a 2025/26 payslip through these constants would cost,
+# checked against the constants rather than assumed:
+#   - Income tax: NOTHING. Personal Allowance (12,570), basic rate limit
+#     (37,700), higher (50,270) and additional (125,140) thresholds have
+#     been frozen since 2021/22 and stay frozen to 2027/28, so 2025/26
+#     and 2026/27 are identical.
+#   - National Insurance: NOTHING. The 8%/2% employee rates and the
+#     PT/UEL are the same in both years.
+#   - Student loans: WRONG for plans 1, 2 and 4. Those thresholds are
+#     uprated every April and the values below are the 2026/27 ones
+#     (~£835-1,050/yr higher than 2025/26), so a 2025/26 payslip with a
+#     plan 1/2/4 loan gets too little expected repayment - roughly £7/mo
+#     on plan 2 - and can raise a student-loan mismatch that isn't real.
+#     Plan 5 (25,000) and PG (21,000) are frozen, so those two are the
+#     only ones that would survive the swap unharmed.
+#
+# That last point is the whole reason this is a refusal and not a
+# warning: two of the five plans would produce a confident, wrong figure.
+
 # Standard Personal Allowance.
 PERSONAL_ALLOWANCE = Decimal("12570")
 
@@ -619,21 +651,62 @@ def periods_in_year(frequency: Frequency) -> int:
 
 
 def annualise(
-    amount: Decimal,
+    gross_this_period: Decimal,
+    gross_ytd: Decimal,
+    period_number: int,
     frequency: Frequency,
 ) -> Decimal:
     """
-    Convert one pay-period amount into an annual equivalent.
+    Estimate total pay for the whole tax year if things carry on as they are.
+
+    Year to date, plus this period's gross repeated for the periods left:
+
+        gross_ytd + gross_this_period * (periods_in_year - period_number)
+
+    This is a gate, not a displayed figure: it exists so the findings layer
+    can detect someone whose full-year earnings look set to land under the
+    Personal Allowance while tax is still being deducted. Its output must
+    never be shown to the user as a projected pound amount.
     """
-    amount = to_money(amount)
+    periods = periods_in_year(frequency)
 
-    if frequency == "monthly":
-        return amount * Decimal("12")
+    return to_money(gross_ytd) + to_money(gross_this_period) * Decimal(
+        periods - period_number
+    )
 
-    if frequency == "weekly":
-        return amount * Decimal("52")
 
-    raise UnsupportedPayslip(f"Unsupported pay frequency: {frequency}")
+# ============================================================================
+# TAX YEAR VALIDATION
+# ============================================================================
+
+
+def validate_tax_year(tax_year: Optional[str]) -> None:
+    """
+    Raise UnsupportedPayslip unless `tax_year` is one this engine has
+    rates for.
+
+    `None` (tax year could not be derived - the pay date was unreadable
+    or absent) refuses too, rather than silently assuming the current
+    tax year: a payslip with no determinable date is exactly the case
+    where guessing "current year" would be most likely wrong and least
+    likely to be noticed.
+
+    Enforced unconditionally. There is deliberately no bypass flag: one
+    existed for the demo, and a constant that turns a correctness guard
+    off is exactly the kind of thing that survives into production. See
+    SUPPORTED_TAX_YEARS for what an unsupported year would actually get
+    wrong (student loan plans 1, 2 and 4).
+    """
+    if tax_year is None:
+        raise UnsupportedPayslip(
+            "The tax year for this payslip could not be determined."
+        )
+
+    if tax_year not in SUPPORTED_TAX_YEARS:
+        raise UnsupportedPayslip(
+            f"This payslip is from tax year {tax_year}, which is not "
+            f"currently supported."
+        )
 
 
 # ============================================================================
@@ -681,9 +754,26 @@ def parse_tax_code(
             compact = compact[: -len(suffix)]
             break
 
-    # NT
+    # Scottish (S) or Welsh (C) prefix. Applying rest-of-UK bands to these
+    # would produce a confidently wrong number, so refuse rather than
+    # approximate. Standard codes always start with a digit, so this
+    # cannot collide with them.
+    if compact[:1] == "S":
+        raise UnsupportedPayslip(f"Scottish tax codes are outside the MVP: {raw}")
+
+    if compact[:1] == "C":
+        raise UnsupportedPayslip(f"Welsh tax codes are outside the MVP: {raw}")
+
+    # NT — no tax due, always. Distinct from 0T: NT is exempt, not banded
+    # on a zero allowance.
     if compact == "NT":
-        raise UnsupportedPayslip("NT tax code is outside the MVP calculation scope.")
+        return TaxCode(
+            raw=raw,
+            kind="NT",
+            free_pay_annual=ZERO,
+            cumulative=cumulative,
+            region="UK",
+        )
 
     # BR
     if compact == "BR":
@@ -725,22 +815,10 @@ def parse_tax_code(
             region="UK",
         )
 
-    # K code.
+    # K code. Adds notional pay rather than deducting free pay, and carries
+    # a regulatory limit on how much can be added — out of MVP scope.
     if compact.startswith("K"):
-        number = compact[1:]
-
-        if not number.isdigit():
-            raise UnsupportedPayslip(f"Unrecognised K tax code: {raw}")
-
-        allowance = Decimal(number) * Decimal("-10")
-
-        return TaxCode(
-            raw=raw,
-            kind="K",
-            free_pay_annual=allowance,
-            cumulative=cumulative,
-            region="UK",
-        )
+        raise UnsupportedPayslip(f"K tax codes are outside the MVP: {raw}")
 
     # Standard numeric + letter tax code.
     #
@@ -769,177 +847,32 @@ def parse_tax_code(
 
 
 # ============================================================================
-# PERSONAL ALLOWANCE
+# PERSONAL ALLOWANCE / ANNUAL TAX  —  deliberately absent
 # ============================================================================
-
-
-def personal_allowance_for_income(
-    annual_income: Decimal,
-) -> Decimal:
-    """
-    Calculate Personal Allowance.
-
-    £12,570 normally.
-
-    Above £100,000, allowance is reduced by £1 for every £2 of
-    adjusted net income above £100,000.
-
-    At £125,140 the allowance reaches zero.
-
-    The MVP deliberately rejects income above £100,000 elsewhere in the
-    engine because the payslip contract says the allowance taper is outside
-    MVP scope. This helper is kept explicit so the rule is not hidden.
-    """
-
-    annual_income = non_negative(annual_income)
-
-    if annual_income <= PERSONAL_ALLOWANCE_TAPER_START:
-        return PERSONAL_ALLOWANCE
-
-    excess = annual_income - PERSONAL_ALLOWANCE_TAPER_START
-
-    reduction = excess / Decimal("2")
-
-    allowance = PERSONAL_ALLOWANCE - reduction
-
-    return max(
-        ZERO,
-        allowance,
-    )
-
-
-# ============================================================================
-# TAXABLE INCOME
-# ============================================================================
-
-
-def taxable_income(
-    annual_gross: Decimal,
-    tax_code: TaxCode,
-) -> Decimal:
-    """
-    Calculate taxable annual income after the allowance represented by
-    the tax code.
-
-    For normal tax codes:
-        taxable = gross - allowance
-
-    For K codes:
-        negative allowance increases taxable income.
-    """
-
-    annual_gross = non_negative(annual_gross)
-
-    allowance = tax_code.free_pay_annual
-
-    taxable = annual_gross - allowance
-
-    return max(
-        ZERO,
-        taxable,
-    )
-
-
-# ============================================================================
-# ANNUAL INCOME TAX
-# ============================================================================
-
-
-def annual_income_tax(
-    annual_gross: Decimal,
-    tax_code: TaxCode,
-) -> Decimal:
-    """
-    Calculate annual UK income tax for England/Wales/Northern Ireland.
-
-    Supported:
-        standard
-        BR
-        D0
-        D1
-        0T
-        K
-
-    The tax code determines the available allowance.
-
-    Standard tax bands:
-        20% basic
-        40% higher
-        45% additional
-    """
-
-    annual_gross = non_negative(annual_gross)
-
-    if annual_gross > PERSONAL_ALLOWANCE_TAPER_START:
-        raise UnsupportedPayslip(
-            "Income above £100,000 is outside the MVP because "
-            "Personal Allowance tapering is not supported."
-        )
-
-    if tax_code.kind == "NT":
-        raise UnsupportedPayslip("NT tax code is outside the MVP.")
-
-    # ------------------------------------------------------------
-    # BR
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "BR":
-        return money(annual_gross * BASIC_RATE)
-
-    # ------------------------------------------------------------
-    # D0
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "D0":
-        return money(annual_gross * HIGHER_RATE)
-
-    # ------------------------------------------------------------
-    # D1
-    # ------------------------------------------------------------
-
-    if tax_code.kind == "D1":
-        return money(annual_gross * ADDITIONAL_RATE)
-
-    # ------------------------------------------------------------
-    # 0T and standard/K codes
-    # ------------------------------------------------------------
-
-    taxable = taxable_income(
-        annual_gross,
-        tax_code,
-    )
-
-    if taxable <= ZERO:
-        return ZERO
-
-    # Basic rate.
-    basic_amount = min(
-        taxable,
-        BASIC_RATE_LIMIT,
-    )
-
-    tax = basic_amount * BASIC_RATE
-
-    # Higher rate.
-    higher_amount = min(
-        max(
-            ZERO,
-            taxable - BASIC_RATE_LIMIT,
-        ),
-        ADDITIONAL_RATE_THRESHOLD - BASIC_RATE_LIMIT,
-    )
-
-    tax += higher_amount * HIGHER_RATE
-
-    # Additional rate.
-    additional_amount = max(
-        ZERO,
-        taxable - ADDITIONAL_RATE_THRESHOLD,
-    )
-
-    tax += additional_amount * ADDITIONAL_RATE
-
-    return money(tax)
+#
+# personal_allowance_for_income(), taxable_income() and annual_income_tax()
+# used to live here. All three are gone, on purpose.
+#
+# annual_income_tax() was the only function in the file that refused income
+# above £100,000 — and it had zero callers, so it refused nothing. That is
+# how a correct £150,000 payslip came back claiming £678.37 of income tax
+# had been under-deducted: the live path (income_tax_due) had no such check,
+# and the guard everyone believed in sat on a function nothing called.
+# taxable_income() was called only by annual_income_tax(), and
+# personal_allowance_for_income() was called by nothing at all.
+#
+# The refusal now lives in assert_allowance_not_tapered(), reached from
+# income_tax_due() — see there. It is not duplicated here, because a second
+# copy on a dead path is exactly the failure being fixed.
+#
+# personal_allowance_for_income() in particular is not coming back until the
+# engine genuinely supports the taper: a live function that computes a
+# tapered allowance, in a codebase whose stated rule is to REFUSE rather
+# than taper, is an invitation to wire it in and start producing the exact
+# figures this engine promises not to produce.
+#
+# PERSONAL_ALLOWANCE_TAPER_START is retained above — it is now the
+# threshold the live guard tests against.
 
 
 # ============================================================================
@@ -953,15 +886,8 @@ def cumulative_income_tax_due(
     """
         Calculate the income tax that should be deducted THIS pay period.
 
-        This is the important distinction between:
-
-            annual_income_tax()
-
-    and:
-
-            cumulative_income_tax_due()
-
-    A cumulative PAYE payslip does not simply calculate:
+    The important distinction is between a whole YEAR's tax and THIS
+    PERIOD's. A cumulative PAYE payslip does not simply calculate:
 
         annual tax / 12
 
@@ -986,30 +912,12 @@ def cumulative_income_tax_due(
     if facts.tax_code.cumulative is False:
         return non_cumulative_income_tax_due(facts)
 
-    annualised_current = annualised(
-        facts.gross_ytd,
-        facts.frequency,
-    )
-
-    # We need the tax allowance accumulated up to the current period.
-    periods = periods_in_year(facts.frequency)
-
     current_period = facts.period_number
 
-    accumulated_allowance = (
-        facts.tax_code.free_pay_annual * Decimal(current_period) / Decimal(periods)
-    )
-
-    # K codes have negative allowance.
-    cumulative_taxable = facts.gross_ytd - accumulated_allowance
-
-    cumulative_taxable = max(
-        ZERO,
-        cumulative_taxable,
-    )
-
-    cumulative_tax = cumulative_tax_on_taxable_amount(
-        cumulative_taxable,
+    cumulative_tax = cumulative_tax_due_to_date(
+        facts.gross_ytd,
+        current_period,
+        facts.frequency,
         facts.tax_code,
     )
 
@@ -1025,17 +933,10 @@ def cumulative_income_tax_due(
     if current_period <= 1 or previous_gross_ytd <= ZERO:
         return money(cumulative_tax)
 
-    previous_allowance = (
-        facts.tax_code.free_pay_annual * Decimal(current_period - 1) / Decimal(periods)
-    )
-
-    previous_taxable = max(
-        ZERO,
-        previous_gross_ytd - previous_allowance,
-    )
-
-    previous_tax = cumulative_tax_on_taxable_amount(
-        previous_taxable,
+    previous_tax = cumulative_tax_due_to_date(
+        previous_gross_ytd,
+        current_period - 1,
+        facts.frequency,
         facts.tax_code,
     )
 
@@ -1046,6 +947,41 @@ def cumulative_income_tax_due(
             ZERO,
             current_tax,
         )
+    )
+
+
+def cumulative_tax_due_to_date(
+    gross_ytd: Decimal,
+    period_number: int,
+    frequency: Frequency,
+    tax_code: TaxCode,
+) -> Decimal:
+    """
+    Tax that should have been deducted in total, from period 1 through the
+    given period, under a cumulative tax code.
+
+    Used both by cumulative_income_tax_due() (this period's figure is
+    to-date minus the prior period's to-date figure) and by the findings
+    layer, which uses it to work out what a cumulative code WOULD have
+    deducted by now — the comparison an emergency/non-cumulative code's
+    overpayment estimate depends on.
+    """
+
+    periods = periods_in_year(frequency)
+
+    accumulated_allowance = (
+        tax_code.free_pay_annual * Decimal(period_number) / Decimal(periods)
+    )
+
+    # K codes have negative allowance.
+    cumulative_taxable = max(
+        ZERO,
+        non_negative(gross_ytd) - accumulated_allowance,
+    )
+
+    return cumulative_tax_on_taxable_amount(
+        cumulative_taxable,
+        tax_code,
     )
 
 
@@ -1137,6 +1073,147 @@ def non_cumulative_income_tax_due(
         taxable,
         facts.tax_code,
     )
+
+
+# ============================================================================
+# INCOME TAX — PUBLIC ENTRY POINT
+# ============================================================================
+
+
+def assert_allowance_not_tapered(
+    facts: PayPeriodFacts,
+) -> None:
+    """
+    Refuse a payslip whose full-year pay looks set to exceed £100,000,
+    where the Personal Allowance is withdrawn by £1 for every £2 above
+    the threshold. This engine does not model that withdrawal, so past
+    the threshold it would apply an allowance the taxpayer does not have
+    and report the difference as an under-deduction — a confidently wrong
+    pound figure, which is the one thing this engine must not produce.
+
+    WHY THIS LIVES HERE. The same rule used to sit in annual_income_tax(),
+    a function with zero callers, so it protected nothing: a correct
+    £150,000 payslip came back with a finding claiming £678.37 of income
+    tax had been under-deducted. income_tax_due() is the single entry
+    point every caller actually reaches (see its docstring), so the guard
+    belongs on it, and annual_income_tax() has been deleted rather than
+    left beside it as a second, dead copy.
+
+    BASIS: the ANNUALISED projection, not year-to-date and not this
+    period's gross alone.
+
+      - Year-to-date alone under-detects for most of the year. A £150,000
+        earner is only £75,000 in by month 6, so months 1-8 would sail
+        through and be computed with a full allowance — precisely the
+        wrong-figure failure this guard exists to stop.
+      - This period's gross x periods-in-year over-detects for anyone who
+        started mid-year, and ignores pay already banked.
+      - annualise() is the projection the engine already uses as a gate
+        for the mirror-image question (is full-year pay set to land UNDER
+        the Personal Allowance — see analysis.analyse_payslip). Using the
+        same basis for both ends of the allowance keeps one definition of
+        "what this person is on course to earn".
+
+    annualise() over-projects on a one-off bonus period (it repeats this
+    period's gross across the periods remaining). That direction is the
+    safe one: it can refuse a payslip that would have calculated fine,
+    which costs a finding, and never accepts one that would calculate
+    wrongly, which would cost a wrong number. A missing finding is fine,
+    a wrong one is not.
+
+    SCOPE: only codes that actually grant an allowance. BR, D0, D1 and 0T
+    all carry free_pay_annual == 0, so there is no allowance to taper and
+    the banded arithmetic is already correct at any income — 0T on
+    £150,000 returns £53,703.00, exactly right. Refusing those would
+    refuse a calculation the engine gets right. K codes carry a negative
+    allowance and are already refused in parse_tax_code(), so they never
+    arrive here.
+    """
+
+    if facts.tax_code.free_pay_annual <= ZERO:
+        return
+
+    projected_annual = annualise(
+        facts.gross_this_period,
+        facts.gross_ytd,
+        facts.period_number,
+        facts.frequency,
+    )
+
+    if projected_annual > PERSONAL_ALLOWANCE_TAPER_START:
+        raise UnsupportedPayslip(
+            "This payslip is on course to earn more than £100,000 over the "
+            "tax year. Above £100,000 the Personal Allowance is gradually "
+            "taken away, and we do not yet work that out — so rather than "
+            "show you a tax figure that assumes an allowance you may not "
+            "have, we have not estimated one for this payslip."
+        )
+
+
+def allowance_used_to_date(
+    gross_ytd: Decimal,
+    tax_code: TaxCode,
+) -> Decimal:
+    """
+    How much of the ANNUAL Personal Allowance this employment's pay has
+    used so far: year-to-date gross, capped at the allowance the code
+    grants. You cannot use more allowance than you have.
+
+    Deliberately the annual view, not the cumulative-to-date grant. Under
+    cumulative PAYE the allowance is released in slices - by month 5 a
+    1257L code has granted 5/12 of GBP 12,570 - and tax is due on anything
+    above that slice. This function answers a different and simpler
+    question: of the year's whole allowance, how much have these earnings
+    consumed. That is the figure that matters at year end, it needs no
+    period number to state, and it cannot drift with the pay pattern.
+
+    Pure arithmetic on two numbers the payslip carries. Says nothing about
+    what happens by April: whether the caller may show it at all is
+    analysis.build_allowance_usage()'s decision, not this function's.
+    """
+    allowance = tax_code.free_pay_annual
+
+    if allowance <= ZERO:
+        return ZERO
+
+    return money(min(non_negative(gross_ytd), allowance))
+
+
+def income_tax_due(
+    facts: PayPeriodFacts,
+) -> Decimal:
+    """
+    Income tax that should be deducted THIS pay period.
+
+    Single entry point for the findings layer and the API. Owns dispatch
+    between the cumulative and non-cumulative calculations; BR, D0 and D1
+    are handled inside both via cumulative_tax_on_taxable_amount(). NT is
+    always zero regardless of basis.
+
+    Raises UnsupportedPayslip — never approximates — for anything outside
+    MVP scope: Scottish/Welsh tax codes, K codes, an unparseable tax code,
+    an unsupported NI category, an out-of-range period number, or pay on
+    course to exceed the £100,000 Personal Allowance taper threshold.
+    Callers must treat that as "we cannot tell", not as zero or a hedged
+    figure.
+
+    Being the single entry point is what makes the taper guard below
+    cover BOTH bases: cumulative_income_tax_due() dispatches to
+    non_cumulative_income_tax_due() for a W1/M1/X code, so neither can be
+    reached from the request path without passing through here first.
+    """
+
+    validate_pay_period_facts(facts)
+
+    if facts.tax_code.kind == "NT":
+        # NT is exempt outright — no tax at any income — so the allowance,
+        # tapered or not, is irrelevant. Checked before the taper guard so
+        # a high-earning NT payslip is answered rather than refused.
+        return ZERO
+
+    assert_allowance_not_tapered(facts)
+
+    return cumulative_income_tax_due(facts)
 
 
 # ============================================================================
@@ -1296,7 +1373,7 @@ def calculate_pay_breakdown(
 
     validate_pay_period_facts(facts)
 
-    income_tax = cumulative_income_tax_due(facts)
+    income_tax = income_tax_due(facts)
 
     national_insurance = national_insurance_due(
         facts.gross_this_period,
@@ -1322,37 +1399,6 @@ def calculate_pay_breakdown(
 # ============================================================================
 # NET PAY
 # ============================================================================
-
-
-def calculate_expected_net(
-    facts: PayPeriodFacts,
-    pension_employee: Decimal = ZERO,
-) -> Decimal:
-    """
-    Calculate expected net pay.
-
-    Pension is supplied separately because the engine cannot safely infer
-    pension treatment from gross pay alone.
-    """
-
-    breakdown = calculate_pay_breakdown(facts)
-
-    pension = money(pension_employee)
-
-    net = (
-        breakdown.gross
-        - breakdown.income_tax
-        - breakdown.national_insurance
-        - breakdown.student_loan
-        - pension
-    )
-
-    return money(
-        max(
-            ZERO,
-            net,
-        )
-    )
 
 
 # ============================================================================
@@ -1397,99 +1443,6 @@ def reconcile_payslip(
     )
 
     return money(expected_net) == money(net_pay)
-
-
-# ============================================================================
-# COMPARE ACTUAL VS EXPECTED
-# ============================================================================
-
-
-@dataclass(frozen=True)
-class CalculationComparison:
-    """
-    Difference between what the payslip says and what the engine calculates.
-    """
-
-    income_tax_actual: Decimal
-    income_tax_expected: Decimal
-    income_tax_difference: Decimal
-
-    national_insurance_actual: Decimal
-    national_insurance_expected: Decimal
-    national_insurance_difference: Decimal
-
-    student_loan_actual: Decimal
-    student_loan_expected: Decimal
-    student_loan_difference: Decimal
-
-    net_pay_actual: Decimal
-    net_pay_expected: Decimal
-    net_pay_difference: Decimal
-
-    reconciles: bool
-
-
-def compare_with_payslip(
-    facts: PayPeriodFacts,
-    actual_income_tax: Decimal,
-    actual_national_insurance: Decimal,
-    actual_net_pay: Decimal,
-    actual_student_loan: Decimal = ZERO,
-    pension_employee: Decimal = ZERO,
-    other_deductions: Decimal = ZERO,
-) -> CalculationComparison:
-    """
-    Compare engine output against the figures actually printed on the
-    payslip.
-
-    This is the function the findings layer should use when determining
-    whether something looks unusual.
-    """
-
-    expected = calculate_pay_breakdown(facts)
-
-    expected_net = (
-        expected.gross
-        - expected.income_tax
-        - expected.national_insurance
-        - expected.student_loan
-        - money(pension_employee)
-        - money(other_deductions)
-    )
-
-    actual_tax = money(actual_income_tax)
-
-    actual_ni = money(actual_national_insurance)
-
-    actual_loan = money(actual_student_loan)
-
-    actual_net = money(actual_net_pay)
-
-    expected_net = money(expected_net)
-
-    tax_difference = money(actual_tax - expected.income_tax)
-
-    ni_difference = money(actual_ni - expected.national_insurance)
-
-    loan_difference = money(actual_loan - expected.student_loan)
-
-    net_difference = money(actual_net - expected_net)
-
-    return CalculationComparison(
-        income_tax_actual=actual_tax,
-        income_tax_expected=expected.income_tax,
-        income_tax_difference=tax_difference,
-        national_insurance_actual=actual_ni,
-        national_insurance_expected=expected.national_insurance,
-        national_insurance_difference=ni_difference,
-        student_loan_actual=actual_loan,
-        student_loan_expected=expected.student_loan,
-        student_loan_difference=loan_difference,
-        net_pay_actual=actual_net,
-        net_pay_expected=expected_net,
-        net_pay_difference=net_difference,
-        reconciles=(abs(net_difference) <= TWO_DP),
-    )
 
 
 # ============================================================================
@@ -1587,39 +1540,6 @@ def calculate_from_values(
 # ============================================================================
 # DEBUG / DEVELOPMENT HELPERS
 # ============================================================================
-
-
-def explain_calculation(
-    facts: PayPeriodFacts,
-) -> dict[str, Decimal | str]:
-    """
-    Return a machine-readable calculation summary.
-
-    Useful for development and tests.
-
-    Do NOT expose this directly to users as financial advice.
-    """
-
-    breakdown = calculate_pay_breakdown(facts)
-
-    return {
-        "tax_year": TAX_YEAR,
-        "frequency": facts.frequency,
-        "period_number": facts.period_number,
-        "tax_code": facts.tax_code.raw,
-        "gross_this_period": breakdown.gross,
-        "gross_ytd": facts.gross_ytd,
-        "income_tax": breakdown.income_tax,
-        "national_insurance": breakdown.national_insurance,
-        "student_loan": breakdown.student_loan,
-        "pension_employee": breakdown.pension_employee,
-        "net_before_pension": (
-            breakdown.gross
-            - breakdown.income_tax
-            - breakdown.national_insurance
-            - breakdown.student_loan
-        ),
-    }
 
 
 # ============================================================================

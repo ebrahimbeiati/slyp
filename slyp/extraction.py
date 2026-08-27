@@ -12,7 +12,7 @@ negotiable:
     assert_safe_to_send     final re-scan - THIRD, right before the call
     extract_payslip         orchestrates all of the above + the model call
 
-Why that order, concretely: on a real payslip, "NI Number RY 44 99 43 D
+Why that order, concretely: on a real payslip, "NI Number AB 12 34 56 C
 National Insurance 0.00" is one line. The allowlist would keep that line
 outright because it contains a currency amount - so if filtering ran
 before redaction, the NI number would ride along with it. Redacting first
@@ -30,7 +30,7 @@ and columns visually laid out side by side collapse into a single line of
 extracted text, e.g.:
 
     Tax Code 1257L Income Tax 0.00
-    NI Number RY 44 99 43 D National Insurance 0.00
+    NI Number AB 12 34 56 C National Insurance 0.00
 
 No regex reliably recovers which label a mid-line value belongs to once
 columns have collapsed like that - that ambiguity is exactly why this
@@ -40,6 +40,8 @@ step is an LLM call and not a parser.
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ from decimal import Decimal
 from typing import Optional
 
 import anthropic
+import openai
 import pdfplumber
 from pydantic import BaseModel, Field, ValidationError
 
@@ -74,6 +77,24 @@ class UnreadableDocument(Exception):
 class NotAPayslip(Exception):
     """The model reports this isn't a payslip, or its output doesn't fit
     the schema closely enough to trust."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class MalformedExtraction(Exception):
+    """The document IS a payslip and the model answered, but a value in
+    that answer could not be parsed into the schema.
+
+    Distinct from NotAPayslip on purpose. "This is not a payslip" is a
+    statement about the user's document; this is a statement about our own
+    round trip, and telling someone their payslip is not a payslip because
+    a figure came back with a comma in it is both wrong and unactionable.
+
+    NotAPayslip stays for what it actually means: the model reporting
+    is_payslip=False, or returning no structured output at all.
+    """
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -111,13 +132,18 @@ class RedactionMap:
         self.replacements.setdefault(token, []).append(original)
 
 
+# Separator class shared by every structured-number pattern below: space,
+# period, hyphen or slash, any number of them, including a line break
+# (\s matches \n). A real payslip prints these numbers with arbitrary
+# internal punctuation ("AB 12 34 56 C", "AB.12.34.56.C", a value split
+# across a wrapped line) - every character boundary tolerates this rather
+# than assuming one canonical separator.
+_SEP = r"[\s./-]*"
+
 # NI number: two letters (excluding D,F,I,Q,U,V - not valid prefix
-# letters), six digits, one suffix letter A-D. Real payslips print these
-# with arbitrary internal spacing ("RY 44 99 43 D"), so every boundary
-# between characters gets an optional \s* rather than requiring the
-# compact form.
+# letters), six digits, one suffix letter A-D.
 _NI_NUMBER_RE = re.compile(
-    r"\b[A-CEGHJ-PR-TW-Z]\s*[A-CEGHJ-PR-TW-Z]\s*(?:\d\s*){6}[A-D]\b",
+    rf"\b[A-CEGHJ-PR-TW-Z]{_SEP}[A-CEGHJ-PR-TW-Z]{_SEP}(?:\d{_SEP}){{6}}[A-D]\b",
     re.IGNORECASE,
 )
 
@@ -127,15 +153,95 @@ _NI_NUMBER_RE = re.compile(
 # address block with a regex.
 _POSTCODE_RE = re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", re.IGNORECASE)
 
-# Sort code: "12-34-56" or "12 34 56".
-_SORT_CODE_RE = re.compile(r"\b\d{2}[-\s]\d{2}[-\s]\d{2}\b")
+# Sort code: three pairs of digits, each pair separated by one of
+# space/hyphen/slash - "12-34-56", "12 34 56", "12/34/56", or mixed
+# ("12-34/56"). Deliberately NOT "." here (unlike the other patterns in
+# this section): two adjacent currency amounts like "37.60 13.85" would
+# otherwise match as a fake sort code ("60 13.85") purely because a
+# decimal point is a valid separator character - a collision that can't
+# happen for NI numbers (which require letters at fixed positions no
+# money figure has). Sort codes aren't printed with periods on a real
+# payslip anyway; the reported gap (F6) was slashes, not periods.
+# Separator is a literal space, hyphen or slash - NOT \s, which matches a
+# newline.
+#
+# A sort code never spans a line break, but \s let this pattern match the
+# tail of one line and the head of the next. On a work-record table with
+# date-first rows it matched '46\n20/07' - the pence of one row's total, the
+# line break, and the next row's DD/MM - and because redact() SUBSTITUTES
+# over the match, the newline was consumed along with it. Three rows became
+# one line reading "38.[BANK]/2026  ES602 Repair...", destroying both the
+# total and the date and welding unrelated columns together. The merge was
+# ours, not pdfplumber's: the extracted text still had the line breaks.
+_SORT_CODE_RE = re.compile(r"\b\d{2}[- /]\d{2}[- /]\d{2}\b")
 
-# Account number: bare 8 digits. Deliberately not label-anchored - real
-# payslips don't always print an "Account Number:" label next to it. That
-# also makes it the noisiest pattern here (an 8-digit reference number
-# would also match); assert_safe_to_send and the allowlist are the
-# backstops for what this over-redacts or misses, not this regex alone.
-_ACCOUNT_NUMBER_RE = re.compile(r"\b\d{8}\b")
+# Account number: 8 digits, each optionally separated from the next by
+# one of the same characters (excluding "." for the same reason as sort
+# code, above). Deliberately not label-anchored - real payslips don't
+# always print an "Account Number:" label next to it. That also makes it
+# the noisiest pattern here (an 8-digit reference number would also
+# match); assert_safe_to_send and the allowlist are the backstops for
+# what this over-redacts or misses, not this regex alone.
+#
+# Genuine collision, found live: a UK date in DD/MM/YYYY or DD-MM-YYYY
+# format ("15/12/2025") is exactly 8 digits with the same separator
+# tolerance, so it matches this pattern too - and since redact() runs
+# before financial_lines_only(), the date was gone (replaced with
+# "[BANK]") before the model ever saw it, silently breaking
+# period.pay_date and everything derived from it for the single most
+# common real-world date format. _looks_like_an_unambiguous_date() below
+# exempts a match from account-number redaction only when it's shaped
+# AND semantically valid as a date - day/month-first (DD/MM/YYYY,
+# DD-MM-YYYY) or year-first (YYYY-MM-DD, YYYY/MM/DD) - with a full
+# 4-digit year in a plausible calendar range. Requiring 4 digits (not
+# 2-4) is what keeps this from reopening F6: a 6-digit sort-code-with-
+# slashes bypass ("12/34/56") never has a 4-digit group, so the
+# exemption is structurally unreachable for it. See redact() for why
+# this can't safely extend to the 6-digit sort-code pattern too.
+_ACCOUNT_NUMBER_RE = re.compile(r"\b\d(?:[-\s/]?\d){7}\b")
+
+_DATE_LIKE_DAY_FIRST_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+_DATE_LIKE_YEAR_FIRST_RE = re.compile(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$")
+
+
+def _is_plausible_date(day: int, month: int, year: int) -> bool:
+    return 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2099
+
+
+def _looks_like_an_unambiguous_date(span: str) -> bool:
+    day_first = _DATE_LIKE_DAY_FIRST_RE.match(span)
+    if day_first:
+        day, month, year = (int(group) for group in day_first.groups())
+        if _is_plausible_date(day, month, year):
+            return True
+
+    year_first = _DATE_LIKE_YEAR_FIRST_RE.match(span)
+    if year_first:
+        year, month, day = (int(group) for group in year_first.groups())
+        if _is_plausible_date(day, month, year):
+            return True
+
+    return False
+
+# Catch-all for an identifier the specific patterns above don't recognise:
+# a contiguous run of 6+ digits that isn't part of a decimal amount. A
+# 6- or 7-digit employee/payroll number falls in exactly this gap - too
+# short for the 8-digit account pattern, no separators for the sort-code
+# pattern - so it used to survive redact() untouched and then trip
+# assert_safe_to_send's digit-run check, refusing the whole document.
+#
+# The gate was right to distrust it; the defect was that redact() left it
+# in. Tokenising it here means the payslip still processes AND the number
+# never leaves the process, instead of the previous outcome where it was
+# only luck (the gate) that stopped it being sent.
+#
+# The lookbehind/lookahead keep this off legitimate money: "125000.00"
+# has a 6-digit run, but it's followed by ".00" so it isn't matched, and
+# ".123456" isn't matched because it's a decimal fraction. Comma-grouped
+# amounts ("1,234,567") never have a 6+ contiguous run at all. Runs this
+# long with no decimal point aren't any field in the extraction schema -
+# every money field on a UK payslip prints to two decimal places.
+_UNEXPLAINED_ID_RE = re.compile(r"(?<![\d.])\b\d{6,}\b(?!\.\d)")
 
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
@@ -158,8 +264,64 @@ _EMPLOYEE_NO_LABEL_RE = re.compile(
 # it, e.g. "[NAME] Payments") - this only catches the labelled case.
 # financial_lines_only() is what catches the unlabelled case, by dropping
 # any line with no currency/date/percent/label content.
-_NAME_LABEL_RE = re.compile(r"(?im)^(Employee Name|Name)\s*:?\s*(.+)$")
-_ADDRESS_LABEL_RE = re.compile(r"(?im)^(Address|Home Address)\s*:?\s*(.+)$")
+# [ \t] rather than \s: the value has to be on the SAME LINE as its label.
+#
+# \s matches \n, so "Name" alone on a line let \s* eat the line break and
+# (.+)$ capture the whole of the NEXT line as the name. On a payslip that
+# next line is routinely figures, so a bare "Name" header destroyed a row
+# of pay data and welded it to the label - the same fault as the sort-code
+# pattern, one field over. A label with no value beside it is a header, not
+# a name.
+_NAME_LABEL_RE = re.compile(r"(?im)^(Employee Name|Name)[ \t]*:?[ \t]*(.+)$")
+# Same reasoning as _NAME_LABEL_RE above, and the same fix: the value must
+# sit on the label's own line. "Address" as a bare header - which is how a
+# multi-line address is usually printed - previously swallowed whichever
+# line came next, and only the first of them.
+_ADDRESS_LABEL_RE = re.compile(r"(?im)^(Address|Home Address)[ \t]*:?[ \t]*(.+)$")
+
+# Words that end a name: payslip vocabulary, plus the company suffixes.
+# Only consulted for the token AFTER a courtesy title, so this list
+# doesn't have to be exhaustive - it has to stop the common collisions
+# on a line where a name and a figure sit side by side.
+_NAME_STOP_WORD = (
+    r"PAYE|Tax|Pay|Payments|Deductions|Gross|Net|Total|National|Insurance|"
+    r"NI|NIC|Pension|Student|Loan|Period|Code|Basic|Holiday|Holidays|Rate|"
+    r"Hours|Earnings|Method|Dept|Ref|Ltd|Limited|PLC"
+)
+
+# Title-anchored employee name - the unlabelled case _NAME_LABEL_RE
+# cannot see.
+#
+# financial_lines_only() was documented as the backstop for an
+# unlabelled name, on the reasoning that a name line carries no
+# financial content and so never survives the allowlist. A real payslip
+# broke that: its identity row is
+#
+#     1195 Mr. K SAMPLE 13/02/2026 AB123456C
+#
+# - name, pay date and NI number on one collapsed row (see the module
+# docstring on collapsed columns). The NI number was redacted, and the
+# DATE then kept the whole line through the allowlist, carrying the
+# employee's name to the model. The allowlist is a backstop for a name
+# ALONE on a line, not for one sharing a line with a financial value -
+# exactly the same ordering hazard the module docstring already
+# describes for the NI number, one field over.
+#
+# A courtesy title is a genuine anchor, not a name-shaped guess: it is
+# the one token on such a row that cannot be mistaken for a payslip
+# figure or label. This does NOT try to find untitled names - see
+# redact()'s docstring for that residual gap, which is real.
+#
+# Bounded deliberately: at most four following tokens, each capitalised
+# and alphabetic (an initial, "O'Brien", "Smith-Jones"), and stopped by
+# _NAME_STOP_WORD so "Mr J Smith PAYE Tax 0.00" gives up the name
+# without swallowing the label beside it. Case-sensitive for the name
+# tokens (scoped (?i:...) on the title only), so a lowercase word after
+# a title can't extend the match.
+_TITLED_NAME_RE = re.compile(
+    r"\b(?i:Mr|Mrs|Ms|Miss|Mx|Dr|Prof|Rev)\b\.?"
+    rf"(?:\s+(?!(?i:{_NAME_STOP_WORD})\b)[A-Z][A-Za-z'’-]*\.?){{1,4}}"
+)
 
 # Colon required (unlike the name/address labels below) - "Employer" on
 # its own is too common a prefix on a real payslip ("Employer NIC 24.98"
@@ -206,11 +368,24 @@ def _find_employer_name(text: str, redaction_map: RedactionMap) -> Optional[str]
 
 
 def _redact_pattern(
-    text: str, pattern: re.Pattern[str], token: str, redaction_map: RedactionMap
+    text: str,
+    pattern: re.Pattern[str],
+    token: str,
+    redaction_map: RedactionMap,
+    *,
+    skip_if=None,
 ) -> str:
-    """Replace every whole match of `pattern` with `token`."""
+    """Replace every whole match of `pattern` with `token`.
+
+    `skip_if`, if given, is called with the matched text; a True result
+    leaves that match untouched instead of redacting it. Used to exempt
+    a payslip date that happens to share a bank pattern's digit shape -
+    see _looks_like_an_unambiguous_date().
+    """
 
     def _sub(match: re.Match[str]) -> str:
+        if skip_if is not None and skip_if(match.group(0)):
+            return match.group(0)
         redaction_map.record(token, match.group(0))
         return token
 
@@ -233,11 +408,21 @@ def _redact_labelled(
 def redact(text: str) -> tuple[str, RedactionMap]:
     """
     Replace PII with tokens ([NAME], [NI], [ADDRESS], [EMPLOYEE_NO],
-    [BANK], [EMAIL], [PHONE]) rather than deleting it - layout matters,
-    and a deleted span would just shift everything after it.
+    [BANK], [EMAIL], [PHONE], [NUMBER]) rather than deleting it - layout
+    matters, and a deleted span would just shift everything after it.
 
     Must run before financial_lines_only(). See the module docstring for
     why: a line can carry both PII and a currency amount together.
+
+    KNOWN RESIDUAL GAP, stated plainly because the allowlist is no longer
+    a complete backstop for it (see _TITLED_NAME_RE): a name that is
+    neither labelled ("Employee Name:") nor titled ("Mr", "Ms") and that
+    shares a line with a currency amount or date still reaches the
+    model. "K SAMPLE 13/02/2026" on one row would not be caught here.
+    Closing that needs a name detector, and every name-shaped heuristic
+    tried in this file so far has been wrong more often than right (see
+    _find_employer_name) - a wrong guess here redacts a financial label
+    and breaks extraction. Flagged rather than patched over.
     """
     redaction_map = RedactionMap()
     redacted = text
@@ -248,13 +433,37 @@ def redact(text: str) -> tuple[str, RedactionMap]:
     # digits.
     redacted = _redact_pattern(redacted, _NI_NUMBER_RE, "[NI]", redaction_map)
     redacted = _redact_pattern(redacted, _POSTCODE_RE, "[ADDRESS]", redaction_map)
+    # Sort code has no date exemption: a 6-digit DD/MM/YY date and a real
+    # sort-code-with-slashes bypass (F6) are the same shape, and telling
+    # them apart would need the same day/month plausibility check that
+    # already can't reliably distinguish a coincidental sort code from a
+    # real date (a sort code's digits aren't meaningfully "random" in a
+    # way that rules out a day-1-31/month-1-12-shaped one). Payslips
+    # overwhelmingly print 4-digit years, so this residual gap - an
+    # uncommon 2-digit-year date getting redacted as a sort code - is the
+    # safer default over reopening F6.
     redacted = _redact_pattern(redacted, _SORT_CODE_RE, "[BANK]", redaction_map)
-    redacted = _redact_pattern(redacted, _ACCOUNT_NUMBER_RE, "[BANK]", redaction_map)
+    redacted = _redact_pattern(
+        redacted,
+        _ACCOUNT_NUMBER_RE,
+        "[BANK]",
+        redaction_map,
+        skip_if=_looks_like_an_unambiguous_date,
+    )
     redacted = _redact_pattern(redacted, _EMAIL_RE, "[EMAIL]", redaction_map)
     redacted = _redact_pattern(redacted, _PHONE_RE, "[PHONE]", redaction_map)
     redacted = _redact_labelled(redacted, _EMPLOYEE_NO_LABEL_RE, "[EMPLOYEE_NO]", redaction_map)
     redacted = _redact_labelled(redacted, _NAME_LABEL_RE, "[NAME]", redaction_map)
+    # After the labelled pass, so a labelled "Name: Mr K Onuoha" is
+    # already gone and this only sees the unlabelled rows. See
+    # _TITLED_NAME_RE.
+    redacted = _redact_pattern(redacted, _TITLED_NAME_RE, "[NAME]", redaction_map)
     redacted = _redact_labelled(redacted, _ADDRESS_LABEL_RE, "[ADDRESS]", redaction_map)
+
+    # Last of the value passes, deliberately: every pattern above is more
+    # specific and gets first claim on the same digits, so this only sees
+    # what none of them recognised. See _UNEXPLAINED_ID_RE.
+    redacted = _redact_pattern(redacted, _UNEXPLAINED_ID_RE, "[NUMBER]", redaction_map)
 
     # Runs last and reads the ORIGINAL text, not `redacted` - it needs to
     # see real label text ("Employer:"), and its own guard needs
@@ -271,9 +480,40 @@ def redact(text: str) -> tuple[str, RedactionMap]:
 _CURRENCY_RE = re.compile(r"£?\d[\d,]*\.\d{2}\b")
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s?%")
 _MONTH_NAMES = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+# [- \t] rather than [-\s] in the month-name alternative: a date does not
+# span a line break, and here that mattered in the UNSAFE direction.
+#
+# _DATE_RE has two jobs. financial_lines_only() calls it per line, so a
+# cross-line match was impossible there. But _mask_known_safe_numbers()
+# runs it over the WHOLE payload with .sub(" "), to remove digits that a
+# payslip legitimately explains before the gate looks for unexplained ones.
+# With \s it could match across a newline and mask the last group of a
+# group-printed digit sequence:
+#
+#     Code 123 4567 89
+#     Mar 2026 National Insurance 0.00
+#
+# "89\nMar 2026" masked away leaves "Code 123 4567", two groups instead of
+# three, so _SPLIT_DIGIT_GROUPS_RE no longer fires and the gate passes a
+# payload it refuses when the same digits sit on one line. Four such
+# sequences were found by search; each evades redact(), is caught by the
+# gate's second check alone, and is released by a month name on the
+# following line.
+#
+# The two numeric alternatives below use [/-] and were never affected.
 _DATE_RE = re.compile(
-    rf"\b\d{{1,2}}(?:st|nd|rd|th)?[-\s](?:{_MONTH_NAMES})[a-z]*[-\s]\d{{2,4}}\b"
-    rf"|\b\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}\b",
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?[- \t](?:{_MONTH_NAMES})[a-z]*[- \t]\d{{2,4}}\b"
+    rf"|\b\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}\b"
+    # Year-first / ISO (YYYY-MM-DD). Without this alternative, an ISO
+    # pay date has no financial shape this pattern recognises: the
+    # allowlist (financial_lines_only, below) would drop a line whose
+    # only content is an ISO date, and assert_safe_to_send's digit-run
+    # check (_mask_known_safe_numbers) would flag the same date's
+    # leftover digits as unexplained and refuse a payload that's
+    # already safe - which is exactly what _looks_like_an_unambiguous_
+    # date's ISO branch fixed for account-number redaction, but this is
+    # a separate regex that needed the same fix independently.
+    rf"|\b\d{{4}}[/-]\d{{1,2}}[/-]\d{{1,2}}\b",
     re.IGNORECASE,
 )
 _TAX_CODE_LINE_RE = re.compile(
@@ -283,7 +523,11 @@ _TAX_CODE_LINE_RE = re.compile(
 _KNOWN_LABEL_RE = re.compile(
     r"(?i)\b("
     r"tax code|gross|net pay|national insurance|nic|paye|income tax|"
-    r"pension|student loan|year to date|ytd|hours|rate|pay period|pay date"
+    r"pension|student loan|postgraduate loan|pgl|"
+    r"year to date|ytd|hours|rate|"
+    r"pay(?:ment)? period|pay date|tax period|tax month|tax week|period number|"
+    r"frequency|pay type|pay basis|"
+    r"ni category|ni table|table letter"
     r")\b"
 )
 # Deliberately excludes generic section headers like "Deductions" and
@@ -291,6 +535,26 @@ _KNOWN_LABEL_RE = re.compile(
 # would otherwise survive the filter on the word "Payments" alone - the
 # whole point of the allowlist is that a bare header with no figure
 # attached gets dropped, PII or not.
+#
+# Audited 2026-08 against every field _ModelExtract can report (not just
+# the one gap that was reported): frequency/pay type/pay basis and
+# tax period/tax month/tax week/period number were all missing entirely -
+# a payslip stating its period as "Tax Period Month 9" or its basis as
+# "Pay Frequency Monthly" on a line with no currency figure had that
+# context silently dropped before the model ever saw it. Same problem
+# for ni_category ("NI Table Letter A" contains neither "national
+# insurance" nor "nic" as a substring) and student_loan_plan
+# ("Postgraduate Loan" doesn't contain "student loan").
+#
+# "pay(ment)? period" rather than "pay period", same class of gap, found
+# on a real weekly payslip: the document stated its frequency exactly
+# once, as "Payment Period    Weekly", on a line carrying no currency
+# amount, date, percentage or tax code. "Payment Period" does not
+# contain "pay period" as a substring, so that line was dropped before
+# the model or infer_frequency_from_label() ever saw it - leaving
+# frequency null, period_number underivable, and every calculation
+# skipped behind "We could not complete every calculation", on a payslip
+# that printed both its frequency and its period number in plain text.
 
 
 def financial_lines_only(text: str) -> str:
@@ -303,7 +567,15 @@ def financial_lines_only(text: str) -> str:
     whatever the redaction regexes above missed - most importantly an
     unlabelled name or address line, which has no shape a PII regex can
     anchor to but also has no financial content, so it never survives
-    this filter either way.
+    this filter.
+
+    That last claim holds only for a name ALONE on its line. It used to
+    be written here as though it held for any unlabelled name, and a
+    real payslip disproved that: "1195 Mr. K SAMPLE 13/02/2026
+    AB123456C" is one collapsed row, and the date alone is enough to
+    keep it - name included. Redaction, not this filter, is what has to
+    catch a name sharing a line with a financial value; see
+    _TITLED_NAME_RE and redact()'s stated residual gap.
 
     Must run AFTER redact(). See the module docstring for why.
     """
@@ -323,30 +595,134 @@ def financial_lines_only(text: str) -> str:
 # Final gate
 # ==========================================================================
 
-_PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("NI number", _NI_NUMBER_RE),
-    ("postcode", _POSTCODE_RE),
-    ("sort code", _SORT_CODE_RE),
-    ("account number", _ACCOUNT_NUMBER_RE),
-    ("email", _EMAIL_RE),
-    ("phone", _PHONE_RE),
+_PII_RECHECK_PATTERNS: tuple[tuple[str, re.Pattern[str], object], ...] = (
+    ("NI number", _NI_NUMBER_RE, None),
+    ("postcode", _POSTCODE_RE, None),
+    ("sort code", _SORT_CODE_RE, None),
+    # Same exemption as redact() - see _looks_like_an_unambiguous_date()
+    # and the comment on _ACCOUNT_NUMBER_RE. This check re-scans with
+    # the same shaped patterns redact() uses, so it must apply the same
+    # exemption redact() does - otherwise a date that correctly survives
+    # redact() gets refused here anyway, on a payload that was already
+    # safe to send.
+    ("account number", _ACCOUNT_NUMBER_RE, _looks_like_an_unambiguous_date),
+    ("email", _EMAIL_RE, None),
+    ("phone", _PHONE_RE, None),
+    # Shares redact()'s regex, like every entry above it, so it adds no
+    # independent detection power - what it adds is failing CLOSED if
+    # this pattern ever stops running in redact() (a reordering, an
+    # early return): the payload is refused instead of quietly sent with
+    # a name in it. Check 2 below cannot see a name at all - it only
+    # reasons about unexplained digits - so without this entry a name is
+    # the one PII class the gate has no opinion on whatsoever.
+    ("name", _TITLED_NAME_RE, None),
 )
+
+
+def _has_unexempted_match(pattern: re.Pattern[str], payload: str, skip_if) -> bool:
+    for match in pattern.finditer(payload):
+        if skip_if is not None and skip_if(match.group(0)):
+            continue
+        return True
+    return False
+
+# A run of 6 or more digits WITHIN ONE TOKEN - whitespace deliberately
+# not tolerated here, unlike the structured-number patterns above. Used
+# only as the SECOND, independent check in assert_safe_to_send() - see
+# there for why.
+#
+# Whitespace used to be in this class, which made the check count digits
+# across independent, adjacent numbers and refuse entirely benign lines:
+# "Period 09 2025" reads as a 6-digit run ("09 2025") though it's just a
+# period number beside a year. That produced a live 422 on a real
+# payslip. Space-separated PII is not lost by this: a sequence of
+# uniform digit groups is caught by _SPLIT_DIGIT_GROUPS_RE below, and
+# every space-separated PII shape the pipeline knows (NI number, sort
+# code, account number, phone) is independently caught by check 1.
+_UNEXPLAINED_DIGIT_RUN_RE = re.compile(r"(?:\d[./-]*){6,}")
+
+# The space-separated half of the same check: three or more groups of 2-4
+# digits in a row, each separated by a single space, totalling 6+ digits.
+# That is what PII looks like when it's printed in groups ("44 99 43",
+# "1234 5678 9012") and is a shape no legitimate payslip figure takes -
+# a payslip prints amounts as single tokens, not as uniform digit
+# groups. Requiring 3+ groups is what keeps "Period 09 2025" (two
+# groups, and not uniform) from matching.
+_SPLIT_DIGIT_GROUPS_RE = re.compile(r"\b\d{2,4}(?: \d{2,4}){2,}\b")
+
+# Any decimal number, to any precision - masking only, never used to
+# decide what the allowlist KEEPS (that's _CURRENCY_RE, which requires
+# exactly two decimal places and is deliberately left narrow: widening
+# it would widen what gets sent). Hourly rates are routinely printed to
+# 3-5 decimal places ("Rate 15.3846"), which _CURRENCY_RE doesn't match,
+# so those digits used to survive masking and read as an unexplained
+# run - the other half of the same live 422.
+_MASKABLE_DECIMAL_RE = re.compile(r"\b\d[\d,]*\.\d{1,6}\b")
+
+
+def _mask_known_safe_numbers(text: str) -> str:
+    """Strip every span that legitimately explains a run of digits on a
+    payslip line, leaving only what neither the allowlist nor a normal
+    payslip figure accounts for."""
+    masked = _CURRENCY_RE.sub(" ", text)
+    masked = _PERCENT_RE.sub(" ", masked)
+    masked = _DATE_RE.sub(" ", masked)
+    masked = _TAX_CODE_LINE_RE.sub(" ", masked)
+    masked = _MASKABLE_DECIMAL_RE.sub(" ", masked)
+    return masked
 
 
 def assert_safe_to_send(payload: str) -> None:
     """
-    Final gate, immediately before the API call. Re-scans the exact
-    payload about to be sent with the same patterns redact() uses, and
-    raises rather than sending if anything still matches. Fails closed:
-    if this raises, the caller must not send the payload anyway.
+    Final gate, immediately before the API call. Fails closed: if this
+    raises, the caller must not send the payload anyway.
+
+    Two independent checks, not one:
+
+    1. Re-scans with the same shaped patterns redact() uses. This catches
+       PII that survives on an otherwise-legitimate line - e.g. an NI
+       number sitting next to a currency amount, which the allowlist
+       keeps for the currency amount alone (see the module docstring for
+       why redact() must run before financial_lines_only()).
+
+    2. Masks out every recognised-safe numeric shape (currency, percent,
+       date, tax code, any-precision decimal) and refuses if what's left
+       contains either 6+ digits inside a single token, or three or more
+       uniform digit groups in a row. This doesn't know what an NI
+       number, sort code or account number looks like, so it can't share
+       check 1's blind spot for a shape neither regex set recognises yet
+       - it catches by the ABSENCE of an explanation for a run of
+       digits, not by recognising a specific kind of personal data.
+       "Two labels on one control" is exactly what this function used to
+       be with only check 1.
+
+       The two halves of check 2 exist because whitespace is genuinely
+       ambiguous here: it separates PII printed in groups ("44 99 43")
+       and equally separates unrelated payslip numbers that just happen
+       to sit next to each other ("Period 09 2025"). Treating it as an
+       intra-number separator refused benign payslips; ignoring it
+       entirely would miss group-printed PII. Splitting the check keeps
+       both.
 
     Deliberately does not include the matched text in the exception
     message - the point of this function is to stop PII leaving the
     process, so it must not leak it into a log line instead.
     """
-    for label, pattern in _PII_RECHECK_PATTERNS:
-        if pattern.search(payload):
+    for label, pattern, skip_if in _PII_RECHECK_PATTERNS:
+        if _has_unexempted_match(pattern, payload, skip_if):
             raise RedactionFailure(f"payload still matches a PII pattern: {label}")
+
+    masked = _mask_known_safe_numbers(payload)
+
+    if _UNEXPLAINED_DIGIT_RUN_RE.search(masked):
+        raise RedactionFailure(
+            "payload has an unexplained run of digits with no financial shape"
+        )
+
+    if _SPLIT_DIGIT_GROUPS_RE.search(masked):
+        raise RedactionFailure(
+            "payload has an unexplained sequence of digit groups"
+        )
 
 
 # ==========================================================================
@@ -382,6 +758,97 @@ def extract_text(pdf_bytes: bytes) -> str:
 # it. `reconciles` must be computed in code, never self-reported, so it
 # isn't in this schema either - there is no field for the model to fill
 # in even if it wanted to guess.
+
+
+# A number as a payslip prints it, which is not a number as Decimal() parses
+# it. The model echoes the document, so it returns "1,867.60" or "£1,867.60"
+# roughly as often as "1867.60" - varying run to run on the same input.
+#
+# Pydantic rejects a thousands separator outright, that ValidationError was
+# turned into NotAPayslip, and main.py rendered it as "We couldn't recognise
+# this document as a payslip". One comma discarded an entire correct
+# extraction and told the user their payslip was not a payslip.
+#
+# Accounting parentheses are included because a refund or a negative
+# adjustment is printed "(123.45)" as often as "-123.45", and income_tax and
+# OtherDeduction.amount can both legitimately be negative.
+_NUMERIC_SHAPE_RE = re.compile(
+    r"""^
+    (?P<neg_before>-)?\s*
+    [£$€]?\s*
+    (?P<neg_after>-)?\s*
+    (?P<digits>\d{1,3}(?:,\d{3})+|\d+)   # 1,234,567 grouped in threes, or plain
+    (?P<fraction>\.\d+)?
+    \s*$""",
+    re.VERBOSE,
+)
+
+
+def normalise_number(value):
+    """
+    A model-supplied value as a plain numeric string, or unchanged.
+
+    Strips thousands separators, one currency symbol and surrounding
+    whitespace, and reads accounting parentheses as a negative.
+
+    Deliberately conservative: anything that does not match a numeric shape
+    end to end is returned EXACTLY as it arrived, so the schema still
+    rejects it. This normalises the input to the existing validation - it
+    does not loosen the validation, and a string that was not a number
+    before is not one afterwards. "1257L" is untouched (letters are not
+    stripped), "12 34 56" is untouched (internal spaces are not), and
+    "abc" is untouched.
+    """
+    if not isinstance(value, str):
+        return value
+
+    text = value.replace(" ", " ").strip()
+    if not text:
+        return value
+
+    bracketed = False
+    if text.startswith("(") and text.endswith(")"):
+        bracketed = True
+        text = text[1:-1].strip()
+
+    match = _NUMERIC_SHAPE_RE.match(text)
+    if match is None:
+        return value
+
+    digits = match.group("digits").replace(",", "")
+    if not digits.isdigit():
+        return value
+
+    # One minus sign, on one side of the currency symbol. "-£5" and "£-5"
+    # are both real; "--5" is not, and tidying it into "-5" would be this
+    # function rescuing garbage rather than normalising a number.
+    signs = [
+        bool(bracketed),
+        bool(match.group("neg_before")),
+        bool(match.group("neg_after")),
+    ]
+    if sum(signs) > 1:
+        return value
+    negative = any(signs)
+
+    return f"{'-' if negative else ''}{digits}{match.group('fraction') or ''}"
+
+
+def _normalise_numbers(payload):
+    """Walk the model's output and normalise every string that is a number.
+
+    Applied to the whole payload rather than to a list of money fields, so
+    a field added to the schema later is covered without anyone
+    remembering to add it here. Safe to apply everywhere because
+    normalise_number() leaves a non-numeric string alone: tax_code.value
+    "1257L", ni_category "A" and student_loan_plan "2" all come through
+    unchanged.
+    """
+    if isinstance(payload, dict):
+        return {key: _normalise_numbers(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_normalise_numbers(item) for item in payload]
+    return normalise_number(payload)
 
 
 class _ModelPeriod(BaseModel):
@@ -447,6 +914,13 @@ Rules:
   employee one only - never the employer figure.
 - "Year to Date" / "YTD" figures are cumulative for the tax year so far. \
   Keep them separate from this pay period's own figures.
+- period.frequency: a printed period label is enough to read this from - \
+  "Month 9" / "Tax Month 9" means monthly, "Week 39" / "Tax Week 39" \
+  means weekly. You do not need the literal word "Monthly" on the page. \
+  Do NOT infer it from the pay date alone, and return null if the \
+  payslip says only "Period 9" without naming the unit, or names a \
+  frequency that is neither monthly nor weekly (fortnightly, 4-weekly, \
+  quarterly).
 - Report a confidence score from 0 to 1 for every field you fill in, \
   keyed by dotted path (e.g. "pay.gross_this_period"). If you are not \
   confident, return null for that field rather than guessing - a \
@@ -461,11 +935,60 @@ Rules:
   there.
 """
 
-# Model used for extraction. Overridable via env var so this can be
-# changed without a code deploy; the default is a placeholder pick, not a
-# benchmarked choice - revisit once real extractions have been checked
-# for accuracy against the sample payslips.
-_MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL", "claude-sonnet-5")
+# Which LLM provider does the extraction call. "anthropic" (default) or
+# "openai" - deliberately a separate setting from the model name, and
+# deliberately validated at import time (fails loudly on startup, not on
+# the first real upload during a demo).
+_MODEL_PROVIDER = os.environ.get("SLYP_MODEL_PROVIDER", "anthropic").strip().lower()
+
+if _MODEL_PROVIDER not in ("anthropic", "openai"):
+    raise ValueError(
+        f"Unsupported SLYP_MODEL_PROVIDER: {_MODEL_PROVIDER!r}. "
+        f"Expected 'anthropic' or 'openai'."
+    )
+
+if _MODEL_PROVIDER == "anthropic":
+    # Overridable via env var so this can be changed without a code
+    # deploy; the default is a placeholder pick, not a benchmarked
+    # choice - revisit once real extractions have been checked for
+    # accuracy against the sample payslips.
+    _MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL", "claude-sonnet-5")
+else:
+    # No default here, deliberately: a Claude model name is not a valid
+    # guess for an OpenAI model and vice versa, so there's no safe
+    # fallback to invent for a provider switch. Must be set explicitly.
+    _MODEL_NAME = os.environ.get("SLYP_EXTRACTION_MODEL")
+    if not _MODEL_NAME:
+        raise ValueError(
+            "SLYP_EXTRACTION_MODEL must be set when "
+            "SLYP_MODEL_PROVIDER=openai."
+        )
+
+def required_credential_name() -> str:
+    """
+    The environment variable that must hold an API key for whichever
+    provider SLYP_MODEL_PROVIDER selected.
+
+    Exists so the API layer can refuse to start without one, rather than
+    booting healthy and failing on the first upload. Deliberately derived
+    from the resolved _MODEL_PROVIDER above rather than re-reading the
+    environment, so the two can never disagree about which provider is in
+    play - which is the whole failure mode being guarded against.
+
+    The check itself is NOT made here, at import time: this module is
+    imported by the test suite, which has no reason to hold a real key.
+    main.py owns the refusal. See there.
+    """
+    return "OPENAI_API_KEY" if _MODEL_PROVIDER == "openai" else "ANTHROPIC_API_KEY"
+
+
+logger = logging.getLogger(__name__)
+
+# Learned on the first call and reused for the rest of the process - see
+# the retry in _call_openai_model(). Per-process, so each uvicorn worker
+# pays the discovery round trip once.
+_OPENAI_NEEDS_REASONING_EFFORT_NONE = False
+
 _TOOL_NAME = "record_payslip_extract"
 
 # Below this, a field is not trusted even if the model didn't flag it
@@ -476,6 +999,19 @@ _CONFIDENCE_THRESHOLD = 0.7
 
 
 def _call_model(filtered_text: str) -> _ModelExtract:
+    """
+    Dispatches to whichever provider SLYP_MODEL_PROVIDER selects. Both
+    paths force a structured tool/function call against the exact same
+    _ModelExtract schema and _SYSTEM_PROMPT, so nothing downstream
+    (normalisation, confidence thresholding, reconciliation) needs to
+    know or care which provider actually answered.
+    """
+    if _MODEL_PROVIDER == "openai":
+        return _call_openai_model(filtered_text)
+    return _call_anthropic_model(filtered_text)
+
+
+def _call_anthropic_model(filtered_text: str) -> _ModelExtract:
     # anthropic.Anthropic() reads ANTHROPIC_API_KEY from the environment
     # on its own - no key is read or passed here, so there is nowhere in
     # this file for one to leak from.
@@ -506,9 +1042,97 @@ def _call_model(filtered_text: str) -> _ModelExtract:
         raise NotAPayslip("model returned no structured output")
 
     try:
-        return _ModelExtract.model_validate(tool_use.input)
+        return _ModelExtract.model_validate(_normalise_numbers(tool_use.input))
     except ValidationError as exc:
-        raise NotAPayslip(f"model output did not match the extraction schema: {exc}") from exc
+        raise MalformedExtraction(
+            f"model output did not match the extraction schema: {exc}"
+        ) from exc
+
+
+def _call_openai_model(filtered_text: str) -> _ModelExtract:
+    # openai.OpenAI() reads OPENAI_API_KEY from the environment on its
+    # own, same reasoning as the Anthropic path above - and deliberately
+    # a different env var name from ANTHROPIC_API_KEY. Putting one
+    # provider's key under the other provider's variable name is exactly
+    # how this integration broke the first time.
+    client = openai.OpenAI()
+
+    def _create(**extra_params):
+        return client.chat.completions.create(
+            model=_MODEL_NAME,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": filtered_text},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": _TOOL_NAME,
+                        "description": "Record the structured fields read off a UK payslip.",
+                        "parameters": _ModelExtract.model_json_schema(),
+                    },
+                }
+            ],
+            # Forces the tool call, same reasoning as the Anthropic path:
+            # no free-text path for the model to answer through instead.
+            tool_choice={"type": "function", "function": {"name": _TOOL_NAME}},
+            **extra_params,
+        )
+
+    global _OPENAI_NEEDS_REASONING_EFFORT_NONE
+
+    try:
+        response = _create(
+            **({"reasoning_effort": "none"} if _OPENAI_NEEDS_REASONING_EFFORT_NONE else {})
+        )
+    except openai.BadRequestError as exc:
+        # Some reasoning-capable models reject a tool call unless
+        # reasoning_effort is explicitly turned off for it. Confirmed
+        # live against gpt-5.6-sol, which answers:
+        #
+        #   "Function tools with reasoning_effort are not supported for
+        #    gpt-5.6-sol in /v1/chat/completions. To use function tools,
+        #    use /v1/responses or set reasoning_effort to 'none'."
+        #
+        # Nothing in the request is malformed - the parameter it names,
+        # reasoning_effort, is one we never sent. The model applies its
+        # own default, and function tools are unsupported alongside it.
+        #
+        # Still not sent unconditionally: a model that doesn't recognise
+        # the parameter at all would then fail every call instead of
+        # none. But the answer doesn't change between calls, so it's
+        # remembered for the life of the process - otherwise every single
+        # upload pays a doomed round trip first (~2s, and it was showing
+        # up as a 400 in the logs on every request).
+        if "reasoning_effort" in str(exc) and not _OPENAI_NEEDS_REASONING_EFFORT_NONE:
+            _OPENAI_NEEDS_REASONING_EFFORT_NONE = True
+            logger.info(
+                "openai: model requires reasoning_effort='none' for function "
+                "tools; retrying and remembering for this process"
+            )
+            response = _create(reasoning_effort="none")
+        else:
+            raise
+
+    tool_calls = response.choices[0].message.tool_calls or []
+    tool_call = next((tc for tc in tool_calls if tc.function.name == _TOOL_NAME), None)
+
+    if tool_call is None:
+        raise NotAPayslip("model returned no structured output")
+
+    try:
+        arguments = json.loads(tool_call.function.arguments)
+    except json.JSONDecodeError as exc:
+        raise MalformedExtraction(f"model output was not valid JSON: {exc}") from exc
+
+    try:
+        return _ModelExtract.model_validate(_normalise_numbers(arguments))
+    except ValidationError as exc:
+        raise MalformedExtraction(
+            f"model output did not match the extraction schema: {exc}"
+        ) from exc
 
 
 # ==========================================================================
@@ -573,10 +1197,283 @@ def derive_period_number(
     return days_elapsed // 7 + 1
 
 
+# Valid period_number range per frequency - used only by the printed-
+# period-label fallback below, to reject an implausible combination
+# (e.g. "period 45" against a monthly payslip) rather than accept
+# anything the model reports once frequency is confirmed.
+_PERIOD_NUMBER_RANGE: dict[str, range] = {
+    "monthly": range(1, 13),
+    "weekly": range(1, 54),
+}
+
+
+def _period_number_plausible(period_number: int, frequency: Optional[Frequency]) -> bool:
+    valid_range = _PERIOD_NUMBER_RANGE.get(frequency or "")
+    return valid_range is not None and period_number in valid_range
+
+
+# Frequency read from a printed period label. Plenty of payslips never
+# print the word "Monthly" anywhere - they print "Month 9" or "Tax Month
+# 9" - and the prompt tells the model to return null rather than guess,
+# so it correctly returns nothing. Without a frequency, period_number
+# can't be derived, and without period_number the whole calculation is
+# skipped: that surfaces as "We could not complete every calculation".
+#
+# Reading the word "Month" beside a number is extraction, the same
+# operation already trusted for the tax code - not the model inventing a
+# value. Done in code rather than left to the model so it's
+# deterministic and testable without an API call.
+#
+# Requires a DIGIT after the word, so "Week Ending 15/12/2025" (a date
+# label, no period number) doesn't read as weekly.
+_MONTHLY_LABEL_RE = re.compile(
+    r"(?i)\bmonthly\b|\b(?:tax\s+)?month\s*(?:no\.?|number|:)?\s*\d{1,2}\b"
+)
+_WEEKLY_LABEL_RE = re.compile(
+    r"(?i)\bweekly\b|\b(?:tax\s+)?week\s*(?:no\.?|number|:)?\s*\d{1,2}\b"
+)
+
+# Frequencies the engine has no rates or period maths for. If any of
+# these appear, refuse to infer at all rather than let the bare word
+# "weekly" inside "4-weekly" or "bi-weekly" read as plain weekly - that
+# would silently calculate a 4-weekly payslip on weekly thresholds.
+_UNSUPPORTED_FREQUENCY_RE = re.compile(
+    r"(?i)\b(?:fortnight(?:ly)?|bi[-\s]?weekly|(?:2|two|4|four)[-\s]?weekly|"
+    r"quarterly|annual(?:ly)?|yearly|daily)\b"
+)
+
+
+# Pay date read from its printed label. Same motivation as
+# infer_frequency_from_label(): pay_date drives period_number, which
+# gates the whole calculation, and leaving it solely to the model makes
+# the result non-deterministic - the same payslip intermittently loses
+# the field and the user sees "We could not complete every calculation"
+# on some runs and not others, with temperature already pinned to 0.
+#
+# Label-anchored deliberately. A payslip carries several dates - period
+# start and end, continuous service date, tax year dates - and an
+# unanchored "first date on the page" read would confidently pick the
+# wrong one. That's the wrong-value failure this pipeline exists to
+# avoid, and it's worse than a missing field.
+_PAY_DATE_LABEL_RE = re.compile(
+    r"(?i)\b(?:pay\s*(?:ment)?\s*d(?:ate|ay)|date\s+paid)\b[^\n\d]{0,20}?("
+    rf"\d{{1,2}}(?:st|nd|rd|th)?[-\s/](?:{_MONTH_NAMES})[a-z]*[-\s/]\d{{2,4}}"
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r"|\d{4}[/-]\d{1,2}[/-]\d{1,2}"
+    r")"
+)
+
+_MONTH_NUMBER = {
+    name.lower(): index
+    for index, name in enumerate(_MONTH_NAMES.split("|"), start=1)
+}
+
+
+def _parse_labelled_date(raw: str) -> Optional[date]:
+    """Parse the date shapes _PAY_DATE_LABEL_RE captures, or None.
+
+    Day-first for the all-numeric forms: this is a UK payslip, where
+    05/06/2025 is 5 June. A two-digit year is read as 2000-2099 - a
+    payslip is a current document, not a historical one.
+    """
+    cleaned = re.sub(r"(?i)(\d)(st|nd|rd|th)", r"\1", raw.strip())
+    parts = re.split(r"[-\s/]+", cleaned)
+    if len(parts) != 3:
+        return None
+
+    try:
+        if parts[0].isdigit() and len(parts[0]) == 4:  # ISO, year first
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+        elif parts[1].isdigit():  # all numeric, day first
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+        else:  # "15 Dec 2025"
+            month_number = _MONTH_NUMBER.get(parts[1][:3].lower())
+            if month_number is None:
+                return None
+            day, month, year = int(parts[0]), month_number, int(parts[2])
+    except ValueError:
+        return None
+
+    if year < 100:
+        year += 2000
+
+    try:
+        return date(year, month, day)
+    except ValueError:  # e.g. 31 February
+        return None
+
+
+def read_pay_date_from_label(text: str) -> Optional[date]:
+    """
+    Pay date read from an explicit "Pay Date"/"Pay Day"/"Payment Date"/
+    "Date Paid" label, or None.
+
+    Returns None - never a guess - when no labelled date is found, when
+    one is found but doesn't parse to a real calendar date, or when two
+    labelled pay dates disagree. A disagreement means the layout isn't
+    what this assumes, which is exactly when picking one would be wrong.
+    """
+    found = {
+        parsed
+        for parsed in (
+            _parse_labelled_date(match.group(1))
+            for match in _PAY_DATE_LABEL_RE.finditer(text)
+        )
+        if parsed is not None
+    }
+    return found.pop() if len(found) == 1 else None
+
+
+def infer_frequency_from_label(text: str) -> Optional[Frequency]:
+    """
+    Frequency from an explicitly printed period label, or None.
+
+    Returns None - never a guess - when the evidence is absent,
+    contradictory (both a month and a week label), or names a frequency
+    the engine doesn't support. "Period 9" on its own is deliberately
+    not enough: it doesn't say which unit, and picking one would be
+    exactly the invented-value failure this pipeline exists to avoid.
+    """
+    if _UNSUPPORTED_FREQUENCY_RE.search(text):
+        return None
+
+    monthly = _MONTHLY_LABEL_RE.search(text) is not None
+    weekly = _WEEKLY_LABEL_RE.search(text) is not None
+
+    if monthly and not weekly:
+        return "monthly"
+    if weekly and not monthly:
+        return "weekly"
+    return None
+
+
 # Best-effort validation of the tax code shapes types.TaxCodeKind
 # recognises. A code failing this doesn't raise - it just means
 # tax_code.value goes into unreadable_fields like any other suspect
 # field, per "a missing field is fine, a wrong field is not."
+# A previous-employment year-to-date line: the P45 carry-forward a payroll
+# system prints when someone joined part-way through the tax year. Its
+# presence means this payslip's YTD column is NOT the whole tax year, which
+# is decisive for the allowance-used figure (see
+# analysis.build_allowance_usage) - direct documentary evidence beats
+# whatever the user answered about other employment.
+#
+# Read in code rather than asked of the model, for the same reason
+# reconciles and tax_year are: it decides whether a figure is shown at all,
+# so it must be deterministic. Matched against the REDACTED text before the
+# allowlist filter runs, because a bare "Previous Employment" header
+# carrying no currency amount would be dropped by the allowlist - and the
+# header alone is still evidence.
+_PREVIOUS_EMPLOYMENT_RE = re.compile(
+    r"(?i)\b("
+    r"previous\s+employ(?:ment|er)|prev\.?\s+employ(?:ment|er)|"
+    r"pay\s+from\s+previous|previous\s+pay|previous\s+taxable\s+pay|"
+    r"p45|brought\s+forward|b/?fwd|"
+    r"(?:gross|taxable\s+pay|tax)\s+(?:in\s+)?previous\s+employment"
+    r")\b"
+)
+
+
+# Basis wording a payroll system prints instead of the W1/M1/X suffix HMRC
+# uses. Order matters: the longer forms are tried first so "NONCUM" is not
+# left as "NON" by a shorter rule.
+_BASIS_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\s*\(\s*(W1|M1|X)\s*\)\s*$"), r" \1"),
+    (re.compile(r"(?i)\s*\bNON[\s-]?CUM(?:ULATIVE)?\b\s*$"), " X"),
+    (re.compile(r"(?i)\s*\bCUM(?:UL|ULATIVE)?\b\s*$"), ""),
+    (re.compile(r"(?i)\s*\bWK\s*1\b\s*$"), " W1"),
+    (re.compile(r"(?i)\s*\bMTH\s*1\b\s*$"), " M1"),
+    (re.compile(r"(?i)\s*\bWEEK\s*1\b\s*$"), " W1"),
+    (re.compile(r"(?i)\s*\bMONTH\s*1\b\s*$"), " M1"),
+)
+
+# A single leading letter that belongs to the column BEFORE the code, welded
+# on when pdfplumber collapsed the columns - "NI Rate:M" + "1257L" reaching
+# the model as "M1257L".
+#
+# S, C, K and D are excluded and that exclusion is the whole risk in this
+# function. S and C are the Scottish and Welsh region prefixes and K starts
+# a K code, so stripping any of them would turn a code the engine correctly
+# REFUSES into one it would happily calculate with - a wrong number instead
+# of a refusal, which is the one outcome this codebase is built to avoid.
+#
+# D was added after the first version of this rule turned "D0" into "0".
+# D0 and D1 are valid codes - all higher rate and all additional rate - and
+# they are the only other codes where a letter is followed directly by a
+# digit. Losing the D would have quietly re-banded someone's entire pay.
+# Found by the table below, which is why every valid shape is in it.
+#
+# The cost of excluding a letter is that a genuinely welded D or K is not
+# recovered and the code is refused instead. That is the right way round.
+# There is a test per excluded letter.
+_WELDED_LEADING_LETTER_RE = re.compile(r"^(?![SCKD])[A-Z](?=\d)")
+
+
+def normalise_tax_code(raw: str) -> str:
+    """
+    Tidy a printed tax code into the form _TAX_CODE_RE accepts, without
+    widening what counts as a valid code.
+
+    Every rule removes decoration a payroll system added or a column
+    collapse introduced. None of them invents a code, changes which code is
+    being described, or turns an invalid code into a valid one - a string
+    that is not a tax code before normalisation is not one afterwards,
+    because _TAX_CODE_RE still has to accept the result.
+
+    The alternative was to widen _TAX_CODE_RE itself. That regex is what
+    stops a garbage read becoming a tax code, so it stays exactly as strict
+    as it was and this normalises the input to meet it.
+    """
+    value = raw.strip()
+
+    # Trailing punctuation: "1257L." from a sentence-ended cell.
+    value = re.sub(r"[.,;:]+$", "", value).strip()
+
+    # Basis wording -> the W1/M1/X the engine knows.
+    for pattern, replacement in _BASIS_WORDS:
+        new = pattern.sub(replacement, value)
+        if new != value:
+            value = new.strip()
+            break
+
+    # A column welded to the front. Applied before spaces are collapsed so
+    # "M 1257L" is left alone - a letter with a space after it is a separate
+    # column that merely sits nearby, not one stuck to the code.
+    value = _WELDED_LEADING_LETTER_RE.sub("", value)
+
+    # Internal spaces: "1257 L" -> "1257L", "1257L M1" -> "1257L M1".
+    # Only between a digit and a letter, so the space before a basis suffix
+    # survives - _TAX_CODE_RE accepts it either way, and joining them would
+    # make the value read less like what the payslip printed.
+    value = re.sub(r"(?<=\d)\s+(?=[A-Za-z]\b)", "", value)
+
+    return value.strip()
+
+
+def _shape_of(value: str) -> str:
+    """A string as its shape: digits to #, letters to A or a, punctuation
+    and spacing kept.
+
+    Used to describe a value in a warning without carrying the value. The
+    shape is what a maintainer needs - "####A Aaaaa" says a basis word is
+    stuck to the code, "A####A" says a neighbouring column welded to it -
+    and it says nothing about the person the payslip belongs to.
+
+    Truncated, because a warning is not the place for an essay and a very
+    long "value" is itself the diagnosis.
+    """
+    shaped = "".join(
+        "#" if ch.isdigit() else ("A" if ch.isupper() else "a" if ch.islower() else ch)
+        for ch in value[:24]
+    )
+    return shaped + ("..." if len(value) > 24 else "")
+
+
+def has_previous_employment_line(text: str) -> bool:
+    """True when the payslip shows a previous-employment YTD carry-forward."""
+    return _PREVIOUS_EMPLOYMENT_RE.search(text) is not None
+
+
 _TAX_CODE_RE = re.compile(
     r"^[SC]?\d{1,4}[LMNPTY](?:\s?(?:W1|M1|X))?$"
     r"|^[SC]?(?:BR|D0|D1|0T|NT)(?:\s?(?:W1|M1|X))?$"
@@ -794,9 +1691,38 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
         if score < _CONFIDENCE_THRESHOLD:
             unreadable.add(dotted_path)
 
+    # A tax code we READ but could not ACCEPT is a different fact from one
+    # we could not read, and until now the extract said the same thing for
+    # both: value None, "tax_code.value" in unreadable_fields, no warning.
+    #
+    # That cost real diagnosis time. A test user's payslip came back with an
+    # unreadable tax code while the model reported it at 0.98 confidence -
+    # it had read the code perfectly and _TAX_CODE_RE rejected the string,
+    # and nothing in the response said so. It took a purpose-built script to
+    # find out, and the next layout that trips this should be readable from
+    # the response instead.
+    #
+    # The warning never carries the value. It is a document the user has not
+    # been shown yet, extraction is the one place PII is still in the clear,
+    # and warnings travel to the frontend and into logs. The SHAPE is enough
+    # to tell the two cases apart and to see which rule to write next:
+    # "###A Aaaaa" is a basis word, "A####A" is a column welded to the code.
+    # Normalise before validating. Every rule strips decoration a payroll
+    # system added or a column collapse introduced; none of them invents a
+    # code or changes which code is described, and _TAX_CODE_RE is unchanged
+    # so a string that was not a tax code still is not one.
     tax_code_value = model_extract.tax_code.value
+    if tax_code_value is not None:
+        tax_code_value = normalise_tax_code(tax_code_value)
+        model_extract.tax_code.value = tax_code_value or None
+
     if tax_code_value is not None and not _TAX_CODE_RE.match(tax_code_value.strip()):
         unreadable.add("tax_code.value")
+        path_warnings.append(
+            f"A tax code was printed on the payslip but not in a form this "
+            f"engine recognises ({_shape_of(tax_code_value.strip())}), so it "
+            f"has not been used. No tax code was guessed."
+        )
 
     pay, deductions = model_extract.pay, model_extract.deductions
     if (
@@ -832,38 +1758,101 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     # genuinely derived from a known frequency and a known pay date.
     period_number = model_extract.period.period_number
     confidence = dict(model_extract.confidence)
-    frequency_known = (
-        model_extract.period.frequency is not None
-        and "period.frequency" not in unreadable
-    )
+    frequency = model_extract.period.frequency
+    pay_date = model_extract.period.pay_date
+
+    # Same reasoning as the frequency read below, and the same guard:
+    # only when the model returned nothing. This is what makes the
+    # result stable run to run - pay_date gates period_number, which
+    # gates the entire calculation, so a model that reads it on one run
+    # and misses it on the next makes "We could not complete every
+    # calculation" appear intermittently on an unchanged payslip.
+    if pay_date is None:
+        pay_date = read_pay_date_from_label(filtered_text)
+        if pay_date is not None:
+            unreadable.discard("period.pay_date")
+            path_warnings.append(
+                f"Your pay date was read from the label printed on the payslip "
+                f"({pay_date}); the model did not report one itself."
+            )
+
+    # Only when the model returned NOTHING for frequency - not when it
+    # returned a value it flagged unreadable, which is a different
+    # situation (it saw something and doubted it, rather than finding
+    # nothing to read). See infer_frequency_from_label().
+    if frequency is None:
+        inferred_frequency = infer_frequency_from_label(filtered_text)
+        if inferred_frequency is not None:
+            frequency = inferred_frequency
+            unreadable.discard("period.frequency")
+            path_warnings.append(
+                f"How often you are paid was read from a printed period label "
+                f"({inferred_frequency}); the payslip does not state it as a "
+                f"word."
+            )
+
+    frequency_known = frequency is not None and "period.frequency" not in unreadable
     derived_period_number = (
-        derive_period_number(model_extract.period.pay_date, model_extract.period.frequency)
+        derive_period_number(pay_date, frequency)
         if frequency_known
         else None
     )
     if derived_period_number is not None:
+        # Guard: pay date present -> derive as always. This branch is
+        # unchanged and takes priority regardless of anything the model
+        # separately reported - see the fallback branch below for why a
+        # disagreement here doesn't get a different resolution.
         if period_number is not None and period_number != derived_period_number:
             path_warnings.append(
-                "period.period_number: model reported "
-                f"{period_number}, derived {derived_period_number} from "
-                "the pay date - using the derived value"
+                "The pay period number was worked out from your pay date "
+                f"({derived_period_number}) rather than taken from the payslip, "
+                f"which showed {period_number}."
             )
         period_number = derived_period_number
         confidence["period.period_number"] = 1.0
         unreadable.discard("period.period_number")
+
+    elif (
+        frequency_known
+        and pay_date is None
+        and period_number is not None
+        and "period.period_number" not in unreadable
+        and _period_number_plausible(period_number, frequency)
+    ):
+        # No pay date to derive from, but the payslip prints an explicit
+        # period label (e.g. "Month 9") that the model read confidently,
+        # and it's a plausible value for the frequency we've separately
+        # confirmed. This is not the failure the strict branch above
+        # guards against: that was the model inventing a number with no
+        # signal behind it. Reading a printed label is extraction - the
+        # same operation already trusted for tax code and gross pay -
+        # not the model guessing. Left as read, not promoted to 1.0
+        # confidence: it still carries whatever uncertainty the model
+        # itself reported about having read it correctly, unlike a
+        # derived value which is mathematically certain given accurate
+        # inputs.
+        path_warnings.append(
+            f"The pay period number was read from a printed label "
+            f"({period_number}); there was no pay date to work it out from "
+            f"independently."
+        )
+
     else:
-        # No trustworthy frequency and/or pay date to derive from -
-        # never fall back to a model-guessed period_number here, even if
-        # the model itself reported it confidently. Assuming a frequency
-        # and then reporting the result as certain is exactly the
-        # failure this whole function exists to prevent.
+        # No trustworthy frequency and/or pay date to derive from, and
+        # no safely-acceptable printed period label either (out of
+        # range for the stated frequency, frequency itself unconfirmed,
+        # or the model didn't report one confidently) - never fall back
+        # to a model-guessed period_number here, even if the model
+        # itself reported it confidently. Assuming a frequency and then
+        # reporting the result as certain is exactly the failure this
+        # whole function exists to prevent.
         period_number = None
         confidence.pop("period.period_number", None)
         unreadable.add("period.period_number")
 
     tax_year = (
-        _tax_year_for(model_extract.period.pay_date)
-        if model_extract.period.pay_date is not None
+        _tax_year_for(pay_date)
+        if pay_date is not None
         else None
     )
 
@@ -872,10 +1861,22 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     )
     extract_dict["confidence"] = confidence
     extract_dict["period"]["period_number"] = period_number
+    extract_dict["period"]["frequency"] = frequency
+    # Must be the resolved value, not the model's: deriving period_number
+    # from a label-read pay date while still reporting pay_date as null
+    # would leave the extract self-contradictory.
+    extract_dict["period"]["pay_date"] = pay_date
     extract_dict["period"]["tax_year"] = tax_year
     # employer_name never reaches the model - the allowlist drops that
     # line outright (no currency, date or known label on it) - so it's
     # captured separately during redact() and applied here instead.
+    # From the redacted text, not the filtered payload: a bare "Previous
+    # Employment" header carries no currency amount and the allowlist would
+    # drop it, but the header alone is still evidence that this payslip's
+    # YTD column does not cover the whole tax year.
+    extract_dict["previous_employment_ytd_present"] = has_previous_employment_line(
+        redacted_text
+    )
     extract_dict["employer_name"] = redaction_map.employer_name
     if redaction_map.employer_name is None:
         path_warnings.append("employer name was not confidently identified")
@@ -896,4 +1897,6 @@ def extract_payslip(pdf_bytes: bytes, filename: Optional[str] = None) -> Payslip
     try:
         return PayslipExtract(**extract_dict)
     except ValidationError as exc:
-        raise NotAPayslip(f"extract failed contract validation: {exc}") from exc
+        raise MalformedExtraction(
+            f"extract failed contract validation: {exc}"
+        ) from exc

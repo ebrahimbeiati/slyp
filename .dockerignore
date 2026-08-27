@@ -1,0 +1,36 @@
+# Secrets never enter an image layer. main.py loads .env for local
+# development only; in a container the platform supplies the environment.
+.env
+.env.*
+!.env.example
+
+# Frontend - deploys to Vercel, not here.
+node_modules/
+.next/
+app/
+lib/
+components/
+public/
+package.json
+package-lock.json
+tsconfig.json
+tsconfig.tsbuildinfo
+next.config.ts
+next-env.d.ts
+postcss.config.mjs
+eslint.config.mjs
+components.json
+Tailwind.config.ts
+
+# Not needed at runtime.
+tests/
+verify/
+tools/
+.git/
+.github/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

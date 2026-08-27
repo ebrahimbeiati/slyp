@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": false,
+    "declaration": false,
+    "jsx": "react-jsx",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "target": "es2022",
+    "rootDir": "..",
+    "outDir": ".tsbuild",
+    "types": ["node"]
+  },
+  "include": [
+    "final_payroll_preview.test.tsx",
+    "../components/PayrollPreview.tsx",
+    "../lib/payrollMessage.ts"
+  ]
+}

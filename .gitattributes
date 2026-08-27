@@ -1,0 +1,7 @@
+# The fixture payslips are real PDFs. Without this, git treats them as
+# text and applies its CRLF filter to the binary - which shows them as
+# permanently "modified" on Windows, and would substitute bytes inside
+# the file on checkout for anyone cloning with core.autocrlf=true.
+# Regenerating them (verify/fixtures/make_fixtures.py) would hide the
+# symptom; this fixes the cause.
+*.pdf binary

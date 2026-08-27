@@ -21,6 +21,13 @@ env/
 samples/private/
 *.payslip.pdf
 
+# Defensive: verify/run_real_payslips.py is meant to be pointed at a
+# directory outside the repo, but if someone runs it against one of
+# these conventional names inside the repo by mistake, it must not be
+# committable.
+real_payslips/
+verify/real_payslips/
+
 # Logs
 logs
 *.log
@@ -170,3 +177,6 @@ vite.config.ts.timestamp-*
 .vite/
 
 
+
+# tsc output from verify/tsconfig.preview.json (see verify/final_payroll_preview.test.tsx)
+verify/.tsbuild/

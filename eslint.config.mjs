@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // tsc output from verify/tsconfig.preview.json - compiled JS copies of
+    // components that are already linted at their source.
+    "verify/.tsbuild/**",
   ]),
 ]);
 
