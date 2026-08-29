@@ -1,10 +1,23 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from slyp.extraction import (
+    _call_openai_model,
+    normalise_number,
+    _normalise_numbers,
+    MalformedExtraction,
+    NotAPayslip,
+    _TAX_CODE_RE,
+    normalise_tax_code,
+    _shape_of,
+    _DATE_RE,
+    _mask_known_safe_numbers,
+    _SORT_CODE_RE,
+    has_previous_employment_line,
     RedactionFailure,
     RedactionMap,
     _cap_ambiguous_field_confidence,
@@ -19,6 +32,7 @@ from slyp.extraction import (
     extract_payslip,
     extract_text,
     financial_lines_only,
+    infer_frequency_from_label,
     redact,
 )
 
@@ -88,7 +102,7 @@ Total Payments 583.55
 Works Number 602
 Department Work Away Manual worker Deductions
 Tax Code 1257L Income Tax 0.00
-NI Number RY 44 99 43 D National Insurance 0.00
+NI Number AB 12 34 56 C National Insurance 0.00
 NI Table Letter A Total Deductions 0.00
 Year to Date
 Taxable Gross Pay 854.07
@@ -98,6 +112,21 @@ Employer NIC 24.98
 Week 16th March (20 hours) & Week 23rd March (17.60 hours)
 Net Pay 583.55
 """
+
+# SAMPLE_TEXT prints "Pay Type Monthly", so infer_frequency_from_label()
+# reads a frequency straight off it - correctly, it's printed there. The
+# tests below that need frequency to be genuinely UNKNOWABLE have to use
+# a payslip that never states it, or they'd be asserting against an
+# inference that legitimately succeeded rather than against the
+# never-guess property they exist to protect.
+SAMPLE_TEXT_NO_FREQUENCY = SAMPLE_TEXT.replace("Pay Type Monthly", "Pay Type")
+
+# Same again for the pay date: SAMPLE_TEXT prints "Pay Date 31-Mar-2026",
+# so read_pay_date_from_label() recovers it even when the model returns
+# none. Tests for the printed-period-label fallback need a payslip where
+# the pay date is genuinely unavailable, since that fallback exists
+# precisely for when there's nothing to derive from.
+SAMPLE_TEXT_NO_PAY_DATE = SAMPLE_TEXT.replace("Pay Date 31-Mar-2026 ", "")
 
 
 # --------------------------------------------------------------------------
@@ -127,11 +156,15 @@ def test_extract_text_raises_on_no_text_layer():
 @pytest.mark.parametrize(
     "canary",
     [
-        "RY 44 99 43 D",  # spaced NI number - the real-world case
-        "RY449943D",  # compact NI number
+        "AB 12 34 56 C",  # spaced NI number - the real-world case
+        "AB123456C",  # compact NI number
+        "AB.12.34.56.C",  # periods (F6 - was a full bypass)
+        "ry449943d",  # lowercase, no separators
         "ZZ99 9ZZ",  # postcode
         "12-34-56",  # sort code, dashed
         "12 34 56",  # sort code, spaced
+        "12/34/56",  # sort code, slashed (F6 - was a full bypass)
+        "12-34/56",  # sort code, mixed separators
     ],
 )
 def test_canary_values_do_not_survive_redaction(canary):
@@ -141,16 +174,23 @@ def test_canary_values_do_not_survive_redaction(canary):
     assert any(canary in values for values in redaction_map.replacements.values())
 
 
+def test_ni_number_split_across_a_line_break_is_redacted():
+    text = "NI Number RY 44 99\n43 D National Insurance 0.00"
+    redacted, redaction_map = redact(text)
+    assert "RY 44 99\n43 D" not in redacted
+    assert "[NI]" in redacted
+
+
 def test_canary_values_do_not_survive_the_full_outbound_payload():
     text = (
-        "NI Number RY 44 99 43 D National Insurance 0.00\n"
+        "NI Number AB 12 34 56 C National Insurance 0.00\n"
         "Address line SW1A 1AA more text\n"
         "Sort code 12-34-56 Account details\n"
     )
     redacted, _ = redact(text)
     payload = financial_lines_only(redacted)
 
-    for canary in ["RY 44 99 43 D", "RY449943D", "SW1A 1AA", "12-34-56"]:
+    for canary in ["AB 12 34 56 C", "AB123456C", "SW1A 1AA", "12-34-56"]:
         assert canary not in payload
 
     # Proves the payload really is clean, not just "happens to pass these
@@ -177,10 +217,166 @@ def test_labelled_name_and_address_are_redacted():
     assert "[ADDRESS]" in redacted
 
 
+def test_titled_name_sharing_a_line_with_a_date_is_redacted():
+    """
+    The row that broke the "allowlist catches unlabelled names" claim, from
+    a real payslip: name, pay date and NI number collapsed onto one line.
+    The NI number was already redacted; the date then kept the whole line
+    through the allowlist, carrying the name to the model with it.
+    """
+    line = "1195 Mr. K SAMPLE 13/02/2026 AB123456C"
+    payload = financial_lines_only(redact(line)[0])
+
+    assert "SAMPLE" not in payload
+    assert "[NAME]" in payload
+    # the line still survives, and the pay date on it is untouched -
+    # period_number is derived from that date
+    assert "13/02/2026" in payload
+
+
+def test_titled_name_does_not_swallow_the_payslip_label_beside_it():
+    """Over-redaction here costs a field, so the name match stops at the
+    first payslip word rather than running to the end of the line."""
+    redacted, _ = redact("Mr J Smith PAYE Tax 0.00")
+
+    assert "Smith" not in redacted
+    assert redacted == "[NAME] PAYE Tax 0.00"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Employer NIC 24.98",
+        "Total Gross Pay 79.64",
+        "Tax Code: 1257L W1 Dept: Tax Period: 45 Method: BACS",
+        "Miss Pay 10.00",  # title followed immediately by a stop word
+    ],
+)
+def test_titled_name_pattern_leaves_financial_lines_alone(line):
+    assert redact(line)[0] == line
+
+
 def test_labelled_employee_number_is_redacted():
     redacted, redaction_map = redact("Works Number 602")
     assert "602" not in redacted
     assert "[EMPLOYEE_NO]" in redacted
+
+
+def test_multi_line_address_is_dropped_by_the_allowlist():
+    # A multi-line address has no labelled anchor on every line, so
+    # redact() only catches the postcode - it's financial_lines_only()
+    # that drops the unlabelled street/town lines, since they carry no
+    # currency, date, tax-code or known-label content either.
+    text = "123 Fake Street\nFaketown\nSW1A 1AA"
+    redacted, _ = redact(text)
+    payload = financial_lines_only(redacted)
+    assert "123 Fake Street" not in payload
+    assert "Faketown" not in payload
+    assert "SW1A 1AA" not in payload
+    assert_safe_to_send(payload)
+
+
+# --------------------------------------------------------------------------
+# redact() - the date / account-number collision
+#
+# _ACCOUNT_NUMBER_RE (broadened for F6 to tolerate "/" as a separator)
+# matches a DD/MM/YYYY date exactly: 8 digits, slash-separated. A live
+# run showed "Pay Date 15/12/2025" silently becoming "Pay Date [BANK]"
+# before the model ever saw a date - not an allowlist or model-vocabulary
+# problem, a genuine redaction bug. Every case below also carries a real
+# account number on the same line, to prove the fix distinguishes the two
+# rather than just accepting anything shaped like 8 digits with
+# separators.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pay_date_text",
+    [
+        "15/12/2025",  # DD/MM/YYYY
+        "15-12-2025",  # DD-MM-YYYY
+        "5/3/25",  # D/M/YY - too few digits to hit either bank pattern at all
+        "2025-12-15",  # YYYY-MM-DD
+    ],
+)
+def test_date_survives_redaction_with_an_adjacent_account_number(pay_date_text):
+    text = f"Pay Date {pay_date_text} Account 12345678"
+    redacted, _ = redact(text)
+    assert pay_date_text in redacted, f"date {pay_date_text!r} was redacted: {redacted!r}"
+    assert "12345678" not in redacted
+    assert "[BANK]" in redacted
+
+
+@pytest.mark.parametrize(
+    "account_text",
+    [
+        "12345678",  # no separators
+        "1234-5678",  # dash
+        "1234 5678",  # space
+        "1234/5678",  # slash
+        "12-34-56-78",  # multiple dashes
+    ],
+)
+def test_account_number_still_redacted_in_every_separator_form(account_text):
+    text = f"Pay Date 15/12/2025 Account {account_text}"
+    redacted, _ = redact(text)
+    assert account_text not in redacted
+    assert "15/12/2025" in redacted
+    assert "[BANK]" in redacted
+
+
+@pytest.mark.parametrize(
+    "pay_date_text",
+    [
+        "15/12/2025",  # DD/MM/YYYY
+        "15-12-2025",  # DD-MM-YYYY
+        "2025-12-15",  # YYYY-MM-DD (ISO) - regressed the gate, not just redact()
+        "2025/12/15",  # YYYY/MM/DD
+    ],
+)
+def test_date_survives_the_full_pipeline_including_the_gate(pay_date_text):
+    # redact() surviving a date isn't enough on its own - _DATE_RE is a
+    # second, separate pattern from the account-number exemption above,
+    # used both by the allowlist and by assert_safe_to_send's independent
+    # digit-run check. An ISO date passed the account-number exemption
+    # but _DATE_RE didn't recognise year-first dates yet, so the date's
+    # leftover digits looked "unexplained" to the gate and got refused -
+    # a live 422 that only surfaced once a real ISO-dated payslip was
+    # run, because no existing test called assert_safe_to_send() on a
+    # payload containing a surviving date. This test goes through the
+    # whole pipeline for exactly that reason.
+    text = (
+        f"Pay Date {pay_date_text} Tax Code 1257L "
+        f"Gross 2500.00 Net 2000.00"
+    )
+    redacted, _ = redact(text)
+    filtered = financial_lines_only(redacted)
+    assert pay_date_text in filtered
+    assert_safe_to_send(filtered)  # must not raise
+
+
+def test_sort_code_with_slashes_bypass_not_reopened_by_the_date_exemption():
+    """F6 regression guard: a 6-digit sort-code-with-slashes bypass must
+    never be exempted just because it superficially resembles a date-
+    shaped sequence - it structurally can't have a 4-digit year group,
+    but this pins the behaviour down explicitly rather than relying on
+    that reasoning holding forever."""
+    redacted, _ = redact("Sort Code 12/34/56 Account 12345678")
+    assert "12/34/56" not in redacted
+    assert redacted.count("[BANK]") == 2
+
+
+@pytest.mark.parametrize(
+    "implausible_text",
+    [
+        "45/67/2025",  # month 67 - not a real date, must still redact
+        "99/99/2025",  # neither day nor month valid
+    ],
+)
+def test_implausible_date_shaped_sequence_still_redacted_as_account_number(implausible_text):
+    redacted, _ = redact(f"Reference {implausible_text}")
+    assert implausible_text not in redacted
+    assert "[BANK]" in redacted
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +412,41 @@ def test_allowlist_keeps_lines_with_financial_content(line):
     assert kept == line
 
 
+def test_allowlist_keeps_a_payment_period_line_with_no_figure_on_it():
+    """
+    "Payment Period    Weekly" is the only statement of frequency on a
+    real weekly payslip, and it carries no currency amount, date,
+    percentage or tax code - the label alone has to keep it. It didn't:
+    the vocabulary had "pay period", which "Payment Period" does not
+    contain, so the line was dropped and frequency came back null.
+    """
+    assert financial_lines_only("Payment Period Weekly") == "Payment Period Weekly"
+    assert financial_lines_only("Pay Period Monthly") == "Pay Period Monthly"
+
+
+def test_frequency_survives_the_allowlist_on_the_real_weekly_payslip():
+    """
+    End-to-end on the shape that produced "We could not complete every
+    calculation": frequency has to survive redact() AND the allowlist to
+    be readable, because infer_frequency_from_label() runs on the
+    filtered payload, not the raw text.
+    """
+    text = "\n".join(
+        [
+            "1195 Mr. K SAMPLE 13/02/2026 AB123456C",
+            "Total Gross Pay 79.64 Total Gross Pay TD 79.64",
+            "Payment Period Weekly",
+            "Tax Code: 1257L W1 Dept: Tax Period: 45 Method: BACS",
+        ]
+    )
+    payload = financial_lines_only(redact(text)[0])
+
+    assert infer_frequency_from_label(payload) == "weekly"
+    # and with the frequency known, the pay date on the identity row is
+    # all the period number needs
+    assert derive_period_number(date(2026, 2, 13), "weekly") == 45
+
+
 def test_redaction_runs_before_filtering_on_the_real_sample():
     """
     The key ordering case: a line with BOTH an NI number and a currency
@@ -226,7 +457,7 @@ def test_redaction_runs_before_filtering_on_the_real_sample():
     redacted, _ = redact(SAMPLE_TEXT)
     payload = financial_lines_only(redacted)
 
-    assert "RY 44 99 43 D" not in payload
+    assert "AB 12 34 56 C" not in payload
     assert "[NI]" in payload
     # the line survives (it has a currency amount) - just without the NI number
     assert "National Insurance 0.00" in payload
@@ -244,7 +475,14 @@ def test_redaction_runs_before_filtering_on_the_real_sample():
 
 def test_assert_safe_to_send_raises_on_unredacted_pii():
     with pytest.raises(RedactionFailure):
-        assert_safe_to_send("NI Number RY 44 99 43 D National Insurance 0.00")
+        assert_safe_to_send("NI Number AB 12 34 56 C National Insurance 0.00")
+
+
+def test_assert_safe_to_send_raises_on_an_unredacted_titled_name():
+    """A name is the one PII class the gate's second (digit-run) check
+    cannot see at all, so the re-scan has to carry it."""
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send("1195 Mr. K SAMPLE 13/02/2026")
 
 
 def test_assert_safe_to_send_does_not_raise_on_clean_text():
@@ -258,6 +496,284 @@ def test_assert_safe_to_send_does_not_leak_the_match_in_its_message():
         assert "payroll@example.com" not in str(exc)
     else:
         pytest.fail("expected RedactionFailure")
+
+
+def test_gate_catches_a_shape_none_of_the_named_pii_patterns_recognise():
+    """
+    The independence check for the gate's second layer (item 35): a bare
+    digit run that doesn't match ANY of the specific PII shapes redact()
+    knows about (not an NI number, not a sort code, not an account
+    number, not a phone number) still trips the gate, because it has no
+    financial explanation (no currency/percent/date/tax-code shape). This
+    is the property that makes the gate more than "the same regex, run
+    twice" - see slyp.extraction._PII_RECHECK_PATTERNS.
+    """
+    from slyp.extraction import _PII_RECHECK_PATTERNS
+
+    payload = "Some Internal Reference 123456789 National Insurance 0.00"
+
+    assert not any(pattern.search(payload) for _label, pattern, _skip_if in _PII_RECHECK_PATTERNS)
+
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(payload)
+
+
+def test_gate_does_not_false_positive_on_clean_multi_field_text():
+    payload = (
+        "Tax Code 1257L Income Tax 0.00\n"
+        "Pay Date 31-Mar-2026 Rate 1 37.60 13.85 520.76\n"
+        "National Insurance 0.00\n"
+        "Taxable Gross Pay 854.07\n"
+    )
+    assert_safe_to_send(payload)
+
+
+# --------------------------------------------------------------------------
+# The gate's second check: whitespace is ambiguous
+#
+# It separates PII printed in groups ("44 99 43") and equally separates
+# unrelated payslip numbers sitting next to each other ("Period 09 2025").
+# The digit-run pattern used to treat it as an intra-number separator,
+# so it counted digits across independent numbers and refused benign
+# payslips - a live 422 on a real ADP payslip. Both properties are
+# checked here because fixing one by loosening the other is exactly the
+# regression to guard against.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Adjacent-but-unrelated numbers - the false positive that fired.
+        "Period 09 2025 Frequency Monthly",
+        "Tax Period 09 Week 39 Gross 2500.00",
+        # Hourly rates print to 3-5 dp; _CURRENCY_RE only matches exactly
+        # 2, so these digits used to survive masking unexplained.
+        "Std Hours 37.50 Rate 15.3846",
+        "Overtime 12.5 Hours @ 23.0769",
+        "Rate of Pay 9.5000 per hour",
+        # Multi-column numeric tables, as ADP prints them.
+        "NI Cat A Earnings 2500.00 1048.00 1452.00 116.16",
+    ],
+)
+def test_gate_accepts_legitimate_payslip_numbers(payload):
+    assert_safe_to_send(payload)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Uniform digit groups - what PII looks like when printed in
+        # groups. Caught by the split-group half of check 2, since
+        # whitespace is no longer an intra-number separator.
+        "Code 123 456 789 National Insurance 0.00",
+        "Ref 1234 5678 9012 National Insurance 0.00",
+        # Contiguous run - caught by the single-token half.
+        "Some Internal Reference 123456789 National Insurance 0.00",
+        "Unknown 987654321012 National Insurance 0.00",
+    ],
+)
+def test_gate_still_refuses_unexplained_digits(payload):
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(payload)
+
+
+# --------------------------------------------------------------------------
+# Unexplained identifiers are REDACTED, not left for the gate to refuse
+#
+# A 6-7 digit employee/payroll number sits in a gap between the specific
+# patterns: too short for the 8-digit account number, no separators for
+# the sort code. It used to survive redact() untouched and then trip the
+# gate's digit-run check, refusing the whole document - which also means
+# the only thing stopping that number being sent was the gate. Redacting
+# it at source is both the safer outcome and the one that lets the
+# payslip actually process.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line,identifier",
+    [
+        ("Employee 123456 Gross Pay 2500.00", "123456"),
+        ("Employee ID 1234567 Tax Code 1257L", "1234567"),
+        ("Staff Number 123456 Net Pay 2000.00", "123456"),
+        ("Clock Number 12345678901 Hours 37.50", "12345678901"),
+    ],
+)
+def test_unexplained_identifier_is_redacted_and_then_passes_the_gate(line, identifier):
+    redacted, _ = redact(line)
+    assert identifier not in redacted
+    payload = financial_lines_only(redacted)
+    assert_safe_to_send(payload)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "line,must_survive",
+    [
+        # Six-plus digits before the decimal point is still money, not an
+        # identifier - the catch-all must not eat a large gross figure.
+        ("Gross Pay 125000.00 Tax Code 1257L", "125000.00"),
+        ("YTD Gross 1,234,567.89 Tax Code 1257L", "1,234,567.89"),
+        ("Gross Pay 2500.00 Net Pay 1987.65", "2500.00"),
+        # Dates must survive the catch-all too, in both orders.
+        ("Pay Date 15/12/2025 Gross 2500.00", "15/12/2025"),
+        ("Pay Date 2025-12-15 Gross 2500.00", "2025-12-15"),
+    ],
+)
+def test_catch_all_does_not_eat_money_or_dates(line, must_survive):
+    redacted, _ = redact(line)
+    assert must_survive in redacted, f"{must_survive!r} was redacted: {redacted!r}"
+
+
+# --------------------------------------------------------------------------
+# Frequency read from a printed period label
+#
+# Plenty of payslips never print "Monthly" as a word - they print
+# "Month 9". The prompt tells the model to return null rather than guess,
+# so it correctly returns nothing, and without a frequency period_number
+# can't be derived. That cascades: no period_number means
+# _facts_from_extract() refuses, which surfaces to the user as "We could
+# not complete every calculation". Reading "Month" beside a number is
+# extraction, not invention - but it has to refuse anything ambiguous.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Month 9", "monthly"),
+        ("Tax Month 09", "monthly"),
+        ("Month No. 9", "monthly"),
+        ("Pay Frequency Monthly", "monthly"),
+        ("Week 39", "weekly"),
+        ("Tax Week 39", "weekly"),
+        ("Weekly", "weekly"),
+    ],
+)
+def test_frequency_read_from_a_printed_label(text, expected):
+    assert infer_frequency_from_label(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Names no unit - picking one would be the invented value the
+        # whole confidence gate exists to prevent.
+        "Period 9",
+        # A date label, not a period number - must not read as weekly.
+        "Week Ending 15/12/2025",
+        # Contradictory evidence.
+        "Month 9 Week 39",
+        # Frequencies the engine has no rates for. The bare word "weekly"
+        # inside these must not read as plain weekly - that would
+        # calculate a 4-weekly payslip on weekly thresholds.
+        "4 Weekly",
+        "Fortnightly",
+        "Bi-Weekly",
+        "Two-weekly Pay",
+        "Quarterly",
+        # Nothing to read at all.
+        "Pay Date 15/12/2025",
+        "Annual Salary 30000",
+    ],
+)
+def test_frequency_inference_refuses_anything_ambiguous(text):
+    assert infer_frequency_from_label(text) is None
+
+
+def test_printed_month_label_unblocks_period_number_and_the_calculation():
+    """
+    The whole cascade, end to end - this is the bug the user saw as two
+    separate messages ("We could not complete every calculation" and
+    "COULDN'T READ CONFIDENTLY: period.period_number"). They are one
+    bug: the payslip prints a pay date and "Tax Month 9" but never the
+    word "Monthly", so the model returns no frequency, so period_number
+    can't be derived, so _facts_from_extract() refuses and the whole
+    calculation is skipped.
+    """
+    text = (
+        "Pay Date 15/12/2025 Tax Month 9\n"
+        "Tax Code 1257L Income Tax 412.60\n"
+        "National Insurance 198.16\n"
+        "Total Gross Pay 2750.00\n"
+        "Taxable Gross Pay 24750.00\n"
+        "Net Pay 2139.24\n"
+    )
+
+    model_extract = _ModelExtract()
+    model_extract.period.pay_date = date(2025, 12, 15)
+    model_extract.period.frequency = None  # correctly returns nothing
+    model_extract.period.period_number = None
+    model_extract.tax_code.value = "1257L"
+    model_extract.pay.gross_this_period = Decimal("2750.00")
+    model_extract.pay.gross_ytd = Decimal("24750.00")
+    model_extract.deductions.income_tax = Decimal("412.60")
+    model_extract.deductions.national_insurance = Decimal("198.16")
+    model_extract.deductions.ni_category = "A"
+    model_extract.net_pay = Decimal("2139.24")
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.frequency == "monthly"
+    assert result.period.period_number == 9  # 15 Dec 2025 -> month 9
+    assert "period.period_number" not in result.unreadable_fields
+    # The frequency is label-read, not model-read - say so downstream.
+    # Human wording, not the dotted path - see contract.FIELD_LABELS.
+    assert any("how often you are paid" in warning.lower() for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    "model_pay_date,model_frequency",
+    [
+        (date(2025, 12, 15), "monthly"),  # model reads both
+        (date(2025, 12, 15), None),  # model drops the frequency
+        (None, "monthly"),  # model drops the pay date
+        (None, None),  # model drops both
+    ],
+)
+def test_period_number_is_stable_however_flaky_the_model_is(
+    model_pay_date, model_frequency
+):
+    """
+    The "works, but it sometimes shows up" report. Both pay_date and
+    frequency gate period_number, which gates the whole calculation, and
+    both used to come only from the model - so on an unchanged payslip
+    the advisory appeared on some runs and not others. temperature is
+    already pinned to 0 on both providers; that is not sufficient on its
+    own, because a model still varies run to run. Reading both off the
+    printed labels in code is what actually makes the result stable, so
+    all four of these must produce identical output.
+    """
+    text = (
+        "Pay Date 15/12/2025 Tax Month 9\n"
+        "Tax Code 1257L Income Tax 412.60\n"
+        "National Insurance 198.16\n"
+        "Total Gross Pay 2750.00\n"
+        "Taxable Gross Pay 24750.00\n"
+        "Net Pay 2139.24\n"
+    )
+
+    model_extract = _ModelExtract()
+    model_extract.period.pay_date = model_pay_date
+    model_extract.period.frequency = model_frequency
+    model_extract.tax_code.value = "1257L"
+    model_extract.pay.gross_this_period = Decimal("2750.00")
+    model_extract.pay.gross_ytd = Decimal("24750.00")
+    model_extract.deductions.income_tax = Decimal("412.60")
+    model_extract.deductions.national_insurance = Decimal("198.16")
+    model_extract.deductions.ni_category = "A"
+    model_extract.net_pay = Decimal("2139.24")
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.pay_date == date(2025, 12, 15)
+    assert result.period.frequency == "monthly"
+    assert result.period.period_number == 9
+    assert "period.period_number" not in result.unreadable_fields
 
 
 # --------------------------------------------------------------------------
@@ -328,6 +844,52 @@ def test_reconciles_accounts_for_other_deductions():
 # --------------------------------------------------------------------------
 # extract_payslip - full pipeline, model call mocked
 # --------------------------------------------------------------------------
+
+
+def test_user_context_never_reaches_the_extraction_model():
+    """
+    only_job (and any other application metadata) is answered by the user
+    in the UI, sent as a form field alongside the file, and consumed by
+    analyse_payslip() AFTER extraction. It must never be part of the
+    model payload.
+
+    Structural, not incidental: extract_payslip() has no parameter for it
+    to arrive through. This captures the exact string handed to the model
+    and checks it against the PDF's own text, so adding a metadata
+    parameter later would have to break this test to leak.
+    """
+    text = "\n".join(
+        [
+            "Pay Date: 28/08/2026",
+            "Tax Code: 1257L M1",
+            "Total Gross Pay 2,500.00 Net Pay 1,968.34",
+        ]
+    )
+    captured: dict[str, str] = {}
+
+    def _capture(payload: str) -> _ModelExtract:
+        captured["payload"] = payload
+        return _sample_model_extract()
+
+    with patch("slyp.extraction._call_model", side_effect=_capture):
+        extract_payslip(_make_pdf_bytes(text.splitlines()))
+
+    payload = captured["payload"]
+    for forbidden in ("only_job", "job_label", "true", "false", "not_sure"):
+        assert forbidden not in payload.lower()
+
+    # Everything sent came off the page, nothing was added to it.
+    source_lines = set(text.splitlines())
+    for line in payload.splitlines():
+        assert line in source_lines
+
+    # And there is no parameter to smuggle it through.
+    import inspect
+
+    assert set(inspect.signature(extract_payslip).parameters) == {
+        "pdf_bytes",
+        "filename",
+    }
 
 
 def _sample_model_extract() -> _ModelExtract:
@@ -424,6 +986,11 @@ def test_extract_payslip_raises_not_a_payslip_when_model_says_so():
         (date(2026, 3, 31), "monthly", 12),
         # matches what the real payslip printed - see slyp-phase3-prompt.md
         (date(2026, 2, 13), "weekly", 45),
+        # weekly, either side of the 6 April boundary - the monthly cases
+        # above cover this, but weekly's day-counting arithmetic is
+        # different code and wasn't independently exercised here.
+        (date(2026, 4, 6), "weekly", 1),
+        (date(2026, 4, 5), "weekly", 53),
     ],
 )
 def test_derive_period_number(pay_date, frequency, expected):
@@ -457,7 +1024,7 @@ def test_extract_payslip_prefers_derived_period_number_over_model_and_warns():
         result = extract_payslip(pdf_bytes)
 
     assert result.period.period_number == 12
-    assert any("period.period_number" in w for w in result.warnings)
+    assert any("pay period number" in w.lower() for w in result.warnings)
     assert any("1" in w and "12" in w for w in result.warnings)
 
 
@@ -474,7 +1041,7 @@ def test_extract_payslip_never_guesses_a_frequency_to_derive_period_number():
     model_extract.period.period_number = 9
     model_extract.confidence["period.period_number"] = 1.0
 
-    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_FREQUENCY.splitlines())
     with patch("slyp.extraction._call_model", return_value=model_extract):
         result = extract_payslip(pdf_bytes)
 
@@ -496,6 +1063,121 @@ def test_extract_payslip_does_not_derive_period_number_when_frequency_is_unreada
     assert result.period.period_number is None
     assert "period.period_number" in result.unreadable_fields
     assert "period.frequency" in result.unreadable_fields
+
+
+# --------------------------------------------------------------------------
+# Printed-period-label fallback: no pay date to derive from, but the
+# payslip prints an explicit period label the model read confidently.
+# --------------------------------------------------------------------------
+
+
+def test_extract_payslip_accepts_printed_period_label_when_no_pay_date_and_in_range():
+    """
+    The case the fallback exists for: a payslip that states its period as
+    "Month 9" with no calendar pay date anywhere - frequency is
+    confidently known, the label is a plausible value for that frequency,
+    so it's accepted rather than refused, and marked distinctly from a
+    derived value.
+    """
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.period_number = 9
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 9
+    assert "period.period_number" not in result.unreadable_fields
+    # Left as the model's own reading, not promoted to 1.0 like a derived
+    # value - this is what makes the two provenances distinguishable.
+    assert result.confidence["period.period_number"] == 0.9
+    assert any(
+        "read from a printed label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_refuses_printed_period_label_out_of_range():
+    """A monthly payslip claiming period 45 is not a plausible reading -
+    refuse rather than accept an implausible label."""
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.period_number = 45
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number is None
+    assert "period.period_number" in result.unreadable_fields
+    assert not any(
+        "read from a printed label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_refuses_printed_period_label_when_frequency_unconfirmed():
+    """No pay date, and the period label is in-range for monthly - but
+    frequency itself isn't confirmed, so there's no basis to judge
+    plausibility against. Must refuse, not assume monthly."""
+    model_extract = _sample_model_extract()
+    model_extract.period.pay_date = None
+    model_extract.period.frequency = None
+    model_extract.period.period_number = 9
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.replace('Pay Type Monthly', 'Pay Type').splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number is None
+    assert "period.period_number" in result.unreadable_fields
+
+
+def test_extract_payslip_pay_date_takes_precedence_over_printed_label():
+    """Pay date present and derivable -> always wins, the fallback branch
+    is never reached, even when the model's own printed-label reading
+    would itself have been accepted (in range) if pay date were absent."""
+    model_extract = _sample_model_extract()  # pay_date "2026-03-31", monthly -> derives to 12
+    model_extract.period.period_number = 9  # plausible on its own, but wrong
+    model_extract.confidence["period.period_number"] = 0.9
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 12
+    assert result.confidence["period.period_number"] == 1.0  # derived, not label-read
+    assert any("pay period number" in w.lower() and "12" in w for w in result.warnings)
+    assert not any(
+        "read from a printed label" in w for w in result.warnings
+    )
+
+
+def test_extract_payslip_label_and_derived_disagreeing_prefers_derived():
+    """
+    Same scenario as the precedence test above, framed the other way: the
+    label and the derived value disagree, and there is no separate
+    conflict-resolution path for that - pay date being present already
+    means derivation runs and wins outright (see
+    test_extract_payslip_prefers_derived_period_number_over_model_and_warns
+    for the original version of this guarantee). The fallback only ever
+    activates when derivation has nothing to work with in the first
+    place, so "label vs derived" can only arise when pay date exists, at
+    which point derived has already won before the fallback is even
+    considered.
+    """
+    model_extract = _sample_model_extract()  # pay_date "2026-03-31", monthly -> derives to 12
+    model_extract.period.period_number = 3  # disagrees with the derived value
+    model_extract.confidence["period.period_number"] = 0.95
+
+    pdf_bytes = _make_pdf_bytes(SAMPLE_TEXT_NO_PAY_DATE.splitlines())
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.period.period_number == 12
+    assert any("3" in w and "12" in w for w in result.warnings)
 
 
 # --------------------------------------------------------------------------
@@ -708,3 +1390,756 @@ def test_extract_payslip_source_filename_defaults_to_none():
         result = extract_payslip(pdf_bytes)
 
     assert result.source.filename is None
+
+
+# --------------------------------------------------------------------------
+# OpenAI retry path: the second request is not a second chance to leak
+# --------------------------------------------------------------------------
+
+
+def test_openai_retry_resends_the_same_redacted_payload():
+    """
+    The provider rejects function tools unless reasoning_effort is set to
+    'none', so the first request 400s and a second is sent. Redaction,
+    the allowlist and the gate all run ONCE, in extract_payslip(), before
+    either request exists - so what has to hold is that the retry sends
+    the identical already-sanitised string and adds nothing to it.
+
+    Pinned because "retry the request" is exactly the kind of code that
+    later grows a "with a bit more context this time".
+    """
+    import slyp.extraction as extraction
+
+    text = "\n".join(
+        [
+            "Employee Name: Jo Bloggs",
+            "NI Number AB 12 34 56 C National Insurance 0.00",
+            "Pay Date: 28/08/2026",
+            "Total Gross Pay 1,000.00 Net Pay 900.00",
+        ]
+    )
+
+    sent: list[dict] = []
+
+    class _FakeCompletions:
+        def create(self, **params):
+            sent.append(params)
+            if "reasoning_effort" not in params:
+                raise extraction.openai.BadRequestError(
+                    "Function tools with reasoning_effort are not supported",
+                    response=_fake_http_response(),
+                    body=None,
+                )
+            return _fake_openai_response()
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = type("chat", (), {"completions": _FakeCompletions()})()
+
+    pdf_bytes = _make_pdf_bytes(text.splitlines())
+
+    with patch.object(extraction, "_MODEL_PROVIDER", "openai"), patch.object(
+        extraction, "_OPENAI_NEEDS_REASONING_EFFORT_NONE", False
+    ), patch.object(extraction.openai, "OpenAI", _FakeClient):
+        extraction.extract_payslip(pdf_bytes)
+        assert len(sent) == 2, "expected one rejected request and one retry"
+
+        # The answer doesn't change between calls, so the doomed first
+        # attempt must not be repeated for the rest of the process.
+        extraction.extract_payslip(pdf_bytes)
+        assert len(sent) == 3, "second upload should not repeat the 400"
+        assert sent[2]["reasoning_effort"] == "none"
+
+    first_user = sent[0]["messages"][1]["content"]
+    retry_user = sent[1]["messages"][1]["content"]
+
+    # Identical, and sanitised - not the raw document.
+    assert first_user == retry_user
+    for payload in (first_user, retry_user):
+        assert "Jo Bloggs" not in payload
+        assert "AB 12 34 56 C" not in payload
+        assert "[NI]" in payload
+
+    # The retry differs by exactly one parameter.
+    assert set(sent[1]) - set(sent[0]) == {"reasoning_effort"}
+    assert sent[1]["reasoning_effort"] == "none"
+
+
+def _fake_http_response():
+    """Enough of an httpx response for openai.BadRequestError to build."""
+    return SimpleNamespace(
+        request=SimpleNamespace(),
+        status_code=400,
+        headers={},
+    )
+
+
+def _fake_openai_response():
+    """Minimal stand-in for an OpenAI chat completion carrying our tool call."""
+    import json as _json
+
+    extract = _sample_model_extract()
+    arguments = _json.dumps(_json.loads(extract.model_dump_json()))
+    function = type("fn", (), {"name": "record_payslip_extract", "arguments": arguments})()
+    tool_call = type("tc", (), {"function": function})()
+    message = type("msg", (), {"tool_calls": [tool_call]})()
+    choice = type("choice", (), {"message": message})()
+    return type("response", (), {"choices": [choice]})()
+
+
+# --------------------------------------------------------------------------
+# Previous-employment YTD detection
+# --------------------------------------------------------------------------
+#
+# Decides whether the allowance-used figure may be shown at all, so it is
+# read in code from the document's own labels rather than asked of the
+# model - see analysis.build_allowance_usage().
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Previous Employment 5,000.00",
+        "Previous Employer Pay 5,000.00",
+        "Prev Employment 5,000.00",
+        "Prev. Employer 5,000.00",
+        "Pay from previous employment 5,000.00",
+        "Previous Pay 5,000.00",
+        "Previous Taxable Pay 5,000.00",
+        "P45 Pay 5,000.00",
+        "Brought Forward 5,000.00",
+        "B/Fwd 5,000.00",
+        "Taxable Pay in Previous Employment 5,000.00",
+    ],
+)
+def test_previous_employment_line_is_detected(line):
+    assert has_previous_employment_line(line) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Gross Pay YTD 7,500.00",
+        "Total Gross Pay 2,500.00",
+        "This Employment 7,500.00",
+        "Employment Type Permanent",
+        "Previous address on file",
+    ],
+)
+def test_ordinary_payslip_lines_are_not_mistaken_for_it(line):
+    assert has_previous_employment_line(line) is False
+
+
+# --------------------------------------------------------------------------
+# DD/MM/YY - the one date shape that collides with the sort-code pattern
+# --------------------------------------------------------------------------
+#
+# DOCUMENTS AN ACCEPTED LOSS. These assertions describe what the pipeline
+# does, not what anyone wants it to do.
+#
+# _SORT_CODE_RE is \b\d{2}[-\s/]\d{2}[-\s/]\d{2}\b - three two-digit groups.
+# A date with two digits in the day, month AND year is exactly that shape,
+# so "15/12/25" is redacted to [BANK] and the date is gone before the model
+# sees it. A four-digit year is what saves DD/MM/YYYY: the trailing \b
+# fails against the year's fourth digit.
+#
+# redact() explains why the sort-code pattern gets no date exemption: a
+# 6-digit date and a real sort-code-with-slashes bypass (F6) are
+# indistinguishable by shape, and exempting one reopens the other. Payslips
+# overwhelmingly print 4-digit years, so losing the uncommon 2-digit case is
+# the accepted trade.
+#
+# This was untested until now. The existing date-survival fixtures are
+# 15/12/2025, 15-12-2025, 5/3/25 and 2025-12-15 - and 5/3/25 slips past the
+# collision only because single-digit day and month are too few digits for
+# the pattern to reach. Nothing covered the two-digit-everything case, which
+# is the only one that actually collides.
+
+
+@pytest.mark.parametrize(
+    "two_digit_year_date",
+    [
+        "15/12/25",  # DD/MM/YY, slashes
+        "15-12-25",  # DD-MM-YY, hyphens
+        "20/07/26",
+        "01/01/26",
+    ],
+)
+def test_two_digit_year_date_is_lost_to_the_sort_code_pattern(two_digit_year_date):
+    """Accepted loss, pinned so it cannot change silently in either
+    direction: if this ever starts passing, the sort-code pattern has been
+    narrowed and F6 needs re-checking."""
+    redacted, _ = redact(f"Pay Date {two_digit_year_date} Gross 2500.00")
+
+    assert two_digit_year_date not in redacted
+    assert "[BANK]" in redacted
+    # The money on the same line must not be collateral.
+    assert "2500.00" in redacted
+
+
+@pytest.mark.parametrize(
+    "four_digit_year_date",
+    ["15/12/2025", "15-12-2025", "20/07/2026", "2025-12-15"],
+)
+def test_four_digit_year_date_is_not_touched_by_the_sort_code_pattern(
+    four_digit_year_date,
+):
+    """The other side of the same boundary, asserted against _SORT_CODE_RE
+    directly rather than through redact(), so it cannot be satisfied by some
+    other pattern happening to spare the date."""
+    assert _SORT_CODE_RE.search(four_digit_year_date) is None
+
+    redacted, _ = redact(f"Pay Date {four_digit_year_date} Gross 2500.00")
+    assert four_digit_year_date in redacted
+
+
+def test_single_digit_day_and_month_dodges_the_collision_by_length():
+    """Why 5/3/25 was never caught by the fixtures above: the sort-code
+    pattern needs two digits in each group, and this has one."""
+    assert _SORT_CODE_RE.search("5/3/25") is None
+
+    redacted, _ = redact("Pay Date 5/3/25 Gross 2500.00")
+    assert "5/3/25" in redacted
+
+
+# --------------------------------------------------------------------------
+# A sort code never spans a line break
+# --------------------------------------------------------------------------
+#
+# _SORT_CODE_RE used [-\s/] as its separator, and \s matches \n. On a
+# work-record table with date-first rows that let it match '46\n20/07' -
+# the pence of one row's total, the line break, and the next row's DD/MM.
+# redact() SUBSTITUTES over its matches, so the newline went with it and
+# three rows collapsed into one line reading "38.[BANK]/2026 ES602
+# Repair...", destroying a total and a date and welding unrelated columns
+# together.
+#
+# The merge was ours, not pdfplumber's - the extracted text still had its
+# line breaks. Separator is now a literal space, hyphen or slash.
+
+
+def test_sort_code_pattern_does_not_span_a_line_break():
+    """The reported failure, pinned by name. If this regresses, a payslip
+    with a numeric table silently loses rows again."""
+    two_rows = "19/07/2026 ES601 Install 2.50 15.3846 38.46\n20/07/2026 ES602 Repair 1.75 15.3846 26.92"
+
+    for match in _SORT_CODE_RE.finditer(two_rows):
+        assert "\n" not in match.group(0), (
+            f"sort-code pattern matched across a line break: {match.group(0)!r}"
+        )
+
+
+def test_redaction_does_not_weld_table_rows_together():
+    """The consequence, asserted on line count rather than on the pattern -
+    a different pattern developing the same fault would fail this too."""
+    rows = "\n".join(
+        f"{day}/07/2026 ES60{i} Install 2.50 15.3846 3{i}.46"
+        for i, day in enumerate((19, 20, 21, 22), start=1)
+    )
+    redacted, _ = redact(rows)
+
+    assert len(redacted.splitlines()) == len(rows.splitlines())
+    assert "[BANK]" not in redacted
+    for day in (19, 20, 21, 22):
+        assert f"{day}/07/2026" in redacted
+
+
+@pytest.mark.parametrize(
+    "sort_code",
+    ["12-34-56", "12 34 56", "12/34/56", "12-34/56", "12 34-56"],
+)
+def test_real_sort_codes_are_still_caught_on_one_line(sort_code):
+    """The fix narrows the separator class, so every genuine separator has
+    to keep working. F6 was a sort code getting through; that must not
+    reopen."""
+    assert _SORT_CODE_RE.search(sort_code) is not None
+
+    redacted, _ = redact(f"Sort Code {sort_code} Account 12345678")
+    assert sort_code not in redacted
+    assert "[BANK]" in redacted
+
+
+# --------------------------------------------------------------------------
+# A label's value must be on the label's own line
+# --------------------------------------------------------------------------
+#
+# _NAME_LABEL_RE and _ADDRESS_LABEL_RE used \s* between the label and the
+# captured value, and \s matches \n. A bare "Name" or "Address" header -
+# which is how both are usually printed when the value sits underneath -
+# let the pattern eat the line break and capture the whole of the NEXT line
+# as the value. On a payslip that next line is routinely figures, so the
+# label swallowed a row of pay data and welded it to itself.
+#
+# Same fault as the sort-code cross-line match, one field over, and pinned
+# the same way: on line count, so a different pattern developing the same
+# fault fails these too.
+
+
+@pytest.mark.parametrize("label", ["Name", "Employee Name", "Address", "Home Address"])
+def test_bare_label_header_does_not_swallow_the_following_line(label):
+    text = f"{label}\nBasic Pay 1,842.00  Income Tax 214.90"
+
+    redacted, _ = redact(text)
+
+    assert len(redacted.splitlines()) == 2, (
+        f"{label!r} header consumed the line break: {redacted!r}"
+    )
+    assert "1,842.00" in redacted
+    assert "214.90" in redacted
+
+
+@pytest.mark.parametrize(
+    ("labelled", "expected_token"),
+    [
+        ("Employee Name: Mr K Sample", "[NAME]"),
+        ("Name: A Sample", "[NAME]"),
+        ("Name   :   Jonathan Ashworth-Pike", "[NAME]"),
+        ("Employee Name Mr K Sample", "[NAME]"),
+        ("Address: 14 Marlborough Crescent", "[ADDRESS]"),
+        ("Home Address:  Flat 2, 14 High St", "[ADDRESS]"),
+        ("Address 14 Marlborough Crescent, Leeds", "[ADDRESS]"),
+    ],
+)
+def test_a_labelled_value_on_the_same_line_is_still_redacted(labelled, expected_token):
+    """The fix narrows the separator, so every same-line spacing that
+    worked before has to keep working - including tabs, extra spaces and
+    no colon at all."""
+    redacted, _ = redact(labelled)
+
+    assert expected_token in redacted
+    assert labelled.split(":")[-1].strip() not in redacted
+
+
+def test_tab_separated_label_and_value_still_redacted():
+    """[ \t] not [ ] - a PDF text layer can put a tab between the two."""
+    redacted, _ = redact("Employee Name:\tMr K Sample")
+
+    assert "[NAME]" in redacted
+    assert "Mr K Sample" not in redacted
+
+
+# --------------------------------------------------------------------------
+# _DATE_RE must not mask across a line break
+# --------------------------------------------------------------------------
+#
+# Unlike the label and sort-code faults, this one failed in the UNSAFE
+# direction. _DATE_RE has two jobs: financial_lines_only() calls it per
+# line, where a cross-line match is impossible, but
+# _mask_known_safe_numbers() runs it over the whole payload with .sub(" ")
+# to remove digits a payslip legitimately explains, before the gate looks
+# for ones it does not.
+#
+# With [-\s] the month-name alternative could match across a newline and
+# mask away the last group of a group-printed digit sequence, leaving two
+# groups where there had been three - so _SPLIT_DIGIT_GROUPS_RE no longer
+# fired and the gate passed digits it refuses when they sit on one line.
+
+
+@pytest.mark.parametrize(
+    "kept_line",
+    [
+        "Gross 2,500.00 Code 123 4567 89",
+        "Net Pay 1,531.58 Code 1234 567 89",
+    ],
+)
+def test_month_name_on_the_next_line_does_not_unmask_grouped_digits(kept_line):
+    """The leak, pinned by name.
+
+    The digits have to sit on a line the allowlist KEEPS (so it carries a
+    currency amount) and at the END of it, with a month name starting the
+    line below - that is the only shape where the mask could reach across.
+    """
+    text = f"{kept_line}\nMar 2026 Net 1,531.58"
+
+    redacted, _ = redact(text)
+    filtered = financial_lines_only(redacted)
+
+    with pytest.raises(RedactionFailure):
+        assert_safe_to_send(filtered)
+
+
+def test_date_pattern_does_not_match_across_a_line_break():
+    """The mechanism, asserted on the pattern itself."""
+    for match in _DATE_RE.finditer("Total 89\nMar 2026 Gross 2,500.00"):
+        assert "\n" not in match.group(0), (
+            f"date pattern matched across a line break: {match.group(0)!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    "written_date",
+    ["15 Jan 2026", "15-Jan-2026", "1st Jan 2026", "15 January 2026",
+     "28 Aug 26", "15\tJan\t2026"],
+)
+def test_month_name_dates_are_still_recognised_on_one_line(written_date):
+    """The fix narrows the separator, so every same-line form has to keep
+    working - the allowlist must keep the line, and the gate must still
+    mask the digits as explained rather than flagging them."""
+    line = f"Pay Date {written_date}"
+
+    assert financial_lines_only(line).strip() != ""
+    assert not any(c.isdigit() for c in _mask_known_safe_numbers(line))
+
+
+# --------------------------------------------------------------------------
+# A tax code read and rejected must say so
+# --------------------------------------------------------------------------
+#
+# "We read a code and could not accept it" and "we could not read a code"
+# produced an identical extract: value None, the path in unreadable_fields,
+# no warning. A test user's payslip came back with an unreadable tax code
+# while the model reported it at 0.98 confidence - it had read the code and
+# _TAX_CODE_RE rejected the string - and nothing in the response said so.
+
+
+def _extract_with_model_tax_code(value, confidence=0.99):
+    """Run extract_payslip with the model's tax code forced, so the test
+    exercises the validator rather than the model."""
+    pdf_bytes = _make_pdf_bytes(["Gross Pay 2,500.00", "Net Pay 2,093.34"])
+    model_extract = _ModelExtract()
+    model_extract.tax_code.value = value
+    model_extract.pay.gross_this_period = Decimal("2500.00")
+    model_extract.pay.gross_ytd = Decimal("2500.00")
+    model_extract.net_pay = Decimal("2093.34")
+    model_extract.confidence = {"tax_code.value": confidence}
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        return extract_payslip(pdf_bytes)
+
+
+# Shapes normalisation deliberately does NOT rescue - see
+# test_normalisation_does_not_rescue_something_that_is_not_a_code.
+@pytest.mark.parametrize("rejected", ["1257LM", "1257L1", "01257L", "M 1257L"])
+def test_a_rejected_tax_code_produces_a_warning(rejected):
+    result = _extract_with_model_tax_code(rejected)
+
+    assert result.tax_code.value is None
+    assert "tax_code.value" in result.unreadable_fields
+    assert any(
+        "not in a form this engine recognises" in w for w in result.warnings
+    ), f"no warning for a rejected code: {result.warnings}"
+
+
+@pytest.mark.parametrize("rejected", ["1257LM", "1257L1", "01257L"])
+def test_the_rejection_warning_never_carries_the_value(rejected):
+    """The warning travels to the frontend and into logs, and extraction is
+    the one place a payslip's contents are still in the clear. The shape is
+    enough to diagnose with."""
+    result = _extract_with_model_tax_code(rejected)
+
+    for warning in result.warnings:
+        assert rejected not in warning, f"warning leaked the value: {warning!r}"
+    assert any(_shape_of(rejected) in w for w in result.warnings)
+
+
+def test_an_accepted_tax_code_produces_no_such_warning():
+    result = _extract_with_model_tax_code("1257L M1")
+
+    assert result.tax_code.value == "1257L M1"
+    assert "tax_code.value" not in result.unreadable_fields
+    assert not any("not in a form this engine recognises" in w for w in result.warnings)
+
+
+def test_a_missing_tax_code_is_distinguishable_from_a_rejected_one():
+    """The whole point: the two cases must no longer look identical."""
+    rejected = _extract_with_model_tax_code("1257LM")
+    missing = _extract_with_model_tax_code(None)
+
+    assert rejected.tax_code.value is missing.tax_code.value is None
+    assert "tax_code.value" in rejected.unreadable_fields
+    assert any("not in a form" in w for w in rejected.warnings)
+    assert not any("not in a form" in w for w in missing.warnings)
+
+
+@pytest.mark.parametrize(
+    ("value", "shape"),
+    [
+        ("M1257L", "A####A"),
+        ("1257L Cumul", "####A Aaaaa"),
+        ("1257 L", "#### A"),
+        ("1257L (M1)", "####A (A#)"),
+    ],
+)
+def test_shape_of_describes_without_disclosing(value, shape):
+    assert _shape_of(value) == shape
+
+
+# --------------------------------------------------------------------------
+# Tax code normalisation
+# --------------------------------------------------------------------------
+#
+# _TAX_CODE_RE rejected 18 of 33 plausible printed shapes, and a rejection
+# silently marked the code unreadable. The regex is the guard that stops a
+# garbage read becoming a tax code, so it is unchanged; the input is
+# normalised to meet it instead.
+#
+# Every rule below has a positive case (raw in, expected out) and a
+# negative one proving it does not fire where it should not.
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # trailing punctuation
+        ("1257L.", "1257L"),
+        ("1257L,", "1257L"),
+        ("1257L;", "1257L"),
+        # basis words
+        ("1257L Cumul", "1257L"),
+        ("1257L CUMUL", "1257L"),
+        ("1257L Cumulative", "1257L"),
+        ("1257L NONCUM", "1257L X"),
+        ("1257L NON-CUM", "1257L X"),
+        ("1257L Wk1", "1257L W1"),
+        ("1257L Mth1", "1257L M1"),
+        ("1257L Week1", "1257L W1"),
+        ("1257L Month1", "1257L M1"),
+        ("1257L (M1)", "1257L M1"),
+        ("1257L (W1)", "1257L W1"),
+        # internal space
+        ("1257 L", "1257L"),
+        ("1257 T", "1257T"),
+        # welded leading column
+        ("M1257L", "1257L"),
+        ("A1257L", "1257L"),
+        # combinations
+        ("M1257L Cumul", "1257L"),
+        (" 1257 L. ", "1257L"),
+    ],
+)
+def test_normalisation_positive(raw, expected):
+    assert normalise_tax_code(raw) == expected
+    assert _TAX_CODE_RE.match(normalise_tax_code(raw)), (
+        f"{raw!r} normalised to {normalise_tax_code(raw)!r}, still rejected"
+    )
+
+
+@pytest.mark.parametrize(
+    "already_valid",
+    ["1257L", "1257L M1", "1257L W1", "1257L X", "1257LM1", "BR", "D0", "D1",
+     "0T", "NT", "K475", "S1257L", "C1257L", "S1257L M1", "C475L", "1257T",
+     "1257N", "BR M1", "D0 W1"],
+)
+def test_normalisation_leaves_every_valid_code_alone(already_valid):
+    """The negative case for all of it: a code that already parses must come
+    out byte-identical."""
+    assert normalise_tax_code(already_valid) == already_valid
+
+
+# --- the leading-letter guard: one test per excluded letter ---------------
+#
+# This exclusion is the whole risk in the change. S and C are the Scottish
+# and Welsh prefixes and K starts a K code - all three are codes the engine
+# deliberately REFUSES, so stripping the letter would turn a refusal into a
+# confident wrong calculation. D was added after the first version turned
+# "D0" into "0", which would have silently re-banded someone's whole pay.
+
+
+@pytest.mark.parametrize(
+    ("code", "why"),
+    [
+        ("S1257L", "Scottish prefix - engine refuses Scottish codes"),
+        ("C1257L", "Welsh prefix - engine refuses Welsh codes"),
+        ("K475", "K code - engine refuses K codes"),
+        ("D0", "all higher rate - a valid code, not a welded column"),
+        ("D1", "all additional rate - a valid code"),
+    ],
+)
+def test_the_leading_letter_guard_never_strips_a_meaningful_prefix(code, why):
+    assert normalise_tax_code(code) == code, why
+    assert normalise_tax_code(code)[0] == code[0], why
+
+
+@pytest.mark.parametrize("prefix", ["S", "C", "K", "D"])
+def test_excluded_prefixes_survive_every_other_rule(prefix):
+    """The guard has to hold when the other rules fire too - stripping the
+    basis word must not expose the prefix to the welded-letter rule."""
+    raw = f"{prefix}1257L Cumul"
+
+    assert normalise_tax_code(raw).startswith(prefix)
+
+
+def test_a_letter_separated_by_a_space_is_a_neighbouring_column_not_a_weld():
+    """"M 1257L" is a column that happens to sit nearby. Only a letter stuck
+    directly to the digits is treated as welded, so this is left alone and
+    refused rather than silently repaired into a code."""
+    assert normalise_tax_code("M 1257L") == "M 1257L"
+    assert not _TAX_CODE_RE.match(normalise_tax_code("M 1257L"))
+
+
+@pytest.mark.parametrize(
+    "not_a_code", ["1257LM", "1257L1", "01257L", "1257", "XYZ", "Tax Code", ""]
+)
+def test_normalisation_does_not_rescue_something_that_is_not_a_code(not_a_code):
+    """Normalisation tidies decoration. It must never turn a non-code into a
+    code - that is what widening _TAX_CODE_RE would have risked."""
+    assert not _TAX_CODE_RE.match(normalise_tax_code(not_a_code))
+
+
+def test_a_normalised_code_is_accepted_end_to_end():
+    result = _extract_with_model_tax_code("1257L Cumul")
+
+    assert result.tax_code.value == "1257L"
+    assert "tax_code.value" not in result.unreadable_fields
+    assert not any("not in a form this engine recognises" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------
+# Numbers as a payslip prints them
+# --------------------------------------------------------------------------
+#
+# The model echoes the document, so it returns "1,867.60" or "£1,867.60"
+# roughly as often as "1867.60", varying run to run on the SAME input.
+# Pydantic rejects a thousands separator, that ValidationError became
+# NotAPayslip, and the user was told "We couldn't recognise this document as
+# a payslip" - because of a comma. Reproduced 4/4 on one synthetic layout.
+#
+# The schema is unchanged. The input is normalised to meet it.
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ("1867.60", "1867.60"),
+        ("1,867.60", "1867.60"),
+        ("£1,867.60", "1867.60"),
+        ("£1867.60", "1867.60"),
+        (" 1867.60 ", "1867.60"),
+        ("  £1,867.60  ", "1867.60"),
+        ("$1,867.60", "1867.60"),
+        ("€1,867.60", "1867.60"),
+        ("1,234,567.89", "1234567.89"),
+        ("476", "476"),
+        ("0.00", "0.00"),
+        # negatives - a refund or an adjustment is printed both ways
+        ("-1,867.60", "-1867.60"),
+        ("£-1,867.60", "-1867.60"),
+        ("-£1,867.60", "-1867.60"),
+        ("(1,867.60)", "-1867.60"),
+        ("(£1,867.60)", "-1867.60"),
+    ],
+)
+def test_every_printed_shape_normalises_to_the_plain_value(printed, expected):
+    assert normalise_number(printed) == expected
+    assert Decimal(normalise_number(printed)) == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        # not numbers at all - must survive untouched so the schema rejects them
+        "1257L", "BR", "A", "abc", "", "£",
+        # numeric-ish but malformed - normalising these would be rescuing
+        # garbage rather than reading a number
+        "12 34 56", "1,86 7.60", "1..2", "5-",
+        "1,2,3", "12,34", "1,23456",
+        "--5", "(-5)", "-(5)", "--£5", "£--5",
+    ],
+)
+def test_garbage_is_returned_untouched_so_validation_still_rejects_it(garbage):
+    assert normalise_number(garbage) == garbage
+
+
+@pytest.mark.parametrize("passthrough", ["1257L", "BR", "A", "2", "PG"])
+def test_non_money_strings_survive_the_recursive_walk(passthrough):
+    """The walk is applied to the whole payload rather than a list of money
+    fields, so a field added later is covered without anyone remembering.
+    That is only safe because a non-numeric string comes through unchanged -
+    tax_code.value, ni_category and student_loan_plan all go through it."""
+    payload = {"tax_code": {"value": passthrough}}
+
+    assert _normalise_numbers(payload)["tax_code"]["value"] == passthrough
+
+
+def test_the_recursive_walk_reaches_nested_lists():
+    """deductions.other is a list of objects with a Decimal amount."""
+    payload = {"deductions": {"other": [{"type": "union", "amount": "£12,345.67"}]}}
+
+    assert _normalise_numbers(payload)["deductions"]["other"][0]["amount"] == "12345.67"
+
+
+def test_a_comma_formatted_model_answer_no_longer_kills_the_extraction():
+    """The bug, end to end through extract_payslip with the model's answer
+    forced to the comma-formatted form that used to fail."""
+    pdf_bytes = _make_pdf_bytes([
+        "Pay Date: 28/08/2026",
+        "Tax Code: 1257L    NI Table Letter A",
+        "Tax Period: 5    Payment Period Monthly",
+        "Basic Pay 1,867.60    Income Tax 164.02",
+        "Total Gross Pay 1,867.60    Net Pay 1,638.01",
+        "Gross Pay YTD 9,338.00    Income Tax YTD 820.10",
+    ])
+    raw = {
+        "is_payslip": True,
+        "period": {"pay_date": "2026-08-28", "period_number": 5, "frequency": "monthly"},
+        "tax_code": {"value": "1257L"},
+        "pay": {"gross_this_period": "1,867.60", "gross_ytd": "£9,338.00"},
+        "deductions": {"income_tax": "164.02", "income_tax_ytd": "820.10"},
+        "net_pay": "1,638.01",
+        "confidence": {"pay.gross_this_period": 1.0},
+    }
+    model_extract = _ModelExtract.model_validate(_normalise_numbers(raw))
+
+    with patch("slyp.extraction._call_model", return_value=model_extract):
+        result = extract_payslip(pdf_bytes)
+
+    assert result.pay.gross_this_period == Decimal("1867.60")
+    assert result.pay.gross_ytd == Decimal("9338.00")
+    assert result.net_pay == Decimal("1638.01")
+    assert "pay.gross_this_period" not in result.unreadable_fields
+
+
+def test_a_parse_failure_is_not_reported_as_not_a_payslip():
+    """MalformedExtraction, not NotAPayslip. "This is not a payslip" is a
+    statement about the user's document; a value we could not parse is a
+    statement about our own round trip.
+
+    Asserted on the provider call, which is where the ValidationError is
+    wrapped - model_validate itself raises pydantic's own error.
+    """
+    import json as _json
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            arguments = _json.dumps(
+                {"is_payslip": True, "pay": {"gross_this_period": "not a number"}}
+            )
+            function = SimpleNamespace(name="record_payslip_extract", arguments=arguments)
+            tool_call = SimpleNamespace(function=function)
+            message = SimpleNamespace(tool_calls=[tool_call])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    with patch("slyp.extraction.openai.OpenAI", return_value=fake_client):
+        with pytest.raises(MalformedExtraction):
+            _call_openai_model("Gross 2500.00")
+
+
+def test_a_comma_would_have_been_a_parse_failure_before_normalisation():
+    """The regression this guards: the same answer with a comma in it now
+    parses, where it used to raise."""
+    import json as _json
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            arguments = _json.dumps(
+                {"is_payslip": True, "pay": {"gross_this_period": "1,867.60"}}
+            )
+            function = SimpleNamespace(name="record_payslip_extract", arguments=arguments)
+            tool_call = SimpleNamespace(function=function)
+            message = SimpleNamespace(tool_calls=[tool_call])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    with patch("slyp.extraction.openai.OpenAI", return_value=fake_client):
+        parsed = _call_openai_model("Gross 1,867.60")
+
+    assert parsed.pay.gross_this_period == Decimal("1867.60")
+
+
+def test_malformed_extraction_is_not_a_subclass_of_not_a_payslip():
+    """They map to different messages in main.py, so one must not be caught
+    by the other's handler."""
+    assert not issubclass(MalformedExtraction, NotAPayslip)
+    assert not issubclass(NotAPayslip, MalformedExtraction)

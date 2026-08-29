@@ -37,7 +37,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 Frequency = Literal["monthly", "weekly"]
@@ -109,6 +109,62 @@ class Source(BaseModel):
     scanned_at: datetime
 
 
+# ==========================================================================
+# Field labels
+# ==========================================================================
+#
+# The one place a dotted field path becomes words a person can read.
+#
+# Paths are an internal key: the findings layer matches Finding.source_fields
+# against unreadable_fields, and both have to be exact. They are not English,
+# and "tax_code.value" reached a real user's screen because three separate
+# places rendered the key instead of a label.
+#
+# Deliberately in Python rather than the frontend. failure_reason is built
+# server-side (analysis.validate_extract), so a TypeScript copy would have
+# to agree with this one forever, and would not.
+
+FIELD_LABELS: dict[str, str] = {
+    "employer_name": "your employer's name",
+    "period.pay_date": "your pay date",
+    "period.period_number": "the pay period number",
+    "period.frequency": "how often you are paid",
+    "period.tax_year": "the tax year",
+    "tax_code.value": "your tax code",
+    "pay.hourly_rate": "your hourly rate",
+    "pay.hours": "your hours",
+    "pay.gross_this_period": "your gross pay",
+    "pay.gross_ytd": "your gross pay so far this year",
+    "deductions.income_tax": "your income tax",
+    "deductions.income_tax_ytd": "your income tax so far this year",
+    "deductions.national_insurance": "your National Insurance",
+    "deductions.national_insurance_ytd": "your National Insurance so far this year",
+    "deductions.ni_category": "your National Insurance category",
+    "deductions.pension_employee": "your pension contribution",
+    "deductions.pension_employer": "your employer's pension contribution",
+    "deductions.pension_percent": "your pension percentage",
+    "deductions.student_loan": "your student loan deduction",
+    "deductions.student_loan_plan": "your student loan plan",
+    "net_pay": "your net pay",
+}
+
+
+def field_label(path: str) -> str:
+    """A dotted path as words. Falls back to something generic rather than
+    leaking the path, because a path this map has not learned yet is
+    exactly when the leak would happen."""
+    return FIELD_LABELS.get(path, "one of the figures on your payslip")
+
+
+def field_labels(paths: list[str]) -> list[str]:
+    """Labels for a list of paths, in order, without duplicates - two
+    unreadable year-to-date fields should not say the same thing twice."""
+    seen: dict[str, None] = {}
+    for path in paths:
+        seen.setdefault(field_label(path), None)
+    return list(seen)
+
+
 class PayslipExtract(BaseModel):
     """What the payslip actually says. No judgements, no calculations."""
 
@@ -147,6 +203,32 @@ class PayslipExtract(BaseModel):
         description=(
             "gross - all deductions == net, to the penny. Computed in code, "
             "not by the model. False means treat every figure as suspect."
+        ),
+    )
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unreadable_field_labels(self) -> list[str]:
+        """unreadable_fields as words, for anything that displays them.
+
+        A computed field rather than a stored one, so it is derived from
+        unreadable_fields on every serialisation and cannot drift out of
+        step with it - including on a hand-built PayslipExtract, which is
+        how most of the test suite constructs one.
+
+        The frontend renders THIS. unreadable_fields stays as paths
+        because the findings layer matches on them.
+        """
+        return field_labels(self.unreadable_fields)
+
+    previous_employment_ytd_present: bool = Field(
+        False,
+        description=(
+            "The payslip shows a previous-employment year-to-date line — a "
+            "P45 carry-forward from an earlier job this tax year. Detected "
+            "in code from the document's own labels, not asked of the "
+            "model. When true, this employment's YTD figures are not the "
+            "whole year, which suppresses the allowance-used figure "
+            "regardless of what the user answered about other employment."
         ),
     )
 
@@ -245,11 +327,23 @@ class Projection(BaseModel):
 # ==========================================================================
 
 class Score(BaseModel):
-    value: int = Field(ge=0, le=100)
+    # None when no check applied - deliberately not 0, which would read as
+    # a failing payslip rather than an unscored one. See
+    # analysis.build_score().
+    value: Optional[int] = Field(default=None, ge=0, le=100)
     checks_passed: int
     checks_run: int
     movers: list[str] = Field(
         default_factory=list, description="What would move it, plain English"
+    )
+    not_applicable: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Plain-English reasons a check did not apply to this payslip. "
+            "These are NOT failures and NOT passes - they are checks with "
+            "nothing to check, and they are excluded from checks_run so "
+            "the score never counts a vacuous comparison as confidence."
+        ),
     )
 
 
@@ -258,6 +352,76 @@ class Verdict(BaseModel):
 
     headline: str = Field(description='e.g. "2 things to check on this payslip"')
     severity: Severity
+
+
+class AllowanceUsage(BaseModel):
+    """
+    How much of the annual Personal Allowance this employment's pay has
+    used so far this tax year.
+
+    Arithmetic on figures the payslip itself carries: year-to-date gross
+    against the allowance the tax code grants. Not a projection, and
+    nothing here says anything about what happens by April.
+
+    Populated ONLY when the user has confirmed they have had no other
+    employment this tax year, and suppressed entirely otherwise — see
+    analysis.build_allowance_usage() for the full set of guards. Year-to-
+    date figures cover this employment only, so for anyone with a previous
+    employer this would be understated by whatever they earned there, and
+    a remaining-allowance number reads as a fact rather than an estimate.
+    That is a stricter bar than the emergency-code overpayment estimate
+    clears, deliberately: that one is framed as "possible, check with
+    HMRC", and this one would be acted on.
+
+    There is deliberately no `remaining_gbp` field. The difference is one
+    subtraction away, but a field with that name is an invitation to
+    render "you have £5,070 left to earn tax-free" — which is a statement
+    about future earnings, i.e. the projection this whole object avoids
+    being. `statement` is the sentence to show.
+    """
+
+    used_gbp: Decimal = Field(
+        description=(
+            "Year-to-date gross, capped at the annual allowance — you "
+            "cannot use more allowance than you have."
+        )
+    )
+    allowance_gbp: Decimal = Field(
+        description="Annual allowance the tax code grants, e.g. 12570 for 1257L."
+    )
+    statement: str = Field(
+        description=(
+            "The bounded sentence to display. Written here rather than in "
+            "the frontend so there is one place the wording can be checked."
+        )
+    )
+
+
+class Explanation(BaseModel):
+    """
+    What something printed on the payslip MEANS. Not a judgement about it.
+
+    The distinction is the whole point. A Finding says something about the
+    user's situation and is gated on what we know about it; an Explanation
+    says what a code does, which is true regardless of whose payslip it is
+    and needs no gate beyond "we read the value confidently".
+
+    That line is easy to cross and the BR code is where it would happen:
+    "no personal allowance is applied here" is an explanation, and "which
+    is normal for a second job" is a claim about the user's circumstances
+    that the findings layer only makes when user_context.only_job is False.
+    Nothing in here may say a code is normal, expected or correct.
+
+    `subject` is deliberately narrow. NI category and student loan plan
+    were scoped and left out - the first needs its 14 categories checked
+    against HMRC before we describe any of them, the second is null on
+    every fixture we have and would ship unexercised. The literal widens
+    when they are built, rather than advertising subjects nothing produces.
+    """
+
+    subject: Literal["tax_code"]
+    heading: str = Field(description='Short, e.g. "What your tax code means"')
+    body: str = Field(description="Plain English, no judgement, no advice.")
 
 
 class AnalysisResult(BaseModel):
@@ -275,6 +439,23 @@ class AnalysisResult(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     projections: list[Projection] = Field(default_factory=list)
     score: Optional[Score] = None
+    explanations: list[Explanation] = Field(
+        default_factory=list,
+        description=(
+            "What the payslip's own codes mean, in plain English. Empty "
+            "when nothing could be explained confidently, or when a finding "
+            "already explains the same thing - see "
+            "analysis.build_tax_code_explanation()."
+        ),
+    )
+    allowance_usage: Optional[AllowanceUsage] = Field(
+        None,
+        description=(
+            "Personal Allowance used to date, or null when any guard "
+            "suppresses it. Null is the default and the common case; the "
+            "frontend renders this field or nothing, and never derives it."
+        ),
+    )
 
     is_example_data: bool = Field(
         False, description="True for /api/mock/scan so the UI can label it"
